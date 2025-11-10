@@ -1,0 +1,7 @@
+me))
+    s = re.sub(r"[^\w\-. ]+", "_", s, flags=re.UNICODE)
+    s = s.strip().strip("._")
+    return s or "arquivo"
+
+
+def find_frame_with_t

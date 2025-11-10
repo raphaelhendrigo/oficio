@@ -1,0 +1,6 @@
+# Copie para .env e preencha, ou use variáveis de ambiente.
+ETCM_URL=https://homologacao-etcm.tcm.sp.gov.br/paginas/login.aspx
+ETCM_USERNAME=20386
+ETCM_PASSWORD=rhg#1004
+HEADLESS=false
+

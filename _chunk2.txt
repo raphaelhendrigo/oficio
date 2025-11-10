@@ -1,0 +1,250 @@
+    assunto = _m([
+        r"Assunto\s*[:\-]\s*(.+)",
+        r"Objeto\s*[:\-]\s*(.+)",
+    ])
+    if assunto:
+        out["{{ASSUNTO}}"] = assunto
+
+    # Date present in document (dd/mm/yyyy or dd de mes de yyyy)
+    data_ddmmyyyy = _m([r"(\b\d{1,2}/\d{1,2}/\d{4}\b)"])
+    if not data_ddmmyyyy:
+        data_ddmmyyyy = _m([
+            r"\b(\d{1,2}\s+de\s+[a-zcaiou]+\s+de\s+\d{4})\b",
+        ])
+    if data_ddmmyyyy:
+        out["{{DATA_DOCUMENTO}}"] = data_ddmmyyyy
+
+    # CPF
+    cpf = _m([
+        r"CPF\s*[:\-]\s*([0-9.\-]{11,14})",
+        r"\b(\d{3}\.\d{3}\.\d{3}\-\d{2})\b",
+    ])
+    if cpf:
+        out["{{CPF}}"] = cpf
+
+    # Matrícula / RF
+    matricula = _m([
+        r"Matr[ií]cula\s*[:\-]\s*([A-Za-z0-9/\.-]+)",
+        r"Registro\s*Funcional\s*[:\-]\s*([A-Za-z0-9/\.-]+)",
+        r"\bRF\b\s*[:\-]\s*([A-Za-z0-9/\.-]+)",
+    ])
+    if matricula:
+        out["{{MATRICULA}}"] = matricula
+
+    # Cargo
+    cargo = _m([
+        r"Cargo\s*[:\-]\s*(.+)",
+        r"Fun[cç][aã]o\s*[:\-]\s*(.+)",
+    ])
+    if cargo:
+        out["{{CARGO}}"] = cargo
+
+    # Data de nascimento
+    nasc = _m([
+        r"Data\s*de\s*Nascimento\s*[:\-]\s*([0-9/]{8,10})",
+        r"Nascimento\s*[:\-]\s*([0-9/]{8,10})",
+    ])
+    if nasc:
+        out["{{NASCIMENTO}}"] = nasc
+
+    # Short summary
+    snippet = re.sub(r"\s+", " ", text).strip()
+    if snippet:
+        out["{{EXTRATO}}"] = snippet[:400]
+
+    return out
+
+
+def attach_docx_to_portal(context, page, docx_path: Path) -> bool:
+    """Try to attach the generated DOCX in the current process UI.
+
+    This looks for an <input type=file> or a button that opens a file chooser
+    in any visible frame and attempts to upload the provided file.
+    Returns True if the file was submitted to the form.
+    """
+    if not docx_path or not docx_path.exists():
+        return False
+
+    # 1) Direct file inputs across frames
+    containers = [page] + list(page.frames)
+    for c in containers:
+        try:
+            inp = c.locator("input[type='file']").first
+            if inp.count() > 0:
+                try:
+                    inp.set_input_files(str(docx_path))
+                    print(f"Arquivo anexado via input[file]: {docx_path.name}")
+                    # Try to click a likely 'Salvar'/'Enviar' afterwards
+                    for btn_text in ("Salvar", "Gravar", "Enviar", "Confirmar"):
+                        try:
+                            c.get_by_role("button", name=re.compile(btn_text, re.I)).first.click()
+                            break
+                        except Exception:
+                            continue
+                    return True
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+    # 2) Try buttons that open a file chooser
+    trigger_texts = ["Anexar", "Incluir", "Inserir", "Upload", "Novo Documento", "Adicionar"]
+    for c in containers:
+        for txt in trigger_texts:
+            try:
+                with page.expect_file_chooser(timeout=5000) as fc_info:
+                    c.get_by_role("button", name=re.compile(txt, re.I)).first.click()
+                fc = fc_info.value
+                fc.set_files(str(docx_path))
+                print(f"Arquivo selecionado para upload: {docx_path.name}")
+                # Try to confirm
+                for btn_text in ("Salvar", "Gravar", "Enviar", "Confirmar"):
+                    try:
+                        c.get_by_role("button", name=re.compile(btn_text, re.I)).first.click()
+                        break
+                    except Exception:
+                        continue
+                return True
+            except Exception:
+                continue
+
+    print("Aviso: nao foi possivel localizar interface de anexo automaticamente.")
+    return False
+
+
+def main():
+    load_dotenv()  # load .env if present
+
+    url = os.getenv("ETCM_URL", "https://homologacao-etcm.tcm.sp.gov.br/paginas/login.aspx")
+    username = os.getenv("ETCM_USERNAME")
+    password = os.getenv("ETCM_PASSWORD")
+    headless = env_bool("HEADLESS", False)
+    attach_only = env_bool("ATTACH_ONLY", False)
+
+    if not username or not password:
+        print("ERRO: defina ETCM_USERNAME e ETCM_PASSWORD (via .env ou variaveis de ambiente).")
+        sys.exit(2)
+
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless, channel="chrome")
+        context = browser.new_context(viewport={"width": 1600, "height": 900}, accept_downloads=True)
+        page = context.new_page()
+
+        # 1) Login
+        print(f"Acessando: {url}")
+        page.goto(url, wait_until="load", timeout=60000)
+
+        # Username: prefer explicit DevExpress ids/names; fallback strategies next
+        try:
+            page.locator("#ctl00_cphMain_txtUsuario_I, input[name='ctl00$cphMain$txtUsuario']").first.fill(username)
+        except Exception:
+            try:
+                page.locator("input[placeholder*='Usu'] , input[name*='Usuario' i]").first.fill(username)
+            except Exception:
+                page.locator("input[type='text']").first.fill(username)
+
+        # Password: prefer explicit DevExpress ids/names; fallback strategies next
+        try:
+            page.locator("#ctl00_cphMain_txtSenha_I, input[name='ctl00$cphMain$txtSenha'][type='password']").first.fill(password)
+        except Exception:
+            try:
+                page.locator("input[type='password']").first.fill(password)
+            except Exception as e:
+                raise RuntimeError("Nao foi possivel localizar o campo de senha.") from e
+
+        # Login button (DevExpress): prefer container, then other fallbacks, then Enter key
+        clicked = False
+        try:
+            page.locator("#ctl00_cphMain_btnLogin").click()
+            clicked = True
+        except Exception:
+            pass
+        if not clicked:
+            try:
+                page.get_by_role("button", name=re.compile(r"Entrar|Acessar|Login", re.I)).click()
+                clicked = True
+            except Exception:
+                pass
+        if not clicked:
+            try:
+                page.locator(
+                    "input[type='submit'][value*='Entrar' i]:not([readonly]):not([disabled])"
+                ).first.click()
+                clicked = True
+            except Exception:
+                pass
+        if not clicked:
+            try:
+                page.locator("#ctl00_cphMain_btnLogin span.dx-vam:has-text('Entrar')").first.click()
+                clicked = True
+            except Exception:
+                try:
+                    page.locator("text=/\\b(Entrar|Acessar|Login)\\b/i").locator(":visible").first.click()
+                    clicked = True
+                except Exception:
+                    pass
+        if not clicked:
+            try:
+                page.locator("#ctl00_cphMain_txtSenha_I, input[type='password']").first.press("Enter")
+                clicked = True
+            except Exception as e:
+                raise RuntimeError("Nao foi possivel acionar o login (botao/Enter nao disponiveis).") from e
+
+        # Wait for the next page or app area to load
+        page.wait_for_load_state("networkidle", timeout=60000)
+
+        # Modo ATTACH_ONLY: apenas anexa o DOCX mais recente via Gerenciador de Atos
+        ger_atos_url = os.getenv("ETCM_GERENCIA_ATO_URL")
+        if attach_only:
+            if ger_atos_url:
+                try:
+                    print(f"Acessando Gerenciador de Atos: {ger_atos_url}")
+                    page.goto(ger_atos_url, wait_until="load", timeout=60000)
+                except Exception:
+                    pass
+            proc_label = os.getenv("PROCESSO_LABEL", "")
+            latest_docx = None
+            try:
+                latest_docx = sorted(Path("output").glob("*.docx"), key=lambda p: p.stat().st_mtime, reverse=True)[0]
+            except Exception:
+                latest_docx = None
+            if not latest_docx:
+                print("ERRO: nenhum DOCX encontrado em output/ para anexar.")
+                context.close(); browser.close(); return
+            try:
+                # Se nao foi passada a URL do gerenciador, tente abrir via grid usando o numero do processo
+                if not ger_atos_url and proc_label:
+                    open_gerenciador_atos_from_grid(context, page, proc_label)
+                ok = attach_docx_via_gerenciador_atos(context, page, proc_label, latest_docx)
+                if ok:
+                    print("Anexo do DOCX concluido (ATTACH_ONLY).")
+                else:
+                    print("Aviso: nao foi possivel anexar o DOCX no modo ATTACH_ONLY.")
+            except Exception as e:
+                print(f"Aviso: falha no anexo ATTACH_ONLY: {e}")
+            context.close(); browser.close(); return
+
+        # Direct viewer URL (optional fast-path)
+        viewer_url = os.getenv("ETCM_VIEWER_URL")
+        if viewer_url:
+            print(f"Acessando visualizador direto: {viewer_url}")
+            page.goto(viewer_url, wait_until="load", timeout=60000)
+            # Try to fetch and save last PDF immediately
+            proc_label = os.getenv("PROCESSO_LABEL", "viewer")
+            try:
+                pdf_path = click_last_piece_and_open_pdf(context, page, output_dir, proc_label)
+                if pdf_path:
+                    # Gera oficio a partir de template, se existir
+                    pdf_text = extract_text_from_pdf(pdf_path)
+                    fields = parse_fields_from_pdf_text(pdf_text, proc_label)
+                    docx_path = generate_oficio_from_template(proc_label, output_dir, extra=fields)
+                    if docx_path:
+                        try:
+                            attached = attach_docx_to_portal(context, page, docx_path)
+                            if not attached:
+                                # Tenta via Gerenciador de Atos. Se informada URL direta, navega ate ela.
+                                ger_url_env = os.getenv("ETCM_GERENCIA_ATO_URL")
+                                if ger_url_env:

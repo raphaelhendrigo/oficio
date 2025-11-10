@@ -1,0 +1,2358 @@
+﻿import os
+import re
+import sys
+import time
+import unicodedata
+from datetime import date
+from typing import Optional
+from pathlib import Path
+from urllib.parse import urljoin
+
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name, str(default))
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def safe_filename(name: str) -> str:
+    """Return a filesystem-safe slug for filenames based on a label like o número do processo."""
+    if not name:
+        return "arquivo"
+    # Replace path separators and illegal chars
+    s = re.sub(r"[\\/]+", "_", str(name))
+    s = re.sub(r"[^\w\-. ]+", "_", s, flags=re.UNICODE)
+    s = s.strip().strip("._")
+    return s or "arquivo"
+
+
+def find_frame_with_text(page, text: str, timeout_ms: int = 30000):
+    """Loop through frames until one contains the given text (substring)."""
+    deadline = time.time() + (timeout_ms / 1000.0)
+    last_err = None
+    while time.time() < deadline:
+        for fr in page.frames:
+            try:
+                loc = fr.get_by_text(text, exact=False)
+                # .count() waits for DOM stability enough for text lookup
+                if loc.count() > 0:
+                    return fr
+            except Exception as e:
+                last_err = e
+                continue
+        time.sleep(0.3)
+    if last_err:
+        raise last_err
+    raise PWTimeoutError(f"Frame with text '{text}' not found in {timeout_ms}ms.")
+
+
+def find_frame_with_selector(page, selector: str, timeout_ms: int = 30000):
+    """Find a frame containing an element matching selector that is attached in DOM."""
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        for fr in page.frames:
+            try:
+                loc = fr.locator(selector)
+                if loc.count() > 0:
+                    try:
+                        loc.first.wait_for(state="attached", timeout=1000)
+                    except Exception:
+                        pass
+                    return fr
+            except Exception:
+                continue
+        time.sleep(0.3)
+    raise PWTimeoutError(f"Frame with selector '{selector}' not found in {timeout_ms}ms.")
+
+
+def normalize(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.replace("º", "o").replace("°", "o").replace("ª", "a")
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join([c for c in s if not unicodedata.combining(c)])
+    return s
+
+
+def _pt_data_extenso_from_ddmmyyyy(s: str) -> str:
+    """Converte 'dd/mm/yyyy' ou 'd/m/yyyy' para 'd de <mês> de yyyy' em PT-BR.
+    Se não conseguir converter, retorna a string original.
+    """
+    try:
+        parts = re.split(r"[/-]", s.strip())
+        if len(parts) != 3:
+            return s
+        d = int(parts[0])
+        m = int(parts[1])
+        y = int(parts[2])
+        meses = [
+            "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+            "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+        ]
+        if 1 <= m <= 12:
+            return f"{d} de {meses[m-1]} de {y}"
+        return s
+    except Exception:
+        return s
+
+
+def find_latest_export_file(directory: Path) -> Path | None:
+    candidates = []
+    for ext in ("*.xlsx", "*.xls"):
+        candidates.extend(directory.glob(ext))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def find_processo_column_index(headers: list[str]) -> int | None:
+    best_idx = None
+    for i, h in enumerate(headers):
+        hl = normalize(h).strip().lower()
+        if not hl:
+            continue
+        if "processo" in hl and any(tag in hl for tag in ("n", "no", "n.", "n ", "numero")):
+            return i
+        if best_idx is None and "processo" in hl:
+            best_idx = i
+    if best_idx is not None:
+        return best_idx
+    if len(headers) >= 5:
+        return 4
+    return None
+
+
+def extract_processo_from_excel(path: Path) -> str | None:
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".xlsx":
+            from openpyxl import load_workbook  # type: ignore
+            wb = load_workbook(filename=str(path), read_only=True, data_only=True)
+            ws = wb.active
+            header = None
+            idx = None
+            for row in ws.iter_rows(values_only=True):
+                values = ["" if v is None else str(v) for v in row]
+                if header is None:
+                    header = values
+                    idx = find_processo_column_index(header)
+                    if idx is None:
+                        continue
+                    continue
+                if idx is None or idx >= len(values):
+                    continue
+                val = values[idx]
+                if val and str(val).strip():
+                    return str(val).strip()
+            return None
+        elif suffix == ".xls":
+            import xlrd  # type: ignore
+            book = xlrd.open_workbook(str(path))
+            sheet = book.sheet_by_index(0)
+            header_row = 0
+            idx = None
+            for r in range(min(5, sheet.nrows)):
+                row_vals = [str(sheet.cell_value(r, c)) for c in range(sheet.ncols)]
+                idx_try = find_processo_column_index(row_vals)
+                if idx_try is not None:
+                    header_row = r
+                    idx = idx_try
+                    break
+            if idx is None:
+                return None
+            for r in range(header_row + 1, sheet.nrows):
+                try:
+                    v = sheet.cell_value(r, idx)
+                except Exception:
+                    continue
+                if v is None:
+                    continue
+                txt = str(v).strip()
+                if txt:
+                    return txt
+            return None
+        else:
+            return None
+    except Exception as e:
+        print(f"Aviso: falha ao ler planilha {path.name}: {e}")
+        return None
+
+
+def extract_processos_from_excel(path: Path) -> list[str]:
+    """Extrai todos os números de processo da planilha, na mesma coluna detectada.
+
+    Retorna os valores não-vazios encontrados na coluna identificada como "Processo".
+    """
+    processos: list[str] = []
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".xlsx":
+            from openpyxl import load_workbook  # type: ignore
+            wb = load_workbook(filename=str(path), read_only=True, data_only=True)
+            ws = wb.active
+            header = None
+            idx = None
+            for row in ws.iter_rows(values_only=True):
+                values = ["" if v is None else str(v) for v in row]
+                if header is None:
+                    header = values
+                    idx = find_processo_column_index(header)
+                    continue
+                if idx is None or idx >= len(values):
+                    continue
+                val = values[idx]
+                if val and str(val).strip():
+                    processos.append(str(val).strip())
+            return processos
+        elif suffix == ".xls":
+            import xlrd  # type: ignore
+            book = xlrd.open_workbook(str(path))
+            sheet = book.sheet_by_index(0)
+            header_row = 0
+            idx = None
+            for r in range(min(5, sheet.nrows)):
+                row_vals = [str(sheet.cell_value(r, c)) for c in range(sheet.ncols)]
+                idx_try = find_processo_column_index(row_vals)
+                if idx_try is not None:
+                    header_row = r
+                    idx = idx_try
+                    break
+            if idx is None:
+                return []
+            for r in range(header_row + 1, sheet.nrows):
+                try:
+                    v = sheet.cell_value(r, idx)
+                except Exception:
+                    continue
+                if v is None:
+                    continue
+                txt = str(v).strip()
+                if txt:
+                    processos.append(txt)
+            return processos
+        else:
+            return []
+    except Exception as e:
+        print(f"Aviso: falha ao ler planilha {path.name}: {e}")
+        return processos
+
+
+def search_processo_and_open_viewer(context, page, processo: str):
+    search_frame = None
+    try:
+        search_frame = find_frame_with_selector(page, "#cbbProcesso_I", timeout_ms=15000)
+    except Exception:
+        if page.locator("#cbbProcesso_I").count() == 0:
+            raise
+
+    target = search_frame if search_frame else page
+    target.locator("#cbbProcesso_I").fill(processo)
+    clicked = False
+    pages_before = list(context.pages)
+    try:
+        btn = target.locator("button[onclick='BuscaProcesso();']").first
+        if btn.count() > 0:
+            btn.click()
+            clicked = True
+    except Exception:
+        pass
+    if not clicked:
+        try:
+            target.locator("#cbbProcesso_I").press("Enter")
+            clicked = True
+        except Exception:
+            pass
+    # If viewer loads in same page, its frame should appear
+    try:
+        find_frame_with_selector(page, "#splLeitorDocumentos_pgcPecas_trePecas", timeout_ms=60000)
+        return page
+    except Exception:
+        pass
+
+    # Otherwise try to detect a newly opened page
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        pages_now = list(context.pages)
+        if len(pages_now) > len(pages_before):
+            newp = pages_now[-1]
+            try:
+                newp.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            return newp
+        time.sleep(0.3)
+    return page
+
+
+def open_processo_from_grid(context, page, processo: str):
+    """Filter the grid by 'N° Processo' and open the viewer (lupa icon).
+
+    Targets the Mesa de Trabalho grid with id prefix 'sptMesaTrabalho_gvProcesso'.
+    """
+    # Fill filter for 'N° Processo'
+    input_sel = (
+        "input[id$='_DXFREditorcol17_I'], "
+        "input[name$='$DXFREditorcol17']"
+    )
+    try:
+        inp = page.locator(", ".join(input_sel)).first
+        inp.wait_for(state="visible", timeout=10000)
+        try:
+            inp.fill("")
+        except Exception:
+            pass
+        inp.fill(processo)
+        try:
+            inp.press("Enter")
+        except Exception:
+            pass
+    except Exception:
+        return
+
+    # Wait for first data row to appear
+    row = None
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            r = page.locator("#sptMesaTrabalho_gvProcesso_DXMainTable tr[id*='DXDataRow']").first
+            if r.count() > 0:
+                row = r
+                break
+        except Exception:
+            pass
+        time.sleep(0.2)
+    if row is None:
+        return None
+
+    # Click the lupa/search icon (first actionable element in row)
+    clicked = False
+    selectors = [
+        "img[src*='img_busca' i]",
+        "a[onclick*='VisualizarProtocolo' i]",
+        "td:nth-child(2) a, td:nth-child(2) img",
+        "a:has(img)",
+        "a",
+    ]
+    for sel in selectors:
+        try:
+            loc = row.locator(sel).first
+            if loc.count() > 0:
+                try:
+                    # Try to capture popup if it opens a new window
+                    with page.expect_popup(timeout=3000) as pop_info:
+                        loc.click()
+                    try:
+                        pop_info.value.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception:
+                        pass
+                    return pop_info.value
+                except Exception:
+                    loc.click()
+                clicked = True
+                break
+        except Exception:
+            continue
+    if not clicked:
+        # As a last resort, click any button in the first columns
+        try:
+            row.locator("td:nth-child(2) button, td:nth-child(2) input[type='button']").first.click()
+        except Exception:
+            pass
+    # If we clicked in the same page (no popup), return current page
+    return page
+
+
+def filter_and_open_processo(context, page, processo: str):
+    """Versão robusta: localiza o filtro 'N° Processo' pela célula de cabeçalho,
+    digita o número, pressiona Enter e clica na lupa da primeira linha.
+
+    Retorna a nova página (popup) quando abrir em janela separada, ou a página atual.
+    """
+    # Tenta descobrir o índice da coluna 'N° Processo' pelo header
+    try:
+        header = page.locator("#sptMesaTrabalho_gvProcesso_DXHeadersRow0 td").filter(
+            has_text=re.compile(r"N\s*°?\s*Processo|N\s*o\.?\s*Processo", re.I)
+        ).first
+        if header.count() > 0:
+            hid = header.get_attribute("id") or ""
+            m = re.search(r"col(\d+)$", hid)
+            if m:
+                col_idx = m.group(1)
+                inp = page.locator(f"#sptMesaTrabalho_gvProcesso_DXFREditorcol{col_idx}_I").first
+                inp.wait_for(state="visible", timeout=10000)
+                try:
+                    inp.fill("")
+                except Exception:
+                    pass
+                inp.fill(processo)
+                try:
+                    inp.press("Enter")
+                except Exception:
+                    pass
+        else:
+            # Fallback: caixa superior
+            topInp = page.locator("input[placeholder*='Processo' i], #cbbProcesso_I").first
+            topInp.wait_for(state="visible", timeout=8000)
+            topInp.fill(processo)
+            try:
+                page.locator("button[onclick='BuscaProcesso();']").first.click()
+            except Exception:
+                topInp.press("Enter")
+    except Exception:
+        pass
+
+    # Aguarda a primeira linha
+    row = None
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        try:
+            r = page.locator("#sptMesaTrabalho_gvProcesso_DXMainTable tr[id*='DXDataRow']").first
+            if r.count() > 0:
+                row = r
+                break
+        except Exception:
+            pass
+        time.sleep(0.2)
+    if row is None:
+        return None
+
+    # Clica na lupa
+    selectors = [
+        "a[href*='VisualizarDocsProtocolo.aspx' i]",
+        "a[onclick*='VisualizarProtocolo' i]",
+        "img[src*='img_busca' i]",
+        "img[src*='lupa' i]",
+        "img[src*='search' i]",
+        "img[alt*='busca' i], img[title*='busca' i]",
+        "td a:has(img)",
+    ]
+    for sel in selectors:
+        try:
+            loc = row.locator(sel).first
+            if loc.count() == 0:
+                continue
+            try:
+                with page.expect_popup(timeout=10000) as pop_info:
+                    loc.click()
+                try:
+                    pop_info.value.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                return pop_info.value
+            except Exception:
+                loc.click()
+                return page
+        except Exception:
+            continue
+    return page
+
+def open_gerenciador_atos_from_grid(context, page, processo: str):
+    """Filter the grid by 'N° Processo' and open the Gerenciador de Atos (clip icon) popup.
+
+    Heuristics:
+    - Reuse the filter input used by open_processo_from_grid.
+    - In the first data row, look for a link to Ato/GerenciaAto.aspx or an icon that resembles a clip/attachment/atos.
+    """
+    # Ensure grid is visible (if needed, try to open 'Em confecção APO-PEN')
+    try:
+        # If grid not present, try to navigate via menu
+        if page.locator("#sptMesaTrabalho_gvProcesso_DXMainTable").count() == 0:
+            fr_menu = find_frame_with_text(page, "Processos", timeout_ms=10000)
+            fr_menu.get_by_text("Processos", exact=True).first.click(force=True)
+            time.sleep(0.5)
+            fr_menu.get_by_text(re.compile(r"Em\s*confec.*APO-?PEN", re.I)).first.click(force=True)
+            page.wait_for_load_state("domcontentloaded", timeout=20000)
+    except Exception:
+        pass
+
+    # Filter by process number
+    try:
+        inp = page.locator("input[id$='_DXFREditorcol17_I'], input[name$='$DXFREditorcol17']").first
+        inp.wait_for(state="visible", timeout=10000)
+        try:
+            inp.fill("")
+        except Exception:
+            pass
+        inp.fill(processo)
+        try:
+            inp.press("Enter")
+        except Exception:
+            pass
+    except Exception:
+        return None
+
+    # Wait for the first row
+    row = None
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            r = page.locator("#sptMesaTrabalho_gvProcesso_DXMainTable tr[id*='DXDataRow']").first
+            if r.count() > 0:
+                row = r
+                break
+        except Exception:
+            pass
+        time.sleep(0.2)
+    if row is None:
+        return None
+
+    # Try to click the Gerenciador de Atos link/icon
+    selectors = [
+        "a[href*='/Ato/GerenciaAto.aspx' i]",
+        "a[onclick*='GerenciaAto' i]",
+        "img[src*='clip' i]",
+        "img[alt*='Ato' i]",
+        "img[src*='ato' i]",
+        "img[src*='anexo' i]",
+        "a:has(img)"
+    ]
+    popup_page = None
+    for sel in selectors:
+        try:
+            loc = row.locator(sel).first
+            if loc.count() == 0:
+                continue
+            with page.expect_popup(timeout=5000) as pop_info:
+                loc.click()
+            popup_page = pop_info.value
+            try:
+                popup_page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+            break
+        except Exception:
+            continue
+    return popup_page
+
+
+def attach_docx_via_gerenciador_atos(context, page, processo: str, docx_path: Path) -> bool:
+    """Try to attach the DOCX via the Gerenciador de Atos popup.
+
+    Steps:
+    - Open 'Gerenciador de Atos' from the grid by clicking the clip icon (popup window).
+    - Click 'Anexar Ato' button in the popup.
+    - On the upload page, select the DOCX and click to submit.
+    Returns True on best-effort success.
+    """
+    # Se nao receber um caminho valido, tenta pegar o DOCX mais recente da pasta output
+    if not docx_path or not docx_path.exists():
+        try:
+            output_dir = Path("output")
+            latest = None
+            for p in sorted(output_dir.glob("*.docx"), key=lambda x: x.stat().st_mtime, reverse=True):
+                latest = p
+                break
+            if latest is None:
+                return False
+            docx_path = latest
+        except Exception:
+            return False
+
+    try:
+        if re.search(r"/Ato/GerenciaAto\.aspx", page.url, re.I):
+            pop = page
+        else:
+            pop = open_gerenciador_atos_from_grid(context, page, processo)
+    except Exception as e:
+        pop = None
+
+    if not pop:
+        return False
+
+    # 1) Clicar preferencialmente em 'Anexar Ato' (novo fluxo); se nao existir, tenta 'Anexar Atos'
+    clicked = False
+    for sel in [
+        "#btnAnexaAto_CD, #btnAnexaAto, #btnAnexaAto_I", # Anexar Ato (singular)
+        "button:has-text('Anexar Ato')",
+        "input[type='submit'][value*='Anexar Ato' i]",
+        # Fallbacks (fluxo antigo 'Anexar Atos')
+        "#btnAnexaAtos, #btnAnexaAtos_I",
+        "button:has-text('Anexar Atos')",
+        "input[type='submit'][value*='Anexar Atos' i]"
+    ]:
+        try:
+            loc = pop.locator(sel).first
+            if loc.count() > 0:
+                with pop.expect_navigation(url=re.compile(r"uploadato|uploadAtos", re.I), timeout=15000):
+                    loc.click()
+                clicked = True
+                break
+        except Exception:
+            continue
+
+    # If no navigation happened, try to proceed anyway on same popup
+    target = pop
+    try:
+        if re.search(r"uploadato|uploadAtos", target.url, re.I) is None:
+            # Maybe the click changed location without full navigation; wait a bit
+            try:
+                target.wait_for_url(re.compile(r"uploadato|uploadAtos", re.I), timeout=8000)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2) On upload page, set input file
+    uploaded = False
+    try:
+        # Novo fluxo simples (uploadato.aspx): input #uplAto
+        try:
+            el_simple = target.locator("#uplAto, input[name='uplAto']").first
+            if el_simple.count() > 0:
+                el_simple.set_input_files(str(docx_path.resolve()))
+                print(f"Arquivo selecionado (uplAto): {docx_path.name}")
+                try:
+                    target.evaluate("try{ if(window.UpdateUploadButton) UpdateUploadButton(); }catch(e){}")
+                except Exception:
+                    pass
+                uploaded = True
+        except Exception:
+            pass
+
+        # Preferred: click the "Selecione o(s) arquivo(s)" button and use file chooser
+        # But first, if the exact DevExpress file input id is present, set directly.
+        try:
+            el_direct = target.locator("#cbpArquivos_UplAtos_TextBox0_Input").first
+            if el_direct.count() > 0:
+                el_direct.set_input_files(str(docx_path.resolve()))
+                print(f"Arquivo selecionado para upload (id direto): {docx_path.name}")
+                try:
+                    target.evaluate("try{ if(window.UpdateUploadButton) UpdateUploadButton(); }catch(e){}")
+                except Exception:
+                    pass
+                uploaded = True
+        except Exception:
+            pass
+        if not uploaded:
+            try:
+                with target.expect_file_chooser(timeout=6000) as fc_info:
+                    # Tenta seletores exatos do ASPxUploadControl
+                    selectors = [
+                        "#cbpArquivos_UplAtos_Browse0 a",
+                        "#cbpArquivos_UplAtos_BrowseT a",
+                        "td[id^='cbpArquivos_UplAtos_Browse'] a",
+                        "td.dxucBrowseButton a",
+                        "a:has-text('Selecione o(s) arquivo(s)')"
+                    ]
+                    clicked = False
+                    for sel in selectors:
+                        loc = target.locator(sel).first
+                        if loc.count() > 0:
+                            loc.click()
+                            clicked = True
+                            break
+                    if not clicked:
+                        # Fallback: busca por texto
+                        target.get_by_text(re.compile(r"Selecione\s*o\(s\)\s*arquivo\(s\)", re.I)).first.click()
+                fc = fc_info.value
+                fc.set_files(str(docx_path.resolve()))
+                print(f"Arquivo selecionado para upload: {docx_path.name}")
+                try:
+                    target.evaluate("try{ if(window.UpdateUploadButton) UpdateUploadButton(); }catch(e){}")
+                except Exception:
+                    pass
+                uploaded = True
+            except Exception:
+                pass
+
+        if not uploaded:
+            # Fallback: set hidden input[type=file] directly (DevExpress UploadControl)
+            inp = None
+            for sel in [
+                "input[id^='cbpArquivos_UplAtos_TextBox'][id$='_Input']",
+                "input[type='file']",
+                "input[name*='File' i]",
+                "input[id*='File' i]",
+                "input[id*='upload' i]",
+                "input[id*='upl' i]",
+            ]:
+                try:
+                    el = target.query_selector(sel)
+                    if el:
+                        inp = el
+                        break
+                except Exception:
+                    continue
+            if not inp:
+                return False
+            inp.set_input_files(str(docx_path.resolve()))
+            print(f"Arquivo selecionado para upload (fallback): {docx_path.name}")
+            try:
+                target.evaluate("try{ if(window.UpdateUploadButton) UpdateUploadButton(); }catch(e){}")
+            except Exception:
+                pass
+            uploaded = True
+    except Exception:
+        return False
+
+    # Wait for classification controls to render (novo/antigo)
+    try:
+        target.wait_for_selector("#cbbTiposAtos_I, #divGvArquivos select, tr select, table select", timeout=15000)
+    except Exception:
+        pass
+
+    # 2.1) Classificar como Ofício SSG (novo fluxo); manter fallbacks antigos
+    try:
+        # Tentativa direta via DevExpress: definir valor 79 ('Ofício SSG')
+        try:
+            target.evaluate(
+                "(function(){\n"
+                "  try {\n"
+                "    var cb = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection().GetByName('cbbTiposAtos') : (window.cbbTiposAtos || null);\n"
+                "    if (cb && cb.SetValue) { cb.SetValue('79'); cb.SetText('Ofício SSG'); return true; }\n"
+                "  } catch(e) {}\n"
+                "  try {\n"
+                "    var vi=document.getElementById('cbbTiposAtos_VI'); var ti=document.getElementById('cbbTiposAtos_I');\n"
+                "    if (vi) vi.value='79'; if (ti) ti.value='Ofício SSG'; return !!(vi||ti);\n"
+                "  } catch(e) {}\n"
+                "  return false;\n"
+                "})()"
+            )
+        except Exception:
+            pass        # Combo global da página nova (uploadato.aspx)
+        try:
+            cg = target.locator("#cbbTiposAtos_I").first
+            if cg.count() > 0:
+                try:
+                    cg.click()
+                except Exception:
+                    pass
+                try:
+                    cg.fill("Oficio SSG")
+                except Exception:
+                    pass
+                # tenta abrir dropdown e escolher explicitamente
+                try:
+                    ddbtn = target.locator("#cbbTiposAtos_B-1").first
+                    if ddbtn.count() > 0:
+                        ddbtn.click()
+                        try:
+                            target.get_by_text(re.compile(r"of[ií]cio\s*ssg", re.I)).first.click()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # DevExpress ASPxComboBox dentro do grid (input id termina com _cbbTipoAto_I)
+        try:
+            tipo_inp = target.locator("input[id$='_cbbTipoAto_I'], input[id*='_cbbTipoAto_I']").first
+            if tipo_inp.count() > 0:
+                try:
+                    tipo_inp.click()
+                except Exception:
+                    pass
+                try:
+                    tipo_inp.fill("Ofício SSG")
+                except Exception:
+                    pass
+                # Tenta selecionar a opção na lista suspensa, se aparecer
+                try:
+                    opt = target.get_by_text(re.compile(r"of[ií]cio\\s*ssg", re.I)).first
+                    if opt.count() > 0:
+                        opt.click()
+                except Exception:
+                    pass
+                try:
+                    tipo_inp.press("Enter")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        row = None
+        try:
+            row = target.locator("tr:has(select)").first
+            if row.count() == 0 and docx_path.name:
+                row = target.locator(f"tr:has-text('{docx_path.name}')").first
+        except Exception:
+            row = None
+        if row and row.count() > 0:
+            # Prefer <select>
+            try:
+                sel = row.locator("select").first
+                if sel.count() > 0:
+                    try:
+                        # tentativa direta por label
+                        sel.select_option(label=re.compile(r"of[ií]cio\s*ssg", re.I))
+                    except Exception:
+                        # busca o value cujo texto contenha 'encaminhamento'
+                        try:
+                            value = sel.evaluate("el => { const opt = Array.from(el.options).find(o => /of[ií]cio\\s*ssg/i.test(o.textContent)); return opt ? opt.value : null; }")
+                            if value:
+                                sel.select_option(value=value)
+                            else:
+                                # fallbacks
+                                try:
+                                    sel.select_option(label=re.compile(r"encaminhamento", re.I))
+                                except Exception:
+                                    sel.select_option(label="ANEXO")
+                        except Exception:
+                            for lab in (re.compile(r"encaminhamento", re.I), "ANEXO"):
+                                try:
+                                    sel.select_option(label=lab)
+                                    break
+                                except Exception:
+                                    continue
+            except Exception:
+                pass
+            # Alternativa: combobox (role)
+            try:
+                cb = row.get_by_role("combobox").first
+                if cb.count() > 0:
+                    try:
+                        # Abra as opções e clique na opção com o texto
+                        cb.click()
+                        try:
+                            target.get_by_role("option", name=re.compile(r"of[ií]cio\s*ssg", re.I)).first.click()
+                        except Exception:
+                            target.get_by_text(re.compile(r"of[ií]cio\\s*ssg", re.I)).first.click()
+                    except Exception:
+                        try:
+                            target.get_by_text(re.compile(r"encaminhamento|^\\s*anexo\\s*$", re.I)).first.click()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Fallback: clicar no texto ANEXO
+            try:
+                opt = target.get_by_text(re.compile(r"of[ií]cio\\s*ssg", re.I)).first
+                if opt.count() == 0:
+                    opt = target.get_by_text(re.compile(r"encaminhamento|^\\s*anexo\\s*$", re.I)).first
+                if opt.count() > 0:
+                    opt.click()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2.9) Se já houver arquivo selecionado, tenta submeter o formulário diretamente (mais robusto)
+    try:
+        has_file = target.evaluate(
+            "(function(){ try{ var inp=document.getElementById('uplAto'); return !!(inp && inp.value && inp.value.length>0); }catch(e){ return false; } })()"
+        )
+    except Exception:
+        has_file = False
+    if has_file:
+        try:
+            with target.expect_event('dialog', timeout=120000) as d:
+                target.evaluate(
+                    "(function(){ try{ var f=document.getElementById('frm'); if(!f) return; try{ f.removeAttribute('onsubmit'); f.onsubmit=null; }catch(_e){}; try{ window.WebForm_OnSubmit=function(){return true;}; window.ValidatorOnSubmit=function(){return true;}; window.Page_BlockSubmit=false; window.Page_IsValid=true; }catch(_e){}; var t=document.getElementById('__EVENTTARGET'); if(t) t.value='btnConfirmar'; var a=document.getElementById('__EVENTARGUMENT'); if(a) a.value=''; f.submit(); }catch(e){} })()"
+                )
+            try:
+                d.value.accept()
+            except Exception:
+                pass
+        except Exception:
+            try:
+                target.evaluate(
+                    "(function(){ try{ var f=document.getElementById('frm'); if(!f) return; try{ f.removeAttribute('onsubmit'); f.onsubmit=null; }catch(_e){}; try{ window.WebForm_OnSubmit=function(){return true;}; window.ValidatorOnSubmit=function(){return true;}; window.Page_BlockSubmit=false; window.Page_IsValid=true; }catch(_e){}; var t=document.getElementById('__EVENTTARGET'); if(t) t.value='btnConfirmar'; var a=document.getElementById('__EVENTARGUMENT'); if(a) a.value=''; f.submit(); }catch(e){} })()"
+                )
+            except Exception:
+                pass
+
+    # 3) Confirm submission
+    # Espera curta para backend processar seleção
+    try:
+        target.wait_for_load_state("networkidle", timeout=8000)
+    except Exception:
+        pass
+    # Tentativa rápida via API DevExpress (btnFechar/btnCancelar.DoClick)
+    try:
+        res_close = target.evaluate(
+            "(function(){\n"
+            "  try { var coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;\n"
+            "        var b = coll ? (coll.GetByName('btnFechar') || coll.GetByName('btnCancelar')) : null;\n"
+            "        if (b && b.SetEnabled) b.SetEnabled(true);\n"
+            "        if (b && b.DoClick) { b.DoClick(); return true; } } catch(e) {}\n"
+            "  try { if (window.btnFechar && btnFechar.DoClick) { btnFechar.SetEnabled && btnFechar.SetEnabled(true); btnFechar.DoClick(); return true; } } catch(e) {}\n"
+            "  try { if (window.btnCancelar && btnCancelar.DoClick) { btnCancelar.SetEnabled && btnCancelar.SetEnabled(true); btnCancelar.DoClick(); return true; } } catch(e) {}\n"
+            "  return false;\n"
+            "})();"
+        )
+        if res_close:
+            # Pequena espera para o backend
+            time.sleep(1.0)
+            return True
+    except Exception:
+        pass
+
+    # 3) Confirm submission (fluxo: Próximo -> Fechar; com fallbacks)
+    for sel in [
+        # Primeiro avanço de etapa
+        "button:has-text('Próximo')",
+        "button:has-text('Proximo')",
+        "input[type='submit'][value*='Próximo' i]",
+        "input[type='submit'][value*='Proximo' i]",
+        "a:has-text('Próximo')",
+        "a:has-text('Proximo')",
+        # Confirmação direta
+        "button:has-text('Confirmar')",
+        "input[type='submit'][value*='Confirmar' i]",
+        "a:has-text('Confirmar')",
+        # Fallbacks
+        "button:has-text('Enviar')",
+        "button:has-text('Upload')",
+        "button:has-text('Salvar')",
+        "input[type='submit'][value*='Enviar' i]",
+        "input[type='submit'][value*='Upload' i]",
+        "input[type='submit'][value*='Salvar' i]",
+    ]:
+        try:
+            target.locator(sel).first.click()
+            break
+        except Exception:
+            continue
+
+    # Extra: garantir clique em 'Confirmar' quando aparecer
+    try:
+        # Aguarda aparecer algum seletor do botão Confirmar
+        try:
+            target.wait_for_selector(
+                "#cbpArquivos_btnConfirmar, #cbpArquivos_btnConfirmar_I, input[name='cbpArquivos$btnConfirmar'], #btnConfirmar, #btnConfirmar_I",
+                timeout=8000,
+            )
+        except Exception:
+            pass
+        clicked_confirm = False
+        # Instala um handler global para aceitar qualquer alerta de sucesso que apareça tardiamente
+        accepted_alert_flag = {"v": False}
+        def _auto_accept_dialog(d):
+            try:
+                d.accept()
+            except Exception:
+                pass
+            accepted_alert_flag["v"] = True
+        try:
+            target.on("dialog", _auto_accept_dialog)
+        except Exception:
+            pass
+        # Modo forçado: envia o form diretamente (ignora validações client-side)
+        try:
+            if env_bool("FORCE_CONFIRM_UPLOAD", False):
+                print("[uploadato] FORCE_CONFIRM_UPLOAD=on -> submetendo formulario diretamente")
+                target.evaluate(
+                    "(function(){ try{ var f=document.getElementById('frm'); if(!f) return; try{ f.removeAttribute('onsubmit'); f.onsubmit=null; }catch(_e){}; try{ window.WebForm_OnSubmit=function(){return true;}; window.ValidatorOnSubmit=function(){return true;}; window.Page_BlockSubmit=false; window.Page_IsValid=true; }catch(_e){}; var t=document.getElementById('__EVENTTARGET'); if(t) t.value='btnConfirmar'; var a=document.getElementById('__EVENTARGUMENT'); if(a) a.value=''; f.submit(); }catch(e){} })()"
+                )
+                clicked_confirm = True
+        except Exception:
+            pass
+        try:
+            target.evaluate("try{ var coll=(window.ASPx&&ASPx.GetControlCollection)?ASPx.GetControlCollection():null; var b=coll?coll.GetByName('btnConfirmar'):null; if(b&&b.SetEnabled) b.SetEnabled(true);}catch(e){}")
+        except Exception:
+            pass
+        # Tentativa via API DevExpress (btnConfirmar.DoClick) com tratamento de alert
+        try:
+            res = target.evaluate(
+                "(function(){\n"
+                "  try { var coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;\n"
+                "        var b = coll ? coll.GetByName('btnConfirmar') : null;\n"
+                "        if (b && b.SetEnabled) b.SetEnabled(true);\n"
+                "        if (b && b.DoClick) { b.DoClick(); } } catch(e) {}\n"
+                "  try { if (window.btnConfirmar && btnConfirmar.DoClick) { btnConfirmar.SetEnabled && btnConfirmar.SetEnabled(true); btnConfirmar.DoClick(); } } catch(e) {}\n"
+                "  try { var t=document.getElementById('__EVENTTARGET'); if(t && t.value==='btnConfirmar') return true; } catch(e) {}\n"
+                "  try { var db=document.getElementById('divBotoes'); if (db && db.style && db.style.display==='none') return true; } catch(e) {}\n"
+                "  return false;\n"
+                "})();"
+            )
+            if res:
+                print("[uploadato] DevExpress DoClick acionado e postback sinalizado (__EVENTTARGET=btnConfirmar ou divBotoes oculto).")
+                try:
+                    with target.expect_event('dialog', timeout=30000) as d:
+                        pass
+                    try:
+                        d.value.accept()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                clicked_confirm = True
+        except Exception:
+            pass
+
+        # Executa o handler client-side oficial para definir e.processOnServer
+        if not clicked_confirm:
+            try:
+                # Loga resultado da validacao cliente e da decisao de prosseguir
+                valid_ok = target.evaluate("(function(){ try{ return !!(window.Page_ClientValidate && Page_ClientValidate()); }catch(e){ return false; } })()")
+                try:
+                    vinfo = target.evaluate(
+                        "(function(){ try{ var arr=[]; var vs=window.Page_Validators||[]; for(var i=0;i<vs.length;i++){ var v=vs[i]; arr.push((v.id||'')+':'+(v.isvalid===false?'INVALID':'OK')); } return arr.join('|'); }catch(e){ return ''; } })()"
+                    )
+                except Exception:
+                    vinfo = ""
+                print(f"[uploadato] Page_ClientValidate: {valid_ok} Validators: {vinfo}")
+                proceed = target.evaluate(
+                    "(function(){\n"
+                    "  try { var e={processOnServer:false};\n"
+                    "        try{ if(window.Page_ClientValidate) Page_ClientValidate(); }catch(ex){}\n"
+                    "        if (typeof window.btnConfirmarClientSide_Click === 'function') { window.btnConfirmarClientSide_Click(null, e); }\n"
+                    "        return !!e.processOnServer;\n"
+                    "  } catch(err) { return false; }\n"
+                    "})();"
+                )
+                print(f"[uploadato] btnConfirmarClientSide_Click -> processOnServer={proceed}")
+                if proceed:
+                    try:
+                        with target.expect_event('dialog', timeout=30000) as d:
+                            target.evaluate("try{ if(window.WebForm_DoPostBackWithOptions){ WebForm_DoPostBackWithOptions(new WebForm_PostBackOptions('btnConfirmar','', true, '', '', false, false)); } else { __doPostBack('btnConfirmar',''); } }catch(e){ try{ var f=document.getElementById('frm'); if(f){ f.__EVENTTARGET.value='btnConfirmar'; f.__EVENTARGUMENT.value=''; f.submit(); } }catch(_){} }")
+                        try:
+                            d.value.accept()
+                        except Exception:
+                            pass
+                    except Exception:
+                        target.evaluate("try{ if(window.WebForm_DoPostBackWithOptions){ WebForm_DoPostBackWithOptions(new WebForm_PostBackOptions('btnConfirmar','', true, '', '', false, false)); } else { __doPostBack('btnConfirmar',''); } }catch(e){ try{ var f=document.getElementById('frm'); if(f){ f.__EVENTTARGET.value='btnConfirmar'; f.__EVENTARGUMENT.value=''; f.submit(); } }catch(_){} }")
+                    try:
+                        post = target.evaluate("(function(){ var t=document.getElementById('__EVENTTARGET'); return !!(t && t.value==='btnConfirmar'); })()")
+                    except Exception:
+                        post = True
+                    clicked_confirm = bool(post)
+            except Exception:
+                pass
+        for conf_sel in (
+            "#cbpArquivos_btnConfirmar",          # container (antigo)
+            "#cbpArquivos_btnConfirmar_I",       # input submit (antigo)
+            "input[name='cbpArquivos$btnConfirmar']",
+            "#btnConfirmar",                      # novo uploadato.aspx
+            "#btnConfirmar_I",
+            "#btnConfirmar_CD",
+        ):
+            try:
+                loc = target.locator(conf_sel).first
+                if loc.count() > 0:
+                    try:
+                        # Tenta rolar para o botao antes de clicar
+                        try:
+                            hscroll = loc.element_handle(timeout=500)
+                            if hscroll:
+                                hscroll.scroll_into_view_if_needed(timeout=1000)
+                        except Exception:
+                            pass
+                        print(f"[uploadato] Clicando Confirmar via seletor: {conf_sel}")
+                        # Tentativa adicional: aciona click programatico direto no input/container DevExpress
+                        try:
+                            if conf_sel in ("#btnConfirmar_I", "#btnConfirmar", "#btnConfirmar_CD"):
+                                target.evaluate(
+                                    "try{ var el = document.querySelector('#btnConfirmar_I') || document.querySelector('#btnConfirmar') || document.querySelector('#btnConfirmar_CD'); if(el){ el.click && el.click(); } }catch(e){}"
+                                )
+                        except Exception:
+                            pass
+                        try:
+                            with target.expect_event('dialog', timeout=30000) as d:
+                                loc.click(force=True)
+                            try:
+                                d.value.accept()
+                            except Exception:
+                                pass
+                        except Exception:
+                            loc.click(force=True)
+                        # Verifica se __EVENTTARGET foi armado para btnConfirmar (indica postback)
+                        try:
+                            armed = target.evaluate("(function(){ var t=document.getElementById('__EVENTTARGET'); return !!(t && t.value==='btnConfirmar'); })()")
+                        except Exception:
+                            armed = True
+                        clicked_confirm = bool(armed)
+                        break
+                    except Exception:
+                        try:
+                            handle = loc.element_handle(timeout=1000)
+                        except Exception:
+                            handle = None
+                        if handle is not None:
+                            try:
+                                try:
+                                    with target.expect_event('dialog', timeout=30000) as d:
+                                        target.evaluate("el => el.click()", handle)
+                                    try:
+                                        d.value.accept()
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    target.evaluate("el => el.click()", handle)
+                                try:
+                                    armed2 = target.evaluate("(function(){ var t=document.getElementById('__EVENTTARGET'); return !!(t && t.value==='btnConfirmar'); })()")
+                                except Exception:
+                                    armed2 = True
+                                clicked_confirm = bool(armed2)
+                                break
+                            except Exception:
+                                pass
+            except Exception:
+                continue
+        if not clicked_confirm:
+            # fallback WebForms: aciona __doPostBack, tentando validar cliente e aceitar alert
+            try:
+                try:
+                    target.evaluate("try{ if(window.Page_ClientValidate) Page_ClientValidate(); }catch(e){};");
+                except Exception:
+                    pass
+                if "uploadato" in (target.url or "").lower():
+                    try:
+                        with target.expect_event('dialog', timeout=30000) as d:
+                            target.evaluate("try{ if(window.WebForm_DoPostBackWithOptions){ WebForm_DoPostBackWithOptions(new WebForm_PostBackOptions('btnConfirmar','', true, '', '', false, false)); } else { __doPostBack('btnConfirmar',''); } }catch(e){ __doPostBack('btnConfirmar',''); }")
+                        try:
+                            d.value.accept()
+                        except Exception:
+                            pass
+                    except Exception:
+                        target.evaluate("try{ if(window.WebForm_DoPostBackWithOptions){ WebForm_DoPostBackWithOptions(new WebForm_PostBackOptions('btnConfirmar','', true, '', '', false, false)); } else { __doPostBack('btnConfirmar',''); } }catch(e){ __doPostBack('btnConfirmar',''); }")
+                else:
+                    try:
+                        with target.expect_event('dialog', timeout=30000) as d:
+                            target.evaluate("__doPostBack('cbpArquivos$btnConfirmar','')")
+                        try:
+                            d.value.accept()
+                        except Exception:
+                            pass
+                    except Exception:
+                        target.evaluate("__doPostBack('cbpArquivos$btnConfirmar','')")
+                # Confirma se o postback foi armado
+                try:
+                    armed3 = target.evaluate("(function(){ var t=document.getElementById('__EVENTTARGET'); return !!(t && t.value==='btnConfirmar'); })()")
+                except Exception:
+                    armed3 = True
+                clicked_confirm = bool(armed3)
+            except Exception:
+                pass
+        if not clicked_confirm:
+            # Ultimo recurso: submeter o form diretamente
+            try:
+                try:
+                    with target.expect_event('dialog', timeout=30000) as d:
+                        target.evaluate(
+                            "try{\n"
+                            "  var f=document.getElementById('frm');\n"
+                            "  if(f){\n"
+                            "    try{ f.removeAttribute('onsubmit'); f.onsubmit=null; }catch(_e){}\n"
+                            "    try{ window.WebForm_OnSubmit=function(){return true;}; }catch(_e){}\n"
+                            "    try{ window.ValidatorOnSubmit=function(){return true;}; window.Page_BlockSubmit=false; window.Page_IsValid=true; }catch(_e){}\n"
+                            "    try{ if(f.__EVENTTARGET) f.__EVENTTARGET.value='btnConfirmar'; if(f.__EVENTARGUMENT) f.__EVENTARGUMENT.value=''; }catch(_e){}\n"
+                            "    f.submit();\n"
+                            "  }\n"
+                            "}catch(e){}"
+                        );
+                    try:
+                        d.value.accept()
+                    except Exception:
+                        pass
+                except Exception:
+                    target.evaluate(
+                        "try{ var f=document.getElementById('frm'); if(f){ try{ f.removeAttribute('onsubmit'); f.onsubmit=null; }catch(_e){}; if(f.__EVENTTARGET) f.__EVENTTARGET.value='btnConfirmar'; if(f.__EVENTARGUMENT) f.__EVENTARGUMENT.value=''; f.submit(); } }catch(e){}"
+                    );
+                clicked_confirm = True
+            except Exception:
+                pass
+        if clicked_confirm:
+            try:
+                # Espera navegacao/redirect apos confirmar (alert pode segurar ate ser aceito)
+                target.wait_for_url(re.compile(r"GerenciaAto\\.aspx", re.I), timeout=120000)
+            except Exception:
+                pass
+            try:
+                target.wait_for_load_state("networkidle", timeout=20000)
+            except Exception:
+                pass
+        # Remove handler global de dialog para nao afetar demais passos
+        try:
+            target.off("dialog", _auto_accept_dialog)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Extra: clique explicito em 'Proximo' e depois 'Confirmar' (IDs DevExpress)
+    try:
+        for sel in (
+            "#cbpArquivos_btnProximo_CD",
+            "#cbpArquivos_btnProximo_I",
+            "input[name='cbpArquivos$btnProximo']",
+        ):
+            try:
+                loc = target.locator(sel).first
+                if loc.count() > 0:
+                    loc.click()
+                    try:
+                        target.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        for sel in (
+            "#cbpArquivos_btnConfirmar",         # container div
+            "#cbpArquivos_btnConfirmar_CD",     # clickable div
+            "#cbpArquivos_btnConfirmar_I",      # input inside
+            "input[name='cbpArquivos$btnConfirmar']",
+        ):
+            try:
+                loc = target.locator(sel).first
+                if loc.count() > 0:
+                    loc.click()
+                    try:
+                        target.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        pass
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 3.1) 'Fechar' só depois que Confirmar realmente foi acionado
+    # Evita fechar/"Cancelar" acidentalmente a tela de upload antes do envio
+    try:
+        on_gerencia = re.search(r"/Ato/GerenciaAto\.aspx", target.url, re.I) is not None
+    except Exception:
+        on_gerencia = False
+
+    closed_after_upload = False
+    if clicked_confirm or on_gerencia:
+        try:
+            target.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        # Aguarda explicitamente aparecer 'Fechar' (mais seguro)
+        try:
+            target.wait_for_selector(
+                "#btnFechar_CD, #btnFechar, #btnFechar_I, button:has-text('Fechar'), a:has-text('Fechar')",
+                timeout=20000,
+            )
+        except Exception:
+            pass
+
+        close_selectors = [
+            "#btnFechar_CD",
+            "#btnFechar",
+            "#btnFechar_I",
+            "button:has-text('Fechar')",
+            "a:has-text('Fechar')",
+            "input[type='button'][value*='Fechar' i]",
+            "input[type='submit'][value*='Fechar' i]",
+        ]
+        # Alguns ambientes usam 'Cancelar' como 'Fechar' apenas na tela GerenciaAto
+        if on_gerencia:
+            close_selectors += ["#btnCancelar_CD", "#btnCancelar", "#btnCancelar_I"]
+
+        for sel in close_selectors:
+            try:
+                loc = target.locator(sel).first
+                if loc.count() > 0:
+                    try:
+                        loc.click()
+                    except Exception:
+                        try:
+                            h = loc.element_handle(timeout=1000)
+                        except Exception:
+                            h = None
+                        if h is not None:
+                            try:
+                                target.evaluate("el => el.click()", h)
+                            except Exception:
+                                pass
+                    closed_after_upload = True
+                    break
+            except Exception:
+                continue
+    else:
+        print("[uploadato] Nao foi possivel confirmar envio; evitando fechar/cancelar para nao abortar o anexo.")
+
+    # Give some time for server
+    time.sleep(2.0)
+    return bool(clicked_confirm and closed_after_upload)
+
+def click_last_piece_and_open_pdf(context, page, output_dir: Path, processo: str) -> Path | None:
+    """Within the VisualizarDocsProtocolo viewer, click the most recent piece and download its PDF.
+
+    Heuristics used:
+    - Find the frame that holds the pieces tree (by id) or fallback to the top page.
+    - Pick the last item by numeric attribute (index_ato/index) or DOM order.
+    - Try to read the embedded PDF URL from iframe/embed/object/a and download via request context.
+    - Fallback to clicking the "nova janela" button and then extract the URL from the popup.
+    """
+    # 1) Find the viewer frame or use the page itself
+    viewer_frame = None
+    try:
+        viewer_frame = find_frame_with_selector(page, "#splLeitorDocumentos_pgcPecas_trePecas", timeout_ms=20000)
+    except Exception:
+        # Try alternative cues for the viewer
+        for sel in ["#imgNewWindow", "img#imgNewWindow", "#splLeitorDocumentos_pgcPecas_trePecas_D", "#splLeitorDocumentos_pgcPecas"]:
+            try:
+                viewer_frame = find_frame_with_selector(page, sel, timeout_ms=5000)
+                break
+            except Exception:
+                continue
+    if not viewer_frame:
+        # As a last resort, operate on the page itself
+        viewer_frame = page
+
+    # 2) Locate pieces/attachments anchors and choose the last one
+    loc = viewer_frame.locator("a[index_ato], a[cod_arquivo_digital_criptografado], a[index]")
+    count = loc.count()
+    if count == 0:
+        # Try a broader selection inside the tree container
+        loc = viewer_frame.locator("#splLeitorDocumentos_pgcPecas_trePecas a, a[cod_arquivo_digital_criptografado]")
+        count = loc.count()
+    if count == 0:
+        print("Aviso: Nenhuma peca encontrada no visualizador.")
+        return None
+
+    max_idx = -1
+    max_n = 0
+    for i in range(count):
+        item = loc.nth(i)
+        val = item.get_attribute("index_ato") or item.get_attribute("index") or ""
+        try:
+            iv = int(re.findall(r"\d+", val)[0]) if val else i
+        except Exception:
+            iv = i
+        if iv >= max_idx:
+            max_idx = iv
+            max_n = i
+
+    loc.nth(max_n).click()
+    time.sleep(1.0)
+
+    def _pick_attr(pl, sel, attr):
+        el = pl.locator(sel)
+        if el.count() > 0:
+            val = el.first.get_attribute(attr)
+            if val:
+                return val
+        return None
+
+    def _try_find_pdf_url_in_container(container):
+        # Try several common embed patterns; URL may not end with .pdf
+        # Chromium's built-in PDF viewer exposes the original document URL in
+        # an `original-url` attribute on the <embed> element. Prefer this.
+        url = (
+            _pick_attr(container, "embed[original-url]", "original-url")
+            or _pick_attr(container, "iframe[src*='visualiza' i]", "src")
+            or _pick_attr(container, "iframe[src*='iFramevisualizardocumento' i]", "src")
+            or _pick_attr(container, "iframe[src]", "src")
+            or _pick_attr(container, "embed[type*='pdf']", "src")
+            or _pick_attr(container, "object[data]", "data")
+            or _pick_attr(container, "a[href*='.pdf']", "href")
+        )
+        return url
+
+    # Helper to download and validate PDF bytes
+    def _download_and_save_pdf(abs_url: str, referer_url: str | None = None) -> Path | None:
+        try:
+            headers = {"Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8"}
+            if referer_url:
+                headers["Referer"] = referer_url
+            resp = context.request.get(abs_url, headers=headers, timeout=60000)
+            if not resp.ok:
+                return None
+            body = resp.body()
+            ct = (resp.headers.get("content-type") or "").lower()
+            if (b"%PDF" not in body[:8]) and ("application/pdf" not in ct):
+                return None
+            pdf_path = output_dir / f"{safe_filename(processo)}-ultimo-ato.pdf"
+            with open(pdf_path, "wb") as f:
+                f.write(body)
+            print(f"PDF salvo em: {pdf_path.resolve()}")
+            return pdf_path
+        except Exception:
+            return None
+
+    # 3) Try to download directly from embedded URL
+    pdf_url = _try_find_pdf_url_in_container(viewer_frame) or _try_find_pdf_url_in_container(page)
+    if pdf_url:
+        base_url = getattr(viewer_frame, "url", None) or page.url
+        abs_url = urljoin(base_url, pdf_url)
+        pdf_path_try = _download_and_save_pdf(abs_url, referer_url=base_url)
+        if pdf_path_try:
+            return pdf_path_try
+        else:
+            print("Aviso: conteudo nao-PDF retornado no embed direto. Tentando nova janela...")
+
+    # 4) Fallback: open in a new window and extract URL
+    btn_sel = "#imgNewWindow, img#imgNewWindow"
+    btn_clicked = False
+    pdf_page = None
+    try:
+        if viewer_frame.locator(btn_sel).count() > 0:
+            with page.expect_popup(timeout=15000) as pop_info:
+                viewer_frame.locator(btn_sel).first.click()
+            pdf_page = pop_info.value
+            btn_clicked = True
+        else:
+            raise Exception("not in frame")
+    except Exception:
+        if page.locator(btn_sel).count() > 0:
+            with page.expect_popup(timeout=15000) as pop_info:
+                page.locator(btn_sel).first.click()
+            pdf_page = pop_info.value
+            btn_clicked = True
+
+    if not btn_clicked or not pdf_page:
+        print("Aviso: Botao 'abrir em nova janela' nao encontrado e nenhum embed localizado.")
+        return None
+
+    try:
+        pdf_page.wait_for_load_state("domcontentloaded", timeout=30000)
+    except Exception:
+        pass
+    # Give the viewer a moment to inject the <embed> element
+    try:
+        pdf_page.wait_for_selector("embed[original-url], embed[type*='pdf'], iframe[src], object[data]", timeout=10000)
+    except Exception:
+        pass
+
+    pdf_url = (
+        _pick_attr(pdf_page, "embed[original-url]", "original-url")
+        or _pick_attr(pdf_page, "iframe[src]", "src")
+        or _pick_attr(pdf_page, "embed[type*='pdf']", "src")
+        or _pick_attr(pdf_page, "object[data]", "data")
+        or _pick_attr(pdf_page, "a[href*='.pdf']", "href")
+    )
+    if not pdf_url:
+        print("Aviso: URL do PDF nao encontrada na nova janela.")
+        return None
+
+    abs_url = urljoin(pdf_page.url, pdf_url)
+    pdf_path_try = _download_and_save_pdf(abs_url, referer_url=pdf_page.url)
+    if pdf_path_try:
+        return pdf_path_try
+    print("Aviso: conteudo nao-PDF retornado na nova janela.")
+    return None
+
+
+def _docx_replace_all(doc, mapping: dict[str, str]):
+    def _replace_in_paragraphs(paragraphs):
+        for p in paragraphs:
+            for k, v in mapping.items():
+                if k in p.text:
+                    for r in p.runs:
+                        r.text = r.text.replace(k, v)
+
+    # Body paragraphs
+    _replace_in_paragraphs(doc.paragraphs)
+
+    # Body tables
+    for table in getattr(doc, "tables", []) or []:
+        for row in table.rows:
+            for cell in row.cells:
+                _replace_in_paragraphs(cell.paragraphs)
+
+    # Headers/Footers
+    for section in getattr(doc, "sections", []) or []:
+        try:
+            _replace_in_paragraphs(section.header.paragraphs)
+            _replace_in_paragraphs(section.footer.paragraphs)
+            for table in getattr(section.header, "tables", []) or []:
+                for row in table.rows:
+                    for cell in row.cells:
+                        _replace_in_paragraphs(cell.paragraphs)
+            for table in getattr(section.footer, "tables", []) or []:
+                for row in table.rows:
+                    for cell in row.cells:
+                        _replace_in_paragraphs(cell.paragraphs)
+        except Exception:
+            continue
+
+
+def _resolve_oficio_template() -> Optional[Path]:
+    """Resolve template path from env vars.
+
+    Regras:
+    - Se OFICIO_TEMPLATE apontar para um arquivo (.docx ou .dotx) existente, usa.
+    - Se OFICIO_TEMPLATE for apenas nome de arquivo e OFICIO_TEMPLATES_DIR existir, usa o arquivo dentro da pasta.
+    - Caso contrário, se OFICIO_TEMPLATES_DIR existir, escolhe o primeiro .docx; se não houver .docx, escolhe .dotx.
+    - Senão, tenta templates/oficio_modelo.docx
+    """
+    template_env = os.getenv("OFICIO_TEMPLATE")
+    templates_dir_env = os.getenv("OFICIO_TEMPLATES_DIR")
+
+    if template_env:
+        p = Path(template_env)
+        if p.exists() and p.is_file():
+            return p
+        if templates_dir_env:
+            p2 = Path(templates_dir_env) / template_env
+            if p2.exists() and p2.is_file():
+                return p2
+
+    if templates_dir_env:
+        d = Path(templates_dir_env)
+        if d.exists() and d.is_dir():
+            docxs = sorted(d.glob("*.docx"))
+            if docxs:
+                return docxs[0]
+            dotxs = sorted(d.glob("*.dotx"))
+            if dotxs:
+                return dotxs[0]
+
+    default_p = Path("templates/oficio_modelo.docx")
+    if default_p.exists():
+        return default_p
+    return None
+
+
+def _word_generate_from_dotx(template_path: Path, out_path: Path, mapping: dict[str, str]) -> bool:
+    """Gera DOCX a partir de um .dotx usando Microsoft Word (COM automation).
+
+    Requisitos: MS Word instalado; pywin32 disponível. Retorna True em sucesso.
+    """
+    try:
+        import win32com.client  # type: ignore
+        from win32com.client import constants  # type: ignore
+    except Exception as e:
+        print(f"Aviso: pywin32/Word indisponivel ({e}).")
+        return False
+
+    word = None
+    doc = None
+    try:
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        doc = word.Documents.Add(Template=str(template_path))
+        # Find/Replace para cada placeholder
+        for k, v in mapping.items():
+            find = word.Selection.Find
+            find.ClearFormatting()
+            find.Replacement.ClearFormatting()
+            find.Text = k
+            find.Replacement.Text = v
+            find.Forward = True
+            find.Wrap = 1  # wdFindContinue
+            find.Format = False
+            find.MatchCase = False
+            find.MatchWholeWord = False
+            find.MatchByte = False
+            find.MatchWildcards = False
+            find.MatchSoundsLike = False
+            find.MatchAllWordForms = False
+            find.Execute(Replace=2)  # wdReplaceAll
+        # Salva como DOCX
+        doc.SaveAs2(str(out_path), FileFormat=constants.wdFormatXMLDocument)
+        return True
+    except Exception as e:
+        print(f"Aviso: falha no Word ao gerar a partir do DOTX: {e}")
+        return False
+    finally:
+        try:
+            if doc is not None:
+                doc.Close(SaveChanges=False)
+        except Exception:
+            pass
+        try:
+            if word is not None:
+                word.Quit()
+        except Exception:
+            pass
+
+
+def _python_generate_from_dotx(template_path: Path, out_path: Path, mapping: dict[str, str]) -> bool:
+    """Gera DOCX a partir de um .dotx copiando o arquivo para .docx e
+    executando substituicoes com python-docx (sem MS Word).
+
+    Retorna True em sucesso.
+    """
+    try:
+        import tempfile
+        import zipfile
+        from io import BytesIO
+        from docx import Document  # type: ignore
+
+        # Converte o pacote .dotx em um pacote .docx trocando o content-type principal
+        with tempfile.TemporaryDirectory() as td:
+            tmp_docx = Path(td) / "tmp_from_dotx.docx"
+            with zipfile.ZipFile(template_path, "r") as zin, zipfile.ZipFile(tmp_docx, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+                for info in zin.infolist():
+                    data = zin.read(info.filename)
+                    if info.filename == "[Content_Types].xml":
+                        try:
+                            xml = data.decode("utf-8")
+                        except Exception:
+                            xml = data.decode("utf-8", errors="ignore")
+                        xml = xml.replace(
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml",
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                        )
+                        data = xml.encode("utf-8")
+                    zout.writestr(info, data)
+
+            # Abre como DOCX e executa os replaces
+            doc = Document(str(tmp_docx))
+            _docx_replace_all(doc, mapping)
+            doc.save(str(out_path))
+        return True
+    except Exception as e:
+        print(f"Aviso: falha ao gerar DOCX a partir do DOTX via python-docx: {e}")
+        return False
+
+
+def _python_convert_dotx_only(template_path: Path, out_path: Path) -> bool:
+    """Converte .dotx em .docx SEM alterar o conteúdo (apenas ajusta o content-type OOXML).
+
+    Não requer MS Word. Evita reserialização do documento para garantir que nenhum
+    conteúdo/formatacao seja modificado.
+    """
+    try:
+        import zipfile
+        with zipfile.ZipFile(template_path, "r") as zin, zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename == "[Content_Types].xml":
+                    try:
+                        xml = data.decode("utf-8")
+                    except Exception:
+                        xml = data.decode("utf-8", errors="ignore")
+                    xml = xml.replace(
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml",
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                    )
+                    data = xml.encode("utf-8")
+                zout.writestr(info, data)
+        return True
+    except Exception as e:
+        print(f"Aviso: conversão DOTX->DOCX sem alterações falhou: {e}")
+        return False
+
+
+def generate_oficio_from_template(processo: str, output_dir: Path, extra: dict | None = None) -> Path | None:
+    """Generate a DOCX response using a template when available; fallback to a simple layout.
+
+    Preferred placeholders in templates: {{NUM_PROCESSO}}, {{DATA}}, plus any provided in `extra`.
+    If no .docx template is found (or .dotx is provided), falls back to creating a minimal DOCX.
+    """
+    try:
+        from docx import Document  # type: ignore
+    except Exception as e:
+        print(f"Aviso: python-docx nao instalado ({e}). Pulei geracao do oficio.")
+        return None
+
+    mapping = {"{{NUM_PROCESSO}}": processo, "{{DATA}}": date.today().strftime("%d/%m/%Y")}
+    if extra:
+        mapping.update({str(k): str(v) for k, v in extra.items()})
+
+    # Alias uteis para modelos que usam nomes diferentes
+    nome = mapping.get("{{INTERESSADO}}") or mapping.get("{{REQUERENTE}}")
+    if nome:
+        mapping.setdefault("{{NOME}}", nome)
+        mapping.setdefault("{{NOME_COMPLETO}}", nome)
+
+    # Garantir placeholders @@ usados no DOTX
+    proc_val = mapping.get("{{NUM_PROCESSO}}", processo) or processo or ""
+    mapping.setdefault("@@processo", proc_val)
+    # Data por extenso, baseada na data do documento (se houver)
+    data_doc = mapping.get("{{DATA_DOCUMENTO}}")
+    if data_doc and re.match(r"\d{1,2}/\d{1,2}/\d{4}", str(data_doc)):
+        mapping.setdefault("@@data_extenso", _pt_data_extenso_from_ddmmyyyy(str(data_doc)))
+    elif data_doc:
+        mapping.setdefault("@@data_extenso", str(data_doc))
+    else:
+        mapping.setdefault("@@data_extenso", _pt_data_extenso_from_ddmmyyyy(date.today().strftime("%d/%m/%Y")))
+
+    # Numero do ofício (env ou s/n)
+    mapping.setdefault("@@numero_oficio", os.getenv("NUMERO_OFICIO", "s/n"))
+
+    # Nome do interessado para @@Nome_interessado
+    if nome:
+        mapping.setdefault("@@Nome_interessado", nome)
+
+    # Demais chaves @@ com valor padrão vazio para evitar lixos no DOCX
+    for key in (
+        "@@natureza_processo",
+        "@@Tipo_Processo",
+        "@@processoexterno",
+        "@@nome_relator",
+        "@@instancia",
+    ):
+        mapping.setdefault(key, "")
+
+    doc: Optional["Document"] = None
+    template_path = _resolve_oficio_template()
+    if template_path and template_path.exists():
+        if template_path.suffix.lower() == ".dotx":
+            out_path = output_dir / f"oficio_{safe_filename(processo)}.docx"
+            convert_only = env_bool("OFICIO_CONVERT_ONLY", False)
+            if convert_only:
+                # Apenas converter DOTX -> DOCX, sem substituir placeholders
+                ok = _python_convert_dotx_only(template_path, out_path)
+                if ok:
+                    print(f"Oficio convertido de DOTX para DOCX (sem alterações): {out_path.resolve()}")
+                    return out_path
+                # Fallback com Word (sem replace)
+                ok2 = _word_generate_from_dotx(template_path, out_path, mapping={})
+                if ok2:
+                    print(f"Oficio convertido via Word (sem alterações): {out_path.resolve()}")
+                    return out_path
+                print("Aviso: conversão DOTX->DOCX (sem alterações) falhou; usando modelo simples.")
+            else:
+                # 1) Tenta gerar via python-docx (sem Word): copia DOTX -> DOCX e faz replace
+                ok = _python_generate_from_dotx(template_path, out_path, mapping)
+                if ok:
+                    print(f"Oficio gerado (DOTX via python-docx) em: {out_path.resolve()}")
+                    return out_path
+                # 2) Fallback: tenta MS Word via COM
+                ok2 = _word_generate_from_dotx(template_path, out_path, mapping)
+                if ok2:
+                    print(f"Oficio gerado (Word/DOTX) em: {out_path.resolve()}")
+                    return out_path
+                else:
+                    print("Aviso: conversao DOTX->DOCX falhou; usando modelo simples.")
+        else:
+            try:
+                doc = Document(str(template_path))
+            except Exception as e:
+                print(f"Aviso: nao foi possivel abrir o template '{template_path.name}' ({e}). Usando modelo simples.")
+
+    if doc is None:
+        # Fallback: cria um documento basico com campos comuns
+        doc = Document()
+        doc.add_heading(f"Oficio – Processo {processo}", level=1)
+        doc.add_paragraph(f"Data: {mapping.get('{{DATA}}','')}")
+        if extra:
+            # Inclui alguns campos relevantes quando existirem
+            for k in ("{{ASSUNTO}}", "{{INTERESSADO}}", "{{REQUERENTE}}", "{{DATA_DOCUMENTO}}"):
+                v = mapping.get(k)
+                if v:
+                    label = k.strip("{} ")
+                    doc.add_paragraph(f"{label}: {v}")
+        doc.add_paragraph("")
+        corpo = mapping.get("{{EXTRATO}}") or ""
+        if corpo:
+            doc.add_paragraph(corpo)
+        else:
+            doc.add_paragraph("Em atendimento, encaminhamos resposta referente ao processo informado.")
+    else:
+        _docx_replace_all(doc, mapping)
+
+    out_path = output_dir / f"oficio_{safe_filename(processo)}.docx"
+    try:
+        doc.save(str(out_path))
+        print(f"Oficio gerado em: {out_path.resolve()}")
+        return out_path
+    except Exception as e:
+        print(f"Aviso: falha ao salvar oficio: {e}")
+        return None
+
+
+def extract_text_from_pdf(pdf_path: Path) -> str:
+    """Extract plain text from a PDF using pypdf. Returns empty string on failure."""
+    try:
+        from pypdf import PdfReader  # type: ignore
+    except Exception as e:
+        print(f"Aviso: biblioteca pypdf nao instalada ({e}). Nao foi possivel ler o PDF.")
+        return ""
+
+    try:
+        reader = PdfReader(str(pdf_path))
+        chunks: list[str] = []
+        for page in reader.pages:
+            try:
+                txt = page.extract_text() or ""
+            except Exception:
+                txt = ""
+            if txt:
+                chunks.append(txt)
+        return "\n".join(chunks)
+    except Exception as e:
+        print(f"Aviso: falha ao extrair texto do PDF '{pdf_path.name}': {e}")
+        return ""
+
+
+def parse_fields_from_pdf_text(text: str, processo: Optional[str] = None) -> dict[str, str]:
+    """Parse common fields from PDF text and return mapping for template placeholders.
+
+    Placeholders populated (quando encontrados):
+    - {{NUM_PROCESSO}}
+    - {{ASSUNTO}}
+    - {{INTERESSADO}}
+    - {{REQUERENTE}}
+    - {{DATA_DOCUMENTO}}
+    - {{DATA}} (kept as today's date; DATA_DOCUMENTO is the date found in PDF)
+    - {{EXTRATO}} (first 400 chars as summary)
+    - {{CPF}}, {{MATRICULA}}, {{CARGO}}, {{NASCIMENTO}}
+    """
+    if not text:
+        return {"{{NUM_PROCESSO}}": processo or ""}
+
+    def _m(patterns: list[str]) -> Optional[str]:
+        for pat in patterns:
+            m = re.search(pat, text, flags=re.IGNORECASE | re.MULTILINE)
+            if m:
+                g = m.group(1).strip()
+                # Clean artifacts like excessive spaces
+                return re.sub(r"\s+", " ", g)
+        return None
+
+    out: dict[str, str] = {}
+
+    # Processo number
+    proc = _m([
+        r"Processo\s*(?:n[oº\.]|no)?\s*[:\-]?\s*([\d./-]+)",
+        r"N[ºo]\s*[:\-]?\s*([\d./-]+)\s*Processo",
+    ]) or (processo or "")
+    out["{{NUM_PROCESSO}}"] = proc
+
+    # Interested party / requerente
+    interessado = _m([
+        r"Interessado\s*[:\-]\s*(.+)",
+        r"Requerente\s*[:\-]\s*(.+)",
+    ])
+    if interessado:
+        out["{{INTERESSADO}}"] = interessado
+        out["{{REQUERENTE}}"] = interessado
+
+    # Assunto
+    assunto = _m([
+        r"Assunto\s*[:\-]\s*(.+)",
+        r"Objeto\s*[:\-]\s*(.+)",
+    ])
+    if assunto:
+        out["{{ASSUNTO}}"] = assunto
+
+    # Date present in document (dd/mm/yyyy or dd de mes de yyyy)
+    data_ddmmyyyy = _m([r"(\b\d{1,2}/\d{1,2}/\d{4}\b)"])
+    if not data_ddmmyyyy:
+        data_ddmmyyyy = _m([
+            r"\b(\d{1,2}\s+de\s+[a-zcaiou]+\s+de\s+\d{4})\b",
+        ])
+    if data_ddmmyyyy:
+        out["{{DATA_DOCUMENTO}}"] = data_ddmmyyyy
+
+    # CPF
+    cpf = _m([
+        r"CPF\s*[:\-]\s*([0-9.\-]{11,14})",
+        r"\b(\d{3}\.\d{3}\.\d{3}\-\d{2})\b",
+    ])
+    if cpf:
+        out["{{CPF}}"] = cpf
+
+    # Matrícula / RF
+    matricula = _m([
+        r"Matr[ií]cula\s*[:\-]\s*([A-Za-z0-9/\.-]+)",
+        r"Registro\s*Funcional\s*[:\-]\s*([A-Za-z0-9/\.-]+)",
+        r"\bRF\b\s*[:\-]\s*([A-Za-z0-9/\.-]+)",
+    ])
+    if matricula:
+        out["{{MATRICULA}}"] = matricula
+
+    # Cargo
+    cargo = _m([
+        r"Cargo\s*[:\-]\s*(.+)",
+        r"Fun[cç][aã]o\s*[:\-]\s*(.+)",
+    ])
+    if cargo:
+        out["{{CARGO}}"] = cargo
+
+    # Data de nascimento
+    nasc = _m([
+        r"Data\s*de\s*Nascimento\s*[:\-]\s*([0-9/]{8,10})",
+        r"Nascimento\s*[:\-]\s*([0-9/]{8,10})",
+    ])
+    if nasc:
+        out["{{NASCIMENTO}}"] = nasc
+
+    # Short summary
+    snippet = re.sub(r"\s+", " ", text).strip()
+    if snippet:
+        out["{{EXTRATO}}"] = snippet[:400]
+
+    # Additional fields for @@ placeholders
+    # Tipo do processo
+    tipo_proc = _m([
+        r"Tipo\s*de\s*Processo\s*[:\-]\s*(.+)",
+        r"Tipo\s*do\s*Processo\s*[:\-]\s*(.+)",
+        r"Classe\s*[:\-]\s*(.+)",
+        r"Categoria\s*[:\-]\s*(.+)",
+        r"Tipo\s*[:\-]\s*(.+)",
+    ])
+    if tipo_proc:
+        out["@@Tipo_Processo"] = tipo_proc
+
+    # Natureza do processo
+    natureza = _m([
+        r"Natureza\s*(?:do\s*Processo)?\s*[:\-]\s*(.+)",
+        r"Classe\s*Processual\s*[:\-]\s*(.+)",
+    ])
+    if natureza:
+        out["@@natureza_processo"] = natureza
+
+    # Processo externo
+    proc_ext = _m([
+        r"Proc(?:esso)?\.?\s*Externo\s*[:\-]\s*(.+)",
+        r"Processo\s*Externo\s*[:\-]\s*(.+)",
+        r"Externo\s*[:\-]\s*(.+)",
+    ])
+    if proc_ext:
+        out["@@processoexterno"] = proc_ext
+
+    # Relator
+    relator = _m([
+        r"Conselheiro\s*Relator\s*[:\-]\s*(.+)",
+        r"Relator\s*[:\-]\s*(.+)",
+    ])
+    if relator:
+        out["@@nome_relator"] = relator
+
+    # Instância
+    instancia = _m([
+        r"Inst[âa]ncia\s*[:\-]\s*(.+)",
+        r"Instancia\s*[:\-]\s*(.+)",
+    ])
+    if instancia:
+        out["@@instancia"] = instancia
+
+    # Interessado → Nome_interessado
+    if interessado:
+        out["@@Nome_interessado"] = interessado
+
+    # Processo → @@processo
+    out["@@processo"] = proc
+
+    # Número do ofício: opcional via env; não costuma vir no PDF
+    num_of = os.getenv("NUMERO_OFICIO", "").strip()
+    out["@@numero_oficio"] = num_of if num_of else "s/n"
+
+    # Data por extenso
+    data_src = out.get("{{DATA_DOCUMENTO}}")
+    if data_src:
+        # Se já estiver por extenso, mantém; caso contrário, converte dd/mm/yyyy
+        if re.match(r"\d{1,2}/\d{1,2}/\d{4}", data_src):
+            out["@@data_extenso"] = _pt_data_extenso_from_ddmmyyyy(data_src)
+        else:
+            out["@@data_extenso"] = data_src
+    else:
+        out["@@data_extenso"] = _pt_data_extenso_from_ddmmyyyy(date.today().strftime("%d/%m/%Y"))
+
+    return out
+
+
+def attach_docx_to_portal(context, page, docx_path: Path) -> bool:
+    """Try to attach the generated DOCX in the current process UI.
+
+    This looks for an <input type=file> or a button that opens a file chooser
+    in any visible frame and attempts to upload the provided file.
+    Returns True if the file was submitted to the form.
+    """
+    if not docx_path or not docx_path.exists():
+        return False
+
+    # 1) Direct file inputs across frames (bounded, non-blocking)
+    containers = [page] + list(page.frames)
+    for c in containers:
+        try:
+            el = c.query_selector("input[type='file']")
+            if el:
+                try:
+                    el.set_input_files(str(docx_path))
+                    print(f"Arquivo anexado via input[file]: {docx_path.name}")
+                    # Try to click a likely 'Salvar'/'Enviar' afterwards
+                    for btn_text in ("Salvar", "Gravar", "Enviar", "Confirmar"):
+                        try:
+                            c.get_by_role("button", name=re.compile(btn_text, re.I)).first.click()
+                            break
+                        except Exception:
+                            continue
+                    return True
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+    # 2) Try buttons that open a file chooser
+    trigger_texts = ["Anexar", "Incluir", "Inserir", "Upload", "Novo Documento", "Adicionar"]
+    for c in containers:
+        for txt in trigger_texts:
+            try:
+                with page.expect_file_chooser(timeout=5000) as fc_info:
+                    c.get_by_role("button", name=re.compile(txt, re.I)).first.click()
+                fc = fc_info.value
+                fc.set_files(str(docx_path))
+                print(f"Arquivo selecionado para upload: {docx_path.name}")
+                # Try to confirm
+                for btn_text in ("Salvar", "Gravar", "Enviar", "Confirmar"):
+                    try:
+                        c.get_by_role("button", name=re.compile(btn_text, re.I)).first.click()
+                        break
+                    except Exception:
+                        continue
+                return True
+            except Exception:
+                continue
+
+    print("Aviso: nao foi possivel localizar interface de anexo automaticamente.")
+    return False
+
+
+def main():
+    load_dotenv()  # load .env if present
+
+    url = os.getenv("ETCM_URL", "https://homologacao-etcm.tcm.sp.gov.br/paginas/login.aspx")
+    username = os.getenv("ETCM_USERNAME")
+    password = os.getenv("ETCM_PASSWORD")
+    headless = env_bool("HEADLESS", False)
+    attach_only = env_bool("ATTACH_ONLY", False)
+
+    if not username or not password:
+        print("ERRO: defina ETCM_USERNAME e ETCM_PASSWORD (via .env ou variaveis de ambiente).")
+        sys.exit(2)
+
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless, channel="chrome")
+        context = browser.new_context(viewport={"width": 1600, "height": 900}, accept_downloads=True)
+        page = context.new_page()
+
+        # 1) Login
+        print(f"Acessando: {url}")
+        page.goto(url, wait_until="load", timeout=60000)
+
+        # Username: prefer explicit DevExpress ids/names; fallback strategies next
+        try:
+            page.locator("#ctl00_cphMain_txtUsuario_I, input[name='ctl00$cphMain$txtUsuario']").first.fill(username)
+        except Exception:
+            try:
+                page.locator("input[placeholder*='Usu'] , input[name*='Usuario' i]").first.fill(username)
+            except Exception:
+                page.locator("input[type='text']").first.fill(username)
+
+        # Password: prefer explicit DevExpress ids/names; fallback strategies next
+        try:
+            page.locator("#ctl00_cphMain_txtSenha_I, input[name='ctl00$cphMain$txtSenha'][type='password']").first.fill(password)
+        except Exception:
+            try:
+                page.locator("input[type='password']").first.fill(password)
+            except Exception as e:
+                raise RuntimeError("Nao foi possivel localizar o campo de senha.") from e
+
+        # Login button (DevExpress): prefer container, then other fallbacks, then Enter key
+        clicked = False
+        try:
+            page.locator("#ctl00_cphMain_btnLogin").click()
+            clicked = True
+        except Exception:
+            pass
+        if not clicked:
+            try:
+                page.get_by_role("button", name=re.compile(r"Entrar|Acessar|Login", re.I)).click()
+                clicked = True
+            except Exception:
+                pass
+        if not clicked:
+            try:
+                page.locator(
+                    "input[type='submit'][value*='Entrar' i]:not([readonly]):not([disabled])"
+                ).first.click()
+                clicked = True
+            except Exception:
+                pass
+        if not clicked:
+            try:
+                page.locator("#ctl00_cphMain_btnLogin span.dx-vam:has-text('Entrar')").first.click()
+                clicked = True
+            except Exception:
+                try:
+                    page.locator("text=/\\b(Entrar|Acessar|Login)\\b/i").locator(":visible").first.click()
+                    clicked = True
+                except Exception:
+                    pass
+        if not clicked:
+            try:
+                page.locator("#ctl00_cphMain_txtSenha_I, input[type='password']").first.press("Enter")
+                clicked = True
+            except Exception as e:
+                raise RuntimeError("Nao foi possivel acionar o login (botao/Enter nao disponiveis).") from e
+
+        # Wait for the next page or app area to load
+        page.wait_for_load_state("networkidle", timeout=60000)
+
+        # Modo ATTACH_ONLY: apenas anexa o DOCX mais recente via Gerenciador de Atos
+        ger_atos_url = os.getenv("ETCM_GERENCIA_ATO_URL")
+        if attach_only:
+            if ger_atos_url:
+                try:
+                    print(f"Acessando Gerenciador de Atos: {ger_atos_url}")
+                    page.goto(ger_atos_url, wait_until="load", timeout=60000)
+                except Exception:
+                    pass
+            proc_label = os.getenv("PROCESSO_LABEL", "")
+            latest_docx = None
+            try:
+                latest_docx = sorted(Path("output").glob("*.docx"), key=lambda p: p.stat().st_mtime, reverse=True)[0]
+            except Exception:
+                latest_docx = None
+            if not latest_docx:
+                print("ERRO: nenhum DOCX encontrado em output/ para anexar.")
+                context.close(); browser.close(); return
+            try:
+                # Se nao foi passada a URL do gerenciador, tente abrir via grid usando o numero do processo
+                if not ger_atos_url and proc_label:
+                    open_gerenciador_atos_from_grid(context, page, proc_label)
+                ok = attach_docx_via_gerenciador_atos(context, page, proc_label, latest_docx)
+                if ok:
+                    print("Anexo do DOCX concluido (ATTACH_ONLY).")
+                else:
+                    print("Aviso: nao foi possivel anexar o DOCX no modo ATTACH_ONLY.")
+            except Exception as e:
+                print(f"Aviso: falha no anexo ATTACH_ONLY: {e}")
+            context.close(); browser.close(); return
+
+        # Direct viewer URL (optional fast-path)
+        viewer_url = os.getenv("ETCM_VIEWER_URL")
+        if viewer_url:
+            print(f"Acessando visualizador direto: {viewer_url}")
+            page.goto(viewer_url, wait_until="load", timeout=60000)
+            # Try to fetch and save last PDF immediately
+            proc_label = os.getenv("PROCESSO_LABEL", "viewer")
+            try:
+                pdf_path = click_last_piece_and_open_pdf(context, page, output_dir, proc_label)
+                if pdf_path:
+                    # Gera oficio a partir de template, se existir
+                    pdf_text = extract_text_from_pdf(pdf_path)
+                    fields = parse_fields_from_pdf_text(pdf_text, proc_label)
+                    docx_path = generate_oficio_from_template(proc_label, output_dir, extra=fields)
+                    if docx_path:
+                        try:
+                            attached = attach_docx_to_portal(context, page, docx_path)
+                            if not attached:
+                                # Tenta via Gerenciador de Atos. Se informada URL direta, navega ate ela.
+                                ger_url_env = os.getenv("ETCM_GERENCIA_ATO_URL")
+                                if ger_url_env:
+                                    try:
+                                        page.goto(ger_url_env, wait_until="load", timeout=30000)
+                                    except Exception:
+                                        pass
+                                attached = attach_docx_via_gerenciador_atos(context, page, proc_label, docx_path)
+                            if attached:
+                                print("Anexo do DOCX concluido.")
+                            else:
+                                print("Aviso: anexo do DOCX nao foi concluido automaticamente.")
+                        except Exception as e:
+                            print(f"Aviso: falha ao anexar DOCX: {e}")
+            except Exception as e:
+                print(f"Aviso: falha no fluxo do visualizador direto: {e}")
+            print("Concluido com sucesso.")
+            context.close()
+            browser.close()
+            return
+
+        # 2) Find the menu frame with "Processos"
+        print("Procurando o menu 'Processos'...")
+        fr_menu = find_frame_with_text(page, "Processos", timeout_ms=30000)
+
+        # 3) Click on "Processos"
+        print("Clicando em 'Processos'...")
+        fr_menu.get_by_text("Processos", exact=True).first.click(force=True)
+
+        # 4) Click on "Em confeccao APO-PEN" (text may include counters)
+        print("Abrindo 'Em confeccao APO-PEN'...")
+        fr_menu.get_by_text(re.compile(r"Em\s*confec.*APO-?PEN", re.I)).first.click(force=True)
+
+        # 5) After opening, a grid usually appears elsewhere; wait and try to export
+        time.sleep(1.0)
+        target_frame = None
+        try:
+            target_frame = find_frame_with_text(page, "Aposentadoria", timeout_ms=10000)
+        except Exception:
+            try:
+                target_frame = find_frame_with_text(page, "Processos", timeout_ms=5000)
+            except Exception:
+                pass
+
+        # 6) Click "Exportar" and download the spreadsheet (Processos grid preferred)
+        print("Procurando botão 'Exportar'...")
+        def _visible_count(sel: str) -> int:
+            try:
+                return page.locator(sel).filter(has_text="Exportar").and_(page.locator(":visible")).count()
+            except Exception:
+                return 0
+
+        # Prefer the Processos grid export, then fallback to Documentos
+        export_selectors = [
+            "#sptMesaTrabalho_gvProcesso_Title_btnExport, #sptMesaTrabalho_gvProcesso_Title_btnExport_I",
+            "#sptMesaTrabalho_gvDocumentos_Title_btnExport, #sptMesaTrabalho_gvDocumentos_Title_btnExport_I",
+        ]
+        export_clicked = False
+        downloaded_file: Path | None = None
+        for sel in export_selectors:
+            try:
+                loc = page.locator(sel).first
+                # Wait a bit for visibility
+                loc.wait_for(state="visible", timeout=15000)
+                with page.expect_download(timeout=60000) as dl_info:
+                    loc.click()
+                download = dl_info.value
+                suggested = download.suggested_filename
+                dest_path = output_dir / suggested
+                try:
+                    download.save_as(str(dest_path))
+                except Exception:
+                    # Fallback to temporary path if save_as fails
+                    tmp_path = download.path()
+                    if tmp_path:
+                        # Copy to dest
+                        import shutil
+                        shutil.copyfile(tmp_path, dest_path)
+                print(f"Planilha baixada em: {dest_path.resolve()}")
+                export_clicked = True
+                downloaded_file = dest_path
+                break
+            except Exception:
+                continue
+        if not export_clicked:
+            print("Aviso: botão 'Exportar' não encontrado ou download não disparou.")
+
+        # Screenshot for sanity
+        png_path = output_dir / "apos_apo_pen.png"
+        page.screenshot(path=str(png_path), full_page=True)
+        print(f"Screenshot salvo em: {png_path.resolve()}")
+
+        # Itera todos os processos (via PROCESSOS_LIST ou PROCESS_ALL=true)
+        try:
+            src_file = downloaded_file if downloaded_file and downloaded_file.exists() else find_latest_export_file(output_dir)
+        except Exception:
+            src_file = None
+        doit_all = env_bool("PROCESS_ALL", False) or bool(os.getenv("PROCESSOS_LIST"))
+        if doit_all:
+            processos: list[str] = []
+            env_list = os.getenv("PROCESSOS_LIST")
+            if env_list:
+                sep = ";" if ";" in env_list and "," not in env_list else ","
+                processos = [s.strip() for s in env_list.split(sep) if s.strip()]
+            elif src_file and src_file.exists():
+                processos = extract_processos_from_excel(src_file)
+            if not processos:
+                print("Aviso: nenhuma linha de processo identificada para processar.")
+            else:
+                try:
+                    max_proc = int(os.getenv("MAX_PROCESSOS", "0"))
+                except Exception:
+                    max_proc = 0
+                if max_proc > 0:
+                    processos = processos[:max_proc]
+                seen = set()
+                processos = [p for p in processos if not (p in seen or seen.add(p))]
+                print(f"Processos a tratar ({len(processos)}): {processos}")
+                for idx, pr in enumerate(processos, start=1):
+                    print(f"\n[{idx}/{len(processos)}] Tratando processo: {pr}")
+                    try:
+                        # 1) Tenta o caminho solicitado pelo usuario: filtrar pelo 'N° Processo' no grid e clicar na lupa
+                        maybe_page = filter_and_open_processo(context, page, pr)
+                        active_page = maybe_page or page
+                        # Aguarda o visualizador carregar; se nao carregar, usa a busca classica como fallback
+                        try:
+                            # Sinal tipico do visualizador carregado
+                            find_frame_with_selector(active_page, "#splLeitorDocumentos_pgcPecas_trePecas", timeout_ms=15000)
+                        except Exception:
+                            # Alternativa: detectar hidden input com o numero do processo
+                            try:
+                                active_page.locator(f"#cod_processo[value*='{pr}']").first.wait_for(state="attached", timeout=8000)
+                            except Exception:
+                                # Fallback: busca pelo campo de processo e abre o visualizador
+                                active_page = search_processo_and_open_viewer(context, page, pr)
+                        pdf_path = click_last_piece_and_open_pdf(context, active_page, output_dir, pr)
+                        if not pdf_path:
+                            print(f"Aviso: nenhum PDF encontrado para {pr}.")
+                            continue
+                        pdf_text = extract_text_from_pdf(pdf_path)
+                        fields = parse_fields_from_pdf_text(pdf_text, pr)
+                        docx_path = generate_oficio_from_template(pr, output_dir, extra=fields)
+                        if docx_path:
+                            try:
+                                # Preferir anexo no Gerenciador de Atos (conforme solicitado)
+                                attached = attach_docx_via_gerenciador_atos(context, page, pr, docx_path)
+                                if not attached:
+                                    attached = attach_docx_to_portal(context, active_page, docx_path)
+                                if attached:
+                                    print("Anexo do DOCX concluido.")
+                                else:
+                                    print("Aviso: anexo do DOCX nao foi concluido automaticamente.")
+                            except Exception as e:
+                                print(f"Aviso: falha ao anexar DOCX: {e}")
+                    except Exception as e:
+                        print(f"Aviso: falha ao navegar e baixar PDF para {pr}: {e}")
+                    finally:
+                        try:
+                            if active_page is not None and active_page != page:
+                                active_page.close()
+                        except Exception:
+                            pass
+                print("Concluido com sucesso.")
+                context.close()
+                browser.close()
+                return
+
+        # 7) Ler planilha e tentar baixar PDF do ultimo ato do processo
+        processo_num = None
+        try:
+            src_file = downloaded_file if downloaded_file and downloaded_file.exists() else find_latest_export_file(output_dir)
+        except Exception:
+            src_file = None
+        if src_file and src_file.exists():
+            processo_num = extract_processo_from_excel(src_file)
+            if processo_num:
+                print(f"Processo identificado na planilha: {processo_num}")
+            else:
+                print("Aviso: nao foi possivel extrair 'N° Processo' da planilha.")
+        else:
+            print("Aviso: nenhuma planilha encontrada para leitura.")
+
+        if processo_num:
+            try:
+                # 1) Tenta o caminho solicitado pelo usuario: filtrar pelo 'N° Processo' no grid e clicar na lupa
+                maybe_page = filter_and_open_processo(context, page, processo_num)
+                active_page = maybe_page or page
+                # Aguarda o visualizador carregar; se nao carregar, usa a busca classica como fallback
+                try:
+                    find_frame_with_selector(active_page, "#splLeitorDocumentos_pgcPecas_trePecas", timeout_ms=15000)
+                except Exception:
+                    try:
+                        active_page.locator(f"#cod_processo[value*='{processo_num}']").first.wait_for(state="attached", timeout=8000)
+                    except Exception:
+                        # Fallback: busca pelo campo de processo e abre o visualizador
+                        active_page = search_processo_and_open_viewer(context, page, processo_num)
+                pdf_path = click_last_piece_and_open_pdf(context, active_page, output_dir, processo_num)
+                if pdf_path:
+                    # Extrai texto do PDF e preenche campos
+                    pdf_text = extract_text_from_pdf(pdf_path)
+                    fields = parse_fields_from_pdf_text(pdf_text, processo_num)
+                    # Gera oficio a partir de template, se existir
+                    docx_path = generate_oficio_from_template(processo_num, output_dir, extra=fields)
+                    # Tenta anexar o DOCX gerado no sistema
+                    if docx_path:
+                        try:
+                            attached = attach_docx_to_portal(context, active_page, docx_path)
+                            if not attached:
+                                attached = attach_docx_via_gerenciador_atos(context, page, processo_num, docx_path)
+                            if attached:
+                                print("Anexo do DOCX concluido.")
+                            else:
+                                print("Aviso: anexo do DOCX nao foi concluido automaticamente.")
+                        except Exception as e:
+                            print(f"Aviso: falha ao anexar DOCX: {e}")
+            except Exception as e:
+                print(f"Aviso: falha ao navegar e baixar PDF: {e}")
+            finally:
+                try:
+                    if active_page is not None and active_page != page:
+                        active_page.close()
+                except Exception:
+                    pass
+
+        print("Concluido com sucesso.")
+        context.close()
+        browser.close()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+

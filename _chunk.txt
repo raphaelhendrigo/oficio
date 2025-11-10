@@ -1,0 +1,250 @@
+import os
+import re
+import sys
+import time
+import unicodedata
+from datetime import date
+from typing import Optional
+from pathlib import Path
+from urllib.parse import urljoin
+
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name, str(default))
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def safe_filename(name: str) -> str:
+    """Return a filesystem-safe slug for filenames based on a label like o número do processo."""
+    if not name:
+        return "arquivo"
+    # Replace path separators and illegal chars
+    s = re.sub(r"[\\/]+", "_", str(name))
+    s = re.sub(r"[^\w\-. ]+", "_", s, flags=re.UNICODE)
+    s = s.strip().strip("._")
+    return s or "arquivo"
+
+
+def find_frame_with_text(page, text: str, timeout_ms: int = 30000):
+    """Loop through frames until one contains the given text (substring)."""
+    deadline = time.time() + (timeout_ms / 1000.0)
+    last_err = None
+    while time.time() < deadline:
+        for fr in page.frames:
+            try:
+                loc = fr.get_by_text(text, exact=False)
+                # .count() waits for DOM stability enough for text lookup
+                if loc.count() > 0:
+                    return fr
+            except Exception as e:
+                last_err = e
+                continue
+        time.sleep(0.3)
+    if last_err:
+        raise last_err
+    raise PWTimeoutError(f"Frame with text '{text}' not found in {timeout_ms}ms.")
+
+
+def find_frame_with_selector(page, selector: str, timeout_ms: int = 30000):
+    """Find a frame containing an element matching selector that is attached in DOM."""
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        for fr in page.frames:
+            try:
+                loc = fr.locator(selector)
+                if loc.count() > 0:
+                    try:
+                        loc.first.wait_for(state="attached", timeout=1000)
+                    except Exception:
+                        pass
+                    return fr
+            except Exception:
+                continue
+        time.sleep(0.3)
+    raise PWTimeoutError(f"Frame with selector '{selector}' not found in {timeout_ms}ms.")
+
+
+def normalize(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.replace("º", "o").replace("°", "o").replace("ª", "a")
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join([c for c in s if not unicodedata.combining(c)])
+    return s
+
+
+def find_latest_export_file(directory: Path) -> Path | None:
+    candidates = []
+    for ext in ("*.xlsx", "*.xls"):
+        candidates.extend(directory.glob(ext))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def find_processo_column_index(headers: list[str]) -> int | None:
+    best_idx = None
+    for i, h in enumerate(headers):
+        hl = normalize(h).strip().lower()
+        if not hl:
+            continue
+        if "processo" in hl and any(tag in hl for tag in ("n", "no", "n.", "n ", "numero")):
+            return i
+        if best_idx is None and "processo" in hl:
+            best_idx = i
+    if best_idx is not None:
+        return best_idx
+    if len(headers) >= 5:
+        return 4
+    return None
+
+
+def extract_processo_from_excel(path: Path) -> str | None:
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".xlsx":
+            from openpyxl import load_workbook  # type: ignore
+            wb = load_workbook(filename=str(path), read_only=True, data_only=True)
+            ws = wb.active
+            header = None
+            idx = None
+            for row in ws.iter_rows(values_only=True):
+                values = ["" if v is None else str(v) for v in row]
+                if header is None:
+                    header = values
+                    idx = find_processo_column_index(header)
+                    if idx is None:
+                        continue
+                    continue
+                if idx is None or idx >= len(values):
+                    continue
+                val = values[idx]
+                if val and str(val).strip():
+                    return str(val).strip()
+            return None
+        elif suffix == ".xls":
+            import xlrd  # type: ignore
+            book = xlrd.open_workbook(str(path))
+            sheet = book.sheet_by_index(0)
+            header_row = 0
+            idx = None
+            for r in range(min(5, sheet.nrows)):
+                row_vals = [str(sheet.cell_value(r, c)) for c in range(sheet.ncols)]
+                idx_try = find_processo_column_index(row_vals)
+                if idx_try is not None:
+                    header_row = r
+                    idx = idx_try
+                    break
+            if idx is None:
+                return None
+            for r in range(header_row + 1, sheet.nrows):
+                try:
+                    v = sheet.cell_value(r, idx)
+                except Exception:
+                    continue
+                if v is None:
+                    continue
+                txt = str(v).strip()
+                if txt:
+                    return txt
+            return None
+        else:
+            return None
+    except Exception as e:
+        print(f"Aviso: falha ao ler planilha {path.name}: {e}")
+        return None
+
+
+def extract_processos_from_excel(path: Path) -> list[str]:
+    """Extrai todos os números de processo da planilha, na mesma coluna detectada.
+
+    Retorna os valores não-vazios encontrados na coluna identificada como "Processo".
+    """
+    processos: list[str] = []
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".xlsx":
+            from openpyxl import load_workbook  # type: ignore
+            wb = load_workbook(filename=str(path), read_only=True, data_only=True)
+            ws = wb.active
+            header = None
+            idx = None
+            for row in ws.iter_rows(values_only=True):
+                values = ["" if v is None else str(v) for v in row]
+                if header is None:
+                    header = values
+                    idx = find_processo_column_index(header)
+                    continue
+                if idx is None or idx >= len(values):
+                    continue
+                val = values[idx]
+                if val and str(val).strip():
+                    processos.append(str(val).strip())
+            return processos
+        elif suffix == ".xls":
+            import xlrd  # type: ignore
+            book = xlrd.open_workbook(str(path))
+            sheet = book.sheet_by_index(0)
+            header_row = 0
+            idx = None
+            for r in range(min(5, sheet.nrows)):
+                row_vals = [str(sheet.cell_value(r, c)) for c in range(sheet.ncols)]
+                idx_try = find_processo_column_index(row_vals)
+                if idx_try is not None:
+                    header_row = r
+                    idx = idx_try
+                    break
+            if idx is None:
+                return []
+            for r in range(header_row + 1, sheet.nrows):
+                try:
+                    v = sheet.cell_value(r, idx)
+                except Exception:
+                    continue
+                if v is None:
+                    continue
+                txt = str(v).strip()
+                if txt:
+                    processos.append(txt)
+            return processos
+        else:
+            return []
+    except Exception as e:
+        print(f"Aviso: falha ao ler planilha {path.name}: {e}")
+        return processos
+
+
+def search_processo_and_open_viewer(context, page, processo: str):
+    search_frame = None
+    try:
+        search_frame = find_frame_with_selector(page, "#cbbProcesso_I", timeout_ms=15000)
+    except Exception:
+        if page.locator("#cbbProcesso_I").count() == 0:
+            raise
+
+    target = search_frame if search_frame else page
+    target.locator("#cbbProcesso_I").fill(processo)
+    clicked = False
+    pages_before = list(context.pages)
+    try:
+        btn = target.locator("button[onclick='BuscaProcesso();']").first
+        if btn.count() > 0:
+            btn.click()
+            clicked = True
+    except Exception:
+        pass
+    if not clicked:
+        try:
+            target.locator("#cbbProcesso_I").press("Enter")
+            clicked = True
+        except Exception:
+            pass
+    # If viewer loads in same page, its frame should appear
+    try:
+        find_frame_with_selector(page, "#splLeitorDocumentos_pgcPecas_trePecas", timeout_ms=60000)
+        return page
+    except Exception:

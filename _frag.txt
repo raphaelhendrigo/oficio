@@ -1,0 +1,37 @@
+        # Aguarda aparecer algum seletor do botão Confirmar
+        try:
+            target.wait_for_selector(
+                "#cbpArquivos_btnConfirmar, #cbpArquivos_btnConfirmar_I, input[name='cbpArquivos$btnConfirmar'], #btnConfirmar, #btnConfirmar_I",
+                timeout=8000,
+            )
+        except Exception:
+            pass
+        clicked_confirm = False
+        for conf_sel in (
+            "#cbpArquivos_btnConfirmar",          # container (antigo)
+            "#cbpArquivos_btnConfirmar_I",       # input submit (antigo)
+            "input[name='cbpArquivos$btnConfirmar']",
+            "#btnConfirmar",                      # novo uploadato.aspx
+            "#btnConfirmar_I",
+        ):
+            try:
+                loc = target.locator(conf_sel).first
+                if loc.count() > 0:
+                    try:
+                        loc.click(force=True)
+                        clicked_confirm = True
+                        break
+                    except Exception:
+                        try:
+                            handle = loc.element_handle(timeout=1000)
+                        except Exception:
+                            handle = None
+                        if handle is not None:
+                            try:
+                                target.evaluate("el => el.click()", handle)
+                                clicked_confirm = True
+                                break
+                            except Exception:
+                                pass
+            except Exception:
+                continue
