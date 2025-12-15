@@ -43,6 +43,7 @@ $env:ETCM_USERNAME="<seu_usuario>"; $env:ETCM_PASSWORD="<sua_senha>"; `
 - `ETCM_URL` (padrão: login da homologação)
 - `ETCM_USERNAME`, `ETCM_PASSWORD` (obrigatórias)
 - `HEADLESS` (true/false, padrão false)
+- `SHOW_BROWSER`/`WATCH_MODE` (true) força janela visível mesmo se HEADLESS=true; `SLOWMO_MS` ajusta o delay entre ações; `PAUSE_AFTER_LOGIN_MS` mantém pausa após login para acompanhar/solucionar captcha; `LOGIN_MANUAL_WAIT_MS` define quanto tempo esperar você concluir o login manualmente se a tela de login continuar aparecendo; `DEVTOOLS` abre o DevTools junto com o navegador.
 - `OFICIO_TEMPLATES_DIR` diretório com modelos .docx
 - `OFICIO_TEMPLATE` nome do arquivo .docx dentro do diretório (opcional)
 - `ETCM_VIEWER_URL` URL direta do visualizador (opcional, fast‑path)
