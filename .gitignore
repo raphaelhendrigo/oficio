@@ -5,3 +5,7 @@ playwright/.cache/
 *.pyc
 .env
 storage_state*.json
+artifacts/
+logs/
+docs/video_frames/
+video_silvana.mp4
