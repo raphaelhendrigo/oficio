@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+output/
+playwright/.cache/
+*.pyc
+.env
+storage_state*.json
