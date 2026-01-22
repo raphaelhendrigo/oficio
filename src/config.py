@@ -63,6 +63,8 @@ class Config:
     status_entrega: str
     prazo_dias: str
     anexo_docx: str
+    visoes: str
+    distribuido_para: str
 
 
 def load_config() -> Config:
@@ -98,6 +100,8 @@ def load_config() -> Config:
     status_entrega = env_str("STATUS_ENTREGA", "Urgente")
     prazo_dias = env_str("PRAZO_DIAS", "60")
     anexo_docx = env_str("ANEXO_DOCX", "")
+    visoes = env_str("VISOES", "Aposentadoria")
+    distribuido_para = env_str("DISTRIBUIDO_PARA", "")
 
     return Config(
         base_url=base_url,
@@ -125,4 +129,6 @@ def load_config() -> Config:
         status_entrega=status_entrega,
         prazo_dias=prazo_dias,
         anexo_docx=anexo_docx,
+        visoes=visoes,
+        distribuido_para=distribuido_para,
     )

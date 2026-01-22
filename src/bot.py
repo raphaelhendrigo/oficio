@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Optional
 
@@ -137,6 +138,8 @@ def normalize(text: str) -> str:
     if text is None:
         return ""
     text = str(text)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
     text = text.replace("§", "o").replace("ø", "o").replace("¦", "a")
     text = re.sub(r"\s+", " ", text)
     return text
@@ -159,6 +162,8 @@ class StepRunner:
             "STATUS_ENTREGA": config.status_entrega,
             "PRAZO_DIAS": config.prazo_dias,
             "ANEXO_DOCX": config.anexo_docx,
+            "VISOES": config.visoes,
+            "DISTRIBUIDO_PARA": config.distribuido_para,
         }
 
     def set_process(self, processo: str) -> None:
@@ -176,6 +181,10 @@ class StepRunner:
             self.page.wait_for_function(script, arg=selectors, timeout=timeout_ms)
         except Exception:
             pass
+        try:
+            self.page.get_by_text("Carregando", exact=False).first.wait_for(state="hidden", timeout=timeout_ms)
+        except Exception:
+            pass
 
     def find_input_by_label(self, label_text: str):
         label = self.page.locator("label", has_text=re.compile(label_text, re.I)).first
@@ -189,6 +198,32 @@ class StepRunner:
         if candidate.count() > 0:
             return candidate
         return None
+
+    def find_grid_filter_input(self, grid_selector: str, column_text: str):
+        grid = self.page.locator(grid_selector).first
+        if grid.count() == 0:
+            return None
+        header_row = grid.locator("tr[id*='DXHeadersRow'], tr.dxgvHeader").first
+        if header_row.count() == 0:
+            return None
+        headers = header_row.locator("th, td")
+        try:
+            header_texts = headers.all_text_contents()
+        except Exception:
+            header_texts = []
+        target_norm = normalize(column_text).strip().lower()
+        idx = None
+        for i, text in enumerate(header_texts):
+            if target_norm and target_norm in normalize(text).strip().lower():
+                idx = i
+                break
+        if idx is None:
+            return None
+        filter_row = grid.locator("tr[id*='DXFilterRow'], tr.dxgvFilterRow").first
+        if filter_row.count() == 0:
+            return None
+        cell = filter_row.locator("td").nth(idx)
+        return cell.locator("input, textarea").first
 
     def resolve_locator(self, strategy: str, hint: str):
         if not hint:
@@ -281,9 +316,13 @@ class StepRunner:
         retries = int(step.get("retries", 2))
         expect_popup = bool(step.get("expect_popup", False))
         wait_state = step.get("wait_state") or step.get("state") or "visible"
+        skip_if_empty = bool(step.get("skip_if_empty", False))
 
         value = step.get("value", "")
         value = expand_value(value, self.variables)
+        if skip_if_empty and isinstance(value, str) and not value.strip():
+            self.logger.info("Step %s skipped (empty value)", step_id)
+            return
         locator = None
         if locator_hint:
             locator = self.resolve_locator(locator_strategy, expand_value(locator_hint, self.variables))
@@ -374,6 +413,26 @@ class StepRunner:
                         locator.click(timeout=self.config.timeout_ms)
                     else:
                         locator.wait_for(state="visible", timeout=self.config.timeout_ms)
+                elif action == "filter_grid":
+                    if not target_hint:
+                        raise RuntimeError("Column name not provided")
+                    grid_hint = expand_value(locator_hint, self.variables)
+                    grid_candidates = split_candidates(grid_hint) if grid_hint else []
+                    input_loc = None
+                    for grid_sel in grid_candidates:
+                        input_loc = self.find_grid_filter_input(grid_sel, target_hint)
+                        if input_loc and input_loc.count() > 0:
+                            break
+                    if not input_loc:
+                        raise RuntimeError("Grid filter input not resolved")
+                    if mode != "dry-run":
+                        input_loc.fill(str(value), timeout=self.config.timeout_ms)
+                        try:
+                            input_loc.press("Enter")
+                        except Exception:
+                            pass
+                    else:
+                        input_loc.wait_for(state="visible", timeout=self.config.timeout_ms)
                 elif action == "click_row_icon":
                     icon = self.resolve_row_icon(expand_value(locator_hint, self.variables))
                     if not icon:

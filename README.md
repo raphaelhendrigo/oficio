@@ -7,7 +7,8 @@ com Playwright, logs e evidencias por etapa.
 - Windows 10/11
 - Python 3.10+
 - PowerShell
-- ffmpeg no PATH (para extrair frames)
+- ffmpeg no PATH (preferido para extrair frames)
+- opencv-python (opcional, fallback quando ffmpeg nao existe)
 - Playwright (instala os navegadores via comando)
 
 ## Setup rapido
@@ -17,7 +18,24 @@ python -m venv .venv
 .\.venv\Scripts\python -m playwright install
 ```
 
-## A) Extrair frames do video
+## A) Extrair frames do video (atual)
+```powershell
+# Gera frames + metadata em docs/video_silvana/
+.\.venv\Scripts\python tools\ingest_video.py
+
+# Fallback quando nao houver ffmpeg/opencv (reusa docs/video_frames)
+.\.venv\Scripts\python tools\ingest_video.py --reuse-existing
+```
+
+Artefatos principais:
+- `docs/video_silvana/frames/`
+- `docs/video_silvana/metadata.json`
+- `docs/video_silvana/frames_manifest.json`
+- `docs/video_silvana/index.md`
+- `docs/video_silvana/flow.md`
+- `docs/video_silvana/gaps.md`
+
+## A.1) Extrair frames (legado)
 ```powershell
 # Intervalo (1s)
 .\.venv\Scripts\python tools\extract_frames.py --mode interval --every 1
@@ -30,6 +48,7 @@ python -m venv .venv
 ```
 
 Abra `docs/video_frames/index.html` para revisar rapidamente.
+Para o novo fluxo: `.\.venv\Scripts\python tools\make_contact_sheet.py --frames-dir docs/video_silvana/frames --output docs/video_silvana/index.html`.
 
 ## B) (Opcional) OCR dos frames
 Requer Tesseract instalado e no PATH.
@@ -39,7 +58,9 @@ Requer Tesseract instalado e no PATH.
 ```
 
 ## C) Roteiro e steps
-- Roteiro humano: `docs/roteiro_video.md`
+- Roteiro humano: `docs/roteiro_video.md` (legado)
+- Fluxo atual: `docs/video_silvana/flow.md`
+- Gaps: `docs/video_silvana/gaps.md`
 - Steps executaveis: `docs/steps.yaml`
 
 Edite `docs/steps.yaml` para ajustar seletores e confirmar campos antes de rodar em producao.
@@ -56,12 +77,18 @@ Edite `docs/steps.yaml` para ajustar seletores e confirmar campos antes de rodar
 .\.venv\Scripts\python src\bot.py --mode dry-run
 ```
 
+## E) Testes
+```powershell
+.\.venv\Scripts\python tests\run_tests.py
+```
+
 ### Variaveis de ambiente (.env)
 Veja `.env.example` para um modelo completo. Principais:
 - `ETCM_USER`, `ETCM_PASS`
 - `BASE_URL`
 - `DOWNLOAD_DIR`
 - `PROCESSOS_LIST` ou `PROCESS_ALL`
+- `VISOES`, `DISTRIBUIDO_PARA`
 - `MODE` (run/debug/dry-run)
 
 ## Saidas e evidencias

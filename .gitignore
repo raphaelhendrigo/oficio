@@ -8,4 +8,5 @@ storage_state*.json
 artifacts/
 logs/
 docs/video_frames/
+docs/video_silvana/frames/
 video_silvana.mp4

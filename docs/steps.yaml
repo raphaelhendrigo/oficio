@@ -105,6 +105,7 @@
   evidence: true
   source: "user"
   review: true
+  optional: true
 
 - step_id: 10
   timestamp: "00:00:00.000"
@@ -116,6 +117,33 @@
   expected: "grid pronta para iteracao"
   evidence: false
   source: "video"
+
+- step_id: 11
+  timestamp: "00:00:00.000"
+  screen: "Grid APO-PEN"
+  action: "select"
+  target_hint: "Visoes"
+  value: "${VISOES}"
+  locator_strategy: "id_or_label"
+  locator_hint: "label:Visoes|label:Visões|#cbbVisoes|#cbbVisao|input[aria-label*='Vis' i]"
+  expected: "visao selecionada"
+  evidence: false
+  source: "video"
+  review: true
+
+- step_id: 12
+  timestamp: "00:00:00.000"
+  screen: "Grid APO-PEN"
+  action: "filter_grid"
+  target_hint: "Distribuido para"
+  value: "${DISTRIBUIDO_PARA}"
+  locator_strategy: "css"
+  locator_hint: "#gvProcesso|#sptMesaTrabalho_gvProcesso|table[id*='gvProcesso']"
+  expected: "filtro aplicado"
+  evidence: false
+  source: "video"
+  review: true
+  skip_if_empty: true
 
 - step_id: 100
   timestamp: "00:00:00.000"
@@ -152,7 +180,7 @@
   action: "click"
   target_hint: "dropdown Operacoes"
   locator_strategy: "id_or_label"
-  locator_hint: "label:Operacoes|#cbbOperacoes|#ddlOperacoes|input[aria-label*='Operacoes' i]"
+  locator_hint: "label:Operacoes|label:Operações|#cbbOperacoes|#ddlOperacoes|input[aria-label*='Operacoes' i]"
   expected: "menu Operacoes aberto"
   evidence: true
   source: "video"
