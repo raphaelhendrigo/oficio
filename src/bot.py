@@ -314,7 +314,21 @@ class StepRunner:
                     if not locator:
                         raise RuntimeError("Locator not resolved")
                     if mode != "dry-run":
-                        locator.first.fill(str(value), timeout=self.config.timeout_ms)
+                        # DevExpress inputs with masks/validators often require real key events.
+                        loc = locator.first
+                        try:
+                            loc.click(timeout=self.config.timeout_ms)
+                        except Exception:
+                            pass
+                        try:
+                            loc.fill("", timeout=self.config.timeout_ms)
+                        except Exception:
+                            pass
+                        loc.type(str(value), delay=25, timeout=self.config.timeout_ms)
+                        try:
+                            loc.press("Tab", timeout=self.config.timeout_ms)
+                        except Exception:
+                            pass
                     else:
                         locator.first.wait_for(state="visible", timeout=self.config.timeout_ms)
                 elif action == "select":
@@ -379,8 +393,17 @@ class StepRunner:
                     if not icon:
                         raise RuntimeError("Row icon not resolved")
                     if mode != "dry-run":
-                        icon.scroll_into_view_if_needed()
-                        icon.click(timeout=self.config.timeout_ms)
+                        if expect_popup:
+                            with self.context.expect_page(timeout=self.config.timeout_ms) as pinfo:
+                                icon.scroll_into_view_if_needed()
+                                icon.click(timeout=self.config.timeout_ms)
+                            new_page = pinfo.value
+                            new_page.wait_for_load_state("domcontentloaded", timeout=self.config.timeout_ms)
+                            self.page_stack.append(self.page)
+                            self.page = new_page
+                        else:
+                            icon.scroll_into_view_if_needed()
+                            icon.click(timeout=self.config.timeout_ms)
                     else:
                         icon.wait_for(state="visible", timeout=self.config.timeout_ms)
                 elif action == "close_page":

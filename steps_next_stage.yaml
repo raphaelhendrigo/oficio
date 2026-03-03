@@ -1,76 +1,36 @@
 - step_id: 1
   timestamp: "00:00:00.000"
-  screen: "Login"
+  screen: "Mesa de trabalho"
   action: "goto"
-  target_hint: "base url"
-  value: "${BASE_URL}"
-  expected: "pagina de login carregada"
+  target_hint: "mesa de trabalho"
+  value: "https://homol-etcm.tcm.sp.gov.br/paginas/mesatrabalho.aspx"
+  expected: "mesa carregada"
   evidence: true
   source: "user"
-  review: true
 
 - step_id: 2
   timestamp: "00:00:00.000"
-  screen: "Login"
-  action: "type"
-  target_hint: "campo usuario"
-  value: "${ETCM_USER}"
-  locator_strategy: "id_or_label"
-  locator_hint: "#username|input[name='username']|input[id='username']|label:RF ou e-mail|label:Usuario|#ctl00_cphMain_txtUsuario_I|input[name='ctl00$cphMain$txtUsuario']|input[placeholder*='Usu' i]"
-  expected: "usuario preenchido"
-  evidence: false
-  source: "user"
-  review: true
-
-- step_id: 3
-  timestamp: "00:00:00.000"
-  screen: "Login"
-  action: "type"
-  target_hint: "campo senha"
-  value: "${ETCM_PASS}"
-  locator_strategy: "id_or_label"
-  locator_hint: "#password|input[name='password']|input[id='password']|label:Senha|#ctl00_cphMain_txtSenha_I|input[name='ctl00$cphMain$txtSenha']|input[type='password']"
-  expected: "senha preenchida"
-  evidence: false
-  source: "user"
-  review: true
-
-- step_id: 4
-  timestamp: "00:00:00.000"
-  screen: "Login"
-  action: "click"
-  target_hint: "botao entrar"
-  locator_strategy: "css"
-  locator_hint: "button[type='submit']|button.btn-dark-gray|button:has-text('Entrar')|input#ctl00_cphMain_btnLogin_I|input[name='ctl00$cphMain$btnLogin']|#ctl00_cphMain_btnLogin|#ctl00_cphMain_btnLogin_CD|.btn-entrar"
-  expected: "login iniciado"
-  evidence: true
-  source: "user"
-  review: true
-
-- step_id: 5
-  timestamp: "00:00:00.000"
   screen: "Mesa de trabalho"
   action: "assert"
-  target_hint: "mesa de trabalho carregada"
+  target_hint: "barra superior"
   locator_strategy: "css"
-  locator_hint: "#lblNomeUsuarioLogado|#cbbProcesso_I|#cbbProtocolo_I"
-  expected: "barra lateral carregada"
+  locator_hint: "#PROCESSO, #cbbAcoes, #sptMesaTrabalho"
+  expected: "layout principal visivel"
   evidence: true
-  source: "video"
+  source: "user"
 
-- step_id: 6
+- step_id: 3
   timestamp: "00:00:00.000"
   screen: "Menu"
   action: "click"
   target_hint: "Processos"
   locator_strategy: "css"
   locator_hint: "#PROCESSO > a"
-  expected: "menu Processos expandido"
+  expected: "menu processos expandido"
   evidence: false
   source: "user"
-  review: true
 
-- step_id: 7
+- step_id: 4
   timestamp: "00:00:00.000"
   screen: "Menu"
   action: "click"
@@ -80,9 +40,8 @@
   expected: "submenu aberto"
   evidence: false
   source: "user"
-  review: true
 
-- step_id: 8
+- step_id: 5
   timestamp: "00:00:00.000"
   screen: "Menu"
   action: "click"
@@ -92,21 +51,8 @@
   expected: "grid APO-PEN carregada"
   evidence: true
   source: "user"
-  review: true
 
-- step_id: 9
-  timestamp: "00:02:17.151"
-  screen: "Grid APO-PEN"
-  action: "download"
-  target_hint: "Exportar"
-  locator_strategy: "css"
-  locator_hint: "#sptMesaTrabalho_gvProcesso_Title_btnExport|#sptMesaTrabalho_gvProcesso_Title_btnExport_CD|#sptMesaTrabalho_gvProcesso_Title_btnExport span.dx-vam"
-  expected: "planilha exportada"
-  evidence: true
-  source: "user"
-  review: true
-
-- step_id: 10
+- step_id: 6
   timestamp: "00:00:00.000"
   screen: "Grid APO-PEN"
   action: "wait"
@@ -115,7 +61,7 @@
   locator_hint: "#gvProcesso, #sptMesaTrabalho_gvProcesso"
   expected: "grid pronta para iteracao"
   evidence: false
-  source: "video"
+  source: "user"
 
 - step_id: 100
   timestamp: "00:00:00.000"
@@ -128,14 +74,13 @@
   expected: "linha selecionada"
   evidence: true
   source: "user"
-  review: true
   scope: "per_process"
 
 - step_id: 110
   timestamp: "00:00:00.000"
   screen: "Grid APO-PEN"
   action: "click_row_icon"
-  target_hint: "icone caixa de correio"
+  target_hint: "icone comunicacao processual"
   value: "${PROCESSO}"
   locator_strategy: "row"
   locator_hint: "row_selector=tr[id*='DXDataRow'];cell_text=${PROCESSO};icon_css=img[src*='notificacao' i], img[title*='Notificacao' i]"
@@ -143,7 +88,6 @@
   expected: "janela de comunicacao aberta"
   evidence: true
   source: "user"
-  review: true
   scope: "per_process"
 
 - step_id: 120
@@ -170,19 +114,6 @@
   source: "user"
   scope: "per_process"
 
-- step_id: 1215
-  timestamp: "00:00:00.000"
-  screen: "Comunicacao Processual"
-  action: "wait"
-  target_hint: "carregando"
-  locator_strategy: "css"
-  locator_hint: ".dxlpLoadingPanel, .dxgvLoadingPanel, .dx-loading-panel"
-  state: "hidden"
-  expected: "carregamento concluido"
-  evidence: false
-  source: "user"
-  scope: "per_process"
-
 - step_id: 122
   timestamp: "00:00:00.000"
   screen: "Nova comunicacao processual"
@@ -193,7 +124,6 @@
   expected: "modal aberta"
   evidence: true
   source: "user"
-  review: true
   scope: "per_process"
 
 - step_id: 140
@@ -207,7 +137,6 @@
   expected: "destinatario selecionado"
   evidence: true
   source: "user"
-  review: true
   scope: "per_process"
 
 - step_id: 150
@@ -221,7 +150,6 @@
   expected: "relator selecionado"
   evidence: true
   source: "user"
-  review: true
   optional: true
   scope: "per_process"
 
@@ -236,7 +164,6 @@
   expected: "descricao preenchida"
   evidence: true
   source: "user"
-  review: true
   scope: "per_process"
 
 - step_id: 165
@@ -250,7 +177,6 @@
   expected: "referencia preenchida"
   evidence: true
   source: "user"
-  review: true
   scope: "per_process"
 
 - step_id: 170
@@ -264,7 +190,6 @@
   expected: "status selecionado"
   evidence: true
   source: "user"
-  review: true
   scope: "per_process"
 
 - step_id: 180
@@ -278,7 +203,6 @@
   expected: "prazo preenchido"
   evidence: true
   source: "user"
-  review: true
   scope: "per_process"
 
 - step_id: 190
@@ -292,7 +216,6 @@
   expected: "arquivo anexado"
   evidence: false
   source: "user"
-  review: true
   optional: true
   retries: 1
   scope: "per_process"
@@ -307,20 +230,18 @@
   expected: "comunicacao criada"
   evidence: true
   source: "user"
-  review: true
   scope: "per_process"
 
 - step_id: 210
   timestamp: "00:00:00.000"
   screen: "Confirmacao"
   action: "assert"
-  target_hint: "mensagem de sucesso"
+  target_hint: "grid de comunicacoes"
   locator_strategy: "css"
   locator_hint: "#gvNotificacao"
   expected: "grid de comunicacoes visivel"
   evidence: true
   source: "user"
-  review: true
   scope: "per_process"
 
 - step_id: 220

@@ -31,18 +31,22 @@ def dx_button_selectors(base_id: str) -> list[str]:
 
 DEFAULT_SELECTORS = {
     "login_user": [
+        "#username",
+        "input[name='username']",
         "#ctl00_cphMain_txtUsuario_I",
-        "input[name*='Usuario' i]",
         "input[placeholder*='Usu' i]",
     ],
     "login_pass": [
+        "#password",
+        "input[name='password']",
         "#ctl00_cphMain_txtSenha_I",
         "input[type='password']",
     ],
     "login_button": [
+        "button[type='submit']",
+        "button:has-text('Entrar')",
         "#ctl00_cphMain_btnLogin_I",
         "input[type='submit'][value*='Entrar' i]",
-        "button:has-text('Entrar')",
     ],
     "grid_apopen": [
         "#gvProcesso",
