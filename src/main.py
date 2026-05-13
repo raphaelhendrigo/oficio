@@ -1526,6 +1526,35 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
                     _dump_form_state_html(form_container, processo, "comunicacao_form_sem_valores")
                     raise RuntimeError("controles ppcNoificacao sem valor (cbbPessoa/txtDescricao); abortando antes do save")
 
+            # IMPORTANTE: o JS do form (IncluirNotificacao) faz:
+            #   gvNotificacao.PerformCallback('Nova;' + cbbPessoa.GetValue())
+            # Se GetValue() devolver TEXTO (e nao o ID numerico do relator),
+            # o servidor rejeita silenciosamente e o popup nao fecha (erro
+            # 'dxgvEditingErrorRow'). O e-TCM ja preenche o hidden #codRelator
+            # com o ID numerico do conselheiro do processo (ex: '14'). Aqui
+            # forcamos cbbPessoa.SetValue(codRelator) para que GetValue() vire
+            # numero. Mantemos o SetText com o nome para a UI exibir certo.
+            try:
+                fix_result = form_container.evaluate(
+                    r"""() => {
+                        const codEl = document.getElementById('codRelator');
+                        if (!codEl) return { ok: false, reason: 'no-codRelator' };
+                        const codNum = String(codEl.value || '').trim();
+                        if (!codNum || isNaN(parseInt(codNum, 10))) return { ok: false, reason: 'codRelator-empty-or-nan', codNum: codNum };
+                        const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+                        const ctl = coll && coll.GetByName ? (coll.GetByName('cbbPessoa') || coll.GetByName('ppcNoificacao_cbbPessoa')) : window.cbbPessoa;
+                        if (!ctl) return { ok: false, reason: 'no-cbbPessoa-control', codNum: codNum };
+                        const txt = ctl.GetText ? ctl.GetText() : '';
+                        try { ctl.SetValue(parseInt(codNum, 10)); } catch(e) {}
+                        try { if (txt) ctl.SetText(txt); } catch(e) {}
+                        const newVal = ctl.GetValue ? ctl.GetValue() : '';
+                        return { ok: !isNaN(parseInt(newVal, 10)), codNum: codNum, newVal: newVal, text: txt };
+                    }"""
+                )
+                print(f"  [relator-fix] {fix_result}")
+            except Exception as e:
+                print(f"  Aviso: falha ao ajustar cbbPessoa.SetValue(codRelator): {e}")
+
             # Conta linhas da grid ANTES de salvar (referência p/ confirmar sucesso).
             rows_before = _count_gv_notificacao_rows(form_container)
             try:
