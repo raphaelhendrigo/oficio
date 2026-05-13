@@ -2500,23 +2500,27 @@ def click_last_piece_and_open_pdf(
     - Try to read the embedded PDF URL from iframe/embed/object/a and download via request context.
     - Fallback to clicking the "nova janela" button and then extract the URL from the popup.
     """
-    # 1) Find the viewer frame or use the page itself
+    # 1) Find the viewer frame or use the page itself.
+    # Em PROD a arvore de pecas (#splLeitorDocumentos_pgcPecas_trePecas) pode
+    # demorar mais de 20s para renderizar quando ha overhead de cleanup
+    # anterior. Aumentamos para 60s e fallbacks adicionais.
     viewer_frame = None
     try:
-        viewer_frame = find_frame_with_selector(page, "#splLeitorDocumentos_pgcPecas_trePecas", timeout_ms=20000)
+        viewer_frame = find_frame_with_selector(page, "#splLeitorDocumentos_pgcPecas_trePecas", timeout_ms=60000)
     except Exception:
         # Try alternative cues for the viewer
         for sel in ["#imgNewWindow", "img#imgNewWindow", "#splLeitorDocumentos_pgcPecas_trePecas_D", "#splLeitorDocumentos_pgcPecas"]:
             try:
-                viewer_frame = find_frame_with_selector(page, sel, timeout_ms=5000)
+                viewer_frame = find_frame_with_selector(page, sel, timeout_ms=10000)
                 break
             except Exception:
                 continue
     if not viewer_frame:
-        # As a last resort, operate on the page itself
         viewer_frame = page
 
-    # 2) Locate pieces/attachments anchors and choose the last one (or first if requested)
+    # 2) Locate pieces/attachments anchors and choose the last one (or first if requested).
+    # Aumentamos a janela de busca para 60s + 30s (no fallback) para tolerar
+    # iframes que carregam ancoras de pecas tardiamente.
     piece_selector = (
         "a[onclick*='LerPDF'], "
         "a[onclick*='setCodArquivoDigital'], "
@@ -2526,7 +2530,7 @@ def click_last_piece_and_open_pdf(
     )
     loc = viewer_frame.locator(piece_selector)
     count = 0
-    deadline = time.time() + 20
+    deadline = time.time() + 60
     while time.time() < deadline:
         try:
             count = loc.count()
@@ -2536,13 +2540,15 @@ def click_last_piece_and_open_pdf(
             count = 0
         time.sleep(0.5)
     if count == 0:
-        # Try a broader selection inside the tree container, keeping only links that can read PDFs.
+        # Fallback no container da arvore + classe DevExpress
         loc = viewer_frame.locator(
             "#splLeitorDocumentos_pgcPecas_trePecas a[onclick*='LerPDF'], "
             "#splLeitorDocumentos_pgcPecas_trePecas a[onclick*='setCodArquivoDigital'], "
-            "a[cod_arquivo_digital_criptografado]"
+            "a[cod_arquivo_digital_criptografado], "
+            "td.dxtv-cnT a, "
+            ".dxtvControl a"
         )
-        deadline = time.time() + 10
+        deadline = time.time() + 30
         while time.time() < deadline:
             try:
                 count = loc.count()
@@ -2553,6 +2559,33 @@ def click_last_piece_and_open_pdf(
             time.sleep(0.5)
     if count == 0:
         print("Aviso: Nenhuma peca encontrada no visualizador.")
+        # Dump HTML para depurar selectors em PROD quando a arvore nao renderiza.
+        try:
+            artifacts_dir = output_dir.parent / "artifacts" / "evidence" if hasattr(output_dir, "parent") else Path("artifacts/evidence")
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_proc = safe_filename(processo)
+            dump_path = artifacts_dir / f"{safe_proc}_visualizador_sem_pecas_{ts}.html"
+            try:
+                page_html = page.content() if hasattr(page, "content") else ""
+            except Exception:
+                page_html = ""
+            try:
+                frame_html = viewer_frame.content() if hasattr(viewer_frame, "content") else ""
+            except Exception:
+                frame_html = ""
+            with open(dump_path, "w", encoding="utf-8") as f:
+                f.write(f"<!-- processo={processo} -->\n")
+                f.write(f"<!-- page url={getattr(page, 'url', '?')} -->\n")
+                f.write("<!-- viewer_frame is same as page: {} -->\n".format(viewer_frame is page))
+                f.write("<!-- ===== PAGE ===== -->\n")
+                f.write(page_html)
+                if frame_html and frame_html != page_html:
+                    f.write("\n\n<!-- ===== VIEWER FRAME ===== -->\n")
+                    f.write(frame_html)
+            print(f"  HTML do visualizador salvo em: {dump_path}")
+        except Exception as e:
+            print(f"  Aviso: nao foi possivel salvar HTML do visualizador: {e}")
         if return_piece_number:
             return None, None, None
         return None, None
