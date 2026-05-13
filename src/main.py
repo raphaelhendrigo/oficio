@@ -1465,6 +1465,33 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
         try:
             # Aguarda Loading Panel do popup sumir antes de tentar preencher.
             _wait_dx_loading_panel_done(form_container, "ppcNoificacao", timeout_ms=90000)
+            # Fallback: se relator chegou vazio do orquestrador (PDF nao tinha
+            # 'Conselheiro Relator: ...'), extrai da tela de Cadastro
+            # (ucTabInfo_pgcInfoProc_lblConselheiro) que ja contem o nome
+            # do conselheiro do processo (ex: 'DOMINGOS DISSEI').
+            if not relator:
+                try:
+                    extracted = target.evaluate(
+                        r"""() => {
+                            const ids = [
+                                'ucTabInfo_pgcInfoProc_lblConselheiro',
+                                'lblConselheiro'
+                            ];
+                            for (const id of ids) {
+                                const el = document.getElementById(id);
+                                if (el) {
+                                    const t = (el.innerText || el.textContent || '').trim();
+                                    if (t) return t;
+                                }
+                            }
+                            return '';
+                        }"""
+                    )
+                    if extracted:
+                        relator = str(extracted).strip()
+                        print(f"  [relator] extraido da pagina (lblConselheiro): {relator!r}")
+                except Exception as e_rel:
+                    print(f"  Aviso: nao foi possivel extrair relator da pagina: {e_rel}")
             _exact_set_combo(form_container, "ppcNoificacao_cbbUsuarios", destinatario)
             _exact_set_combo(form_container, "ppcNoificacao_cbbPessoa", relator)
             _wait_dx_loading_panel_done(form_container, "ppcNoificacao", timeout_ms=30000)
