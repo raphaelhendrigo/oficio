@@ -972,6 +972,161 @@ def open_caixa_correio_from_grid(context, page, processo: str):
     return target
 
 
+def _read_ppcnoificacao_state(container) -> dict:
+    """Le os valores REAIS dos controles DevExpress no popup ppcNoificacao.
+
+    Retorna {'ok': bool, '<controle>_value/_text/_dom': ...}. Util para
+    detectar (antes de clicar Salvar) se os preenchimentos via fill/JS
+    chegaram ao controle DevExpress real — sem isso, o submit envia
+    valores vazios e o servidor rejeita silenciosamente.
+    """
+    try:
+        return container.evaluate(
+            r"""() => {
+                const result = {};
+                const names = ['cbbUsuarios','cbbPessoa','cbbStatusProvidencia','cbbTipoNotificacao','txtDescricao','txtReferencia','txtPrazo','txtNotificacao'];
+                const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+                for (const name of names) {
+                    const ctl = coll && coll.GetByName ? (coll.GetByName(name) || coll.GetByName('ppcNoificacao_' + name)) : window[name];
+                    if (!ctl) { continue; }
+                    try { if (ctl.GetValue) result[name + '_value'] = ctl.GetValue(); } catch(e) {}
+                    try { if (ctl.GetText)  result[name + '_text']  = ctl.GetText();  } catch(e) {}
+                }
+                const inputIds = ['ppcNoificacao_txtDescricao_I','ppcNoificacao_txtReferencia_I','ppcNoificacao_txtPrazo_I','destinatario','codRelator','tipoNotificacao'];
+                for (const id of inputIds) {
+                    const el = document.getElementById(id);
+                    if (el) result[id + '_dom'] = el.value;
+                }
+                try {
+                    const btn = document.getElementById('ppcNoificacao_btnPopNova_I');
+                    result['btnPopNova_visible'] = !!(btn && btn.offsetParent);
+                } catch(e) {}
+                const cbbPessoaVal = result.cbbPessoa_value;
+                const descTxt = result.txtDescricao_text;
+                result.ok = !!(cbbPessoaVal && String(cbbPessoaVal).trim() !== '' && descTxt && String(descTxt).trim() !== '');
+                return result;
+            }"""
+        )
+    except Exception as e:
+        return {"error": str(e), "ok": False}
+
+
+def _force_set_devexpress_controls(container, mapping: dict) -> None:
+    """Forca SetValue/SetText nos controles DevExpress quando _exact_set_combo
+    nao conseguiu deixar os valores propagados pelo ciclo do DevExpress.
+    """
+    try:
+        container.evaluate(
+            r"""(mapping) => {
+                const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+                for (const [name, value] of Object.entries(mapping)) {
+                    if (!value) continue;
+                    const ctl = coll && coll.GetByName ? (coll.GetByName(name) || coll.GetByName('ppcNoificacao_' + name)) : window[name];
+                    if (!ctl) continue;
+                    if (name.startsWith('txt')) {
+                        try { ctl.SetText(String(value)); } catch(e) {}
+                        try { ctl.SetValue(String(value)); } catch(e) {}
+                    } else if (name.startsWith('cbb')) {
+                        let matched = false;
+                        try {
+                            const norm = String(value).trim().toLowerCase();
+                            const n = ctl.GetItemCount ? ctl.GetItemCount() : 0;
+                            for (let i = 0; i < n; i++) {
+                                const item = ctl.GetItem(i);
+                                if (!item) continue;
+                                const itemText = String(item.text || '').toLowerCase();
+                                if (itemText.includes(norm) || norm.includes(itemText)) {
+                                    try { ctl.SetSelectedIndex(i); matched = true; break; } catch(e) {}
+                                }
+                            }
+                        } catch(e) {}
+                        if (!matched) {
+                            try { ctl.SetText(String(value)); } catch(e) {}
+                        }
+                    }
+                }
+            }""",
+            mapping,
+        )
+    except Exception:
+        pass
+
+
+def _count_gv_notificacao_rows(container) -> int:
+    """Conta linhas de dados (nao header/empty) na grid de comunicacoes."""
+    try:
+        return int(container.evaluate(
+            r"""() => {
+                const rows = document.querySelectorAll(
+                    "#gvNotificacao_DXMainTable tr[id*='DXDataRow'], " +
+                    "tr[id*='gvNotificacao_DXDataRow']"
+                );
+                return rows.length;
+            }"""
+        ))
+    except Exception:
+        return 0
+
+
+def _wait_for_comunicacao_saved(form_container, page_target, rows_before: int, timeout_ms: int = 30000) -> bool:
+    """Confirma REAL salvamento da comunicacao processual.
+
+    Sucesso quando:
+      - a grid #gvNotificacao passa a ter MAIS linhas do que tinha antes; OU
+      - o popup ppcNoificacao foi escondido E em seguida a contagem subiu.
+
+    NUNCA assume sucesso so porque #gvNotificacao existe — antes da edicao
+    a grid ja esta no DOM com 'Nenhum registro encontrado'.
+    """
+    deadline = time.time() + (timeout_ms / 1000.0)
+    popup_was_hidden_at = None
+    while time.time() < deadline:
+        for c in (form_container, page_target):
+            try:
+                cur = _count_gv_notificacao_rows(c)
+                if cur > rows_before:
+                    return True
+            except Exception:
+                continue
+        try:
+            popup_hidden = bool(form_container.evaluate(
+                r"""() => {
+                    const ids = ['ppcNoificacao_PW-1','ppcNoificacao'];
+                    for (const id of ids) {
+                        const el = document.getElementById(id);
+                        if (!el) continue;
+                        const cs = window.getComputedStyle(el);
+                        if (cs.display === 'none' || cs.visibility === 'hidden' || !el.offsetParent) return true;
+                    }
+                    return false;
+                }"""
+            ))
+        except Exception:
+            popup_hidden = False
+        if popup_hidden:
+            if popup_was_hidden_at is None:
+                popup_was_hidden_at = time.time()
+            elif time.time() - popup_was_hidden_at > 4:
+                return False
+        time.sleep(0.5)
+    return False
+
+
+def _dump_form_state_html(container, processo: str, tag: str) -> Optional[Path]:
+    try:
+        artifacts_dir = Path("artifacts/evidence")
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = artifacts_dir / f"{safe_filename(processo)}_{tag}_{ts}.html"
+        html = container.content() if hasattr(container, "content") else ""
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"<!-- processo={processo} tag={tag} ts={ts} -->\n")
+            f.write(html)
+        return path
+    except Exception:
+        return None
+
+
 def _wait_dx_loading_panel_done(container, popup_base_id: str, timeout_ms: int = 60000) -> bool:
     """Aguarda o Loading Panel (LP/LD) de um popup DevExpress sumir.
 
@@ -1289,9 +1444,6 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
         status_entrega = (dados.get("status") or os.getenv("STATUS_ENTREGA") or "Urgente").strip()
         try:
             # Aguarda Loading Panel do popup sumir antes de tentar preencher.
-            # Em PROD o ppcNoificacao_LP/LD pode demorar >30s para liberar,
-            # e o textarea fica no DOM porem invisivel ate la — sem essa
-            # espera, fill() repete >60 vezes ate timeout.
             _wait_dx_loading_panel_done(form_container, "ppcNoificacao", timeout_ms=90000)
             _exact_set_combo(form_container, "ppcNoificacao_cbbUsuarios", destinatario)
             _exact_set_combo(form_container, "ppcNoificacao_cbbPessoa", relator)
@@ -1302,6 +1454,40 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
             _exact_set_combo(form_container, "ppcNoificacao_cbbStatusProvidencia", status_entrega)
             _safe_dx_fill(form_container, "#ppcNoificacao_txtPrazo_I", str(prazo or ""), timeout_ms=15000)
             _prepare_notificacao_defaults(form_container, status_entrega, destinatario)
+
+            # Pre-flight: ler estado real dos controles DevExpress. Se cbbPessoa
+            # ou txtDescricao nao tiverem valor, o servidor rejeita silenciosamente.
+            pre_state = _read_ppcnoificacao_state(form_container)
+            print(f"  [form-state] pre-save cbbPessoa={pre_state.get('cbbPessoa_value')!r} "
+                  f"cbbUsuarios={pre_state.get('cbbUsuarios_value')!r} "
+                  f"txtDescricao(len)={len(str(pre_state.get('txtDescricao_text') or ''))} "
+                  f"ok={pre_state.get('ok')}")
+            if not pre_state.get("ok"):
+                _force_set_devexpress_controls(form_container, {
+                    "cbbUsuarios": destinatario,
+                    "cbbPessoa": relator,
+                    "txtDescricao": desc_custom,
+                    "txtReferencia": referencia,
+                    "cbbStatusProvidencia": status_entrega,
+                    "txtPrazo": str(prazo or ""),
+                })
+                pre_state = _read_ppcnoificacao_state(form_container)
+                print(f"  [form-state] apos force cbbPessoa={pre_state.get('cbbPessoa_value')!r} "
+                      f"txtDescricao(len)={len(str(pre_state.get('txtDescricao_text') or ''))} "
+                      f"ok={pre_state.get('ok')}")
+                if not pre_state.get("ok"):
+                    _dump_form_state_html(form_container, processo, "comunicacao_form_sem_valores")
+                    raise RuntimeError("controles ppcNoificacao sem valor (cbbPessoa/txtDescricao); abortando antes do save")
+
+            # Conta linhas da grid ANTES de salvar (referência p/ confirmar sucesso).
+            rows_before = _count_gv_notificacao_rows(form_container)
+            try:
+                rows_before_target = _count_gv_notificacao_rows(target)
+            except Exception:
+                rows_before_target = rows_before
+            rows_before = max(rows_before, rows_before_target)
+            print(f"  [grid] linhas antes do save: {rows_before}")
+
             clicked_save = False
             for sel in [
                 "#ppcNoificacao_btnPopNova_I",
@@ -1339,15 +1525,22 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
                 except Exception:
                     clicked_save = False
             if not clicked_save:
-                raise RuntimeError("botão Salvar/Nova comunicação não localizado no formulário ppcNoificacao")
-            try:
-                form_container.wait_for_selector("#gvNotificacao, #gvNotificacao_DXMainTable", timeout=20000)
-            except Exception:
-                try:
-                    target.wait_for_selector("#gvNotificacao, #gvNotificacao_DXMainTable", timeout=20000)
-                except Exception:
-                    pass
-            print(f"Comunicacao processual criada para o processo {processo} (prazo {prazo} dias, tipo {tipo}, secretaria {secretaria}).")
+                _dump_form_state_html(form_container, processo, "comunicacao_save_nao_clicado")
+                raise RuntimeError("botao Salvar/Nova comunicacao nao localizado no formulario ppcNoificacao")
+
+            # Verificacao REAL: linha apareceu na grid + popup fechou.
+            saved_ok = _wait_for_comunicacao_saved(form_container, target, rows_before, timeout_ms=45000)
+            if not saved_ok:
+                dump = _dump_form_state_html(form_container, processo, "comunicacao_save_falhou")
+                if dump:
+                    print(f"  HTML pos-save salvo em: {dump}")
+                raise RuntimeError(
+                    f"comunicacao processual NAO foi confirmada na grid para {processo} "
+                    f"(rows_before={rows_before}; popup nao fechou OR grid nao avancou em 45s)"
+                )
+
+            print(f"Comunicacao processual CRIADA E CONFIRMADA na grid para o processo {processo} "
+                  f"(prazo {prazo} dias, tipo {tipo}, secretaria {secretaria}).")
             return True
         except Exception as e:
             print(f"Aviso: falha no fluxo ppcNoificacao para {processo}: {e}. Tentando fallback generico.")
