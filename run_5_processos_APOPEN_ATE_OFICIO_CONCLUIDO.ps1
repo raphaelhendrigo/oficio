@@ -19,6 +19,10 @@ if (
 $env:ETCM_URL = "https://etcm.tcm.sp.gov.br/paginas/login.aspx"
 $env:BASE_URL = "https://etcm.tcm.sp.gov.br/paginas/login.aspx"
 
+# Output do python em tempo real: sem Start-Process bufferiza ate o filho terminar.
+$env:PYTHONUNBUFFERED = "1"
+$env:PYTHONIOENCODING = "utf-8"
+
 $env:PROCESSOS_LIST = "TC/007902/2022,TC/008636/2022,TC/008084/2023,TC/013838/2023,TC/018149/2024"
 $env:ONLY_PROCESSOS_AUTHORIZED = "TC/007902/2022,TC/008636/2022,TC/008084/2023,TC/013838/2023,TC/018149/2024"
 
