@@ -655,6 +655,32 @@ def _open_fresh_apo_pen_page(context):
         return None
 
 
+def _close_extra_pages(context, keep_pages) -> int:
+    """Fecha todas as abas do contexto que NAO estao em keep_pages.
+
+    Usado apos o cleanup destrutivo (cancel ato/comunicacao) para que
+    abas extras (Gerenciador de Atos, Cadastro de Comunicacao) nao
+    confundam filter_and_open_processo / click_last_piece_and_open_pdf
+    com paginas no contexto errado.
+    """
+    closed = 0
+    try:
+        all_pages = list(context.pages)
+    except Exception:
+        return 0
+    keep_ids = {id(p) for p in keep_pages if p is not None}
+    for p in all_pages:
+        if id(p) in keep_ids:
+            continue
+        try:
+            if hasattr(p, "is_closed") and not p.is_closed():
+                p.close()
+                closed += 1
+        except Exception:
+            pass
+    return closed
+
+
 def open_process_action_context_anywhere(context, main_page, processo: str):
     """Localiza o processo em APO-PEN ou por busca geral quando saiu da fila."""
     attempts: list[tuple[str, object]] = []
@@ -5647,8 +5673,23 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
             except Exception as e:
                 print(f"Processo {processo_num}: falha no cleanup robô: {e}")
                 return
+            # Fecha as abas extras criadas pelo cleanup (Gerenciador de Atos,
+            # Cadastro de Comunicacao, popups). Sem isso, filter_and_open_processo
+            # pode operar na pagina errada na sequencia.
+            try:
+                n_closed = _close_extra_pages(context, [main_page, grid_page])
+                if n_closed > 0:
+                    print(f"  [cleanup] fechadas {n_closed} abas extras apos cleanup")
+            except Exception:
+                pass
             # Reabre a grid limpa antes do fluxo normal.
             grid_page = _open_fresh_apo_pen_page(context) or grid_page
+            try:
+                n_closed = _close_extra_pages(context, [main_page, grid_page])
+                if n_closed > 0:
+                    print(f"  [cleanup] fechadas {n_closed} abas residuais apos reopen")
+            except Exception:
+                pass
         else:
             print(f"Processo {processo_num}: cleanup nao autorizado ({_safe_reason}).")
 

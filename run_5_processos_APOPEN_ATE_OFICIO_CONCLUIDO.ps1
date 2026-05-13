@@ -23,8 +23,10 @@ $env:BASE_URL = "https://etcm.tcm.sp.gov.br/paginas/login.aspx"
 $env:PYTHONUNBUFFERED = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
-# TC/013838/2023 ja foi validado (visualmente OK por usuario). Agora os 4 restantes.
-$env:PROCESSOS_LIST = "TC/007902/2022,TC/008636/2022,TC/008084/2023,TC/018149/2024"
+# Re-execucao completa dos 5: usuario solicitou recriar do zero por fonte
+# errada no Encaminha. Cleanup destrutivo habilitado para derrubar o que
+# o robo criou na rodada anterior.
+$env:PROCESSOS_LIST = "TC/007902/2022,TC/008636/2022,TC/008084/2023,TC/013838/2023,TC/018149/2024"
 $env:ONLY_PROCESSOS_AUTHORIZED = "TC/007902/2022,TC/008636/2022,TC/008084/2023,TC/013838/2023,TC/018149/2024"
 
 $env:ENVIRONMENT = "producao"
@@ -36,10 +38,10 @@ $env:LOGIN_MANUAL_WAIT_MS = "60000"
 $env:PAUSE_AFTER_LOGIN_MS = "5000"
 
 $env:USE_CAIXA_CORREIO = "true"
-$env:FORCE_RECREATE_COMUNICACAO = "false"
-$env:FORCE_DELETE_OLD_OFICIO_SSG = "false"
-$env:SAFE_DELETE_OWN_DRAFTS = "false"
-$env:RUN_PROD_DESTRUCTIVE_CLEANUP = "false"
+$env:FORCE_RECREATE_COMUNICACAO = "true"
+$env:FORCE_DELETE_OLD_OFICIO_SSG = "true"
+$env:SAFE_DELETE_OWN_DRAFTS = "true"
+$env:RUN_PROD_DESTRUCTIVE_CLEANUP = "true"
 
 $env:REQUEST_SIGNATURE = "false"
 $env:ASSINANTE_NOME = ""
