@@ -11,6 +11,24 @@ from urllib.parse import quote, urljoin
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
+# Utilitarios isolados (sem dependencia circular):
+from docx_utils import (
+    AT_TOKEN_RE,
+    AtTokenViolation,
+    assert_at_tokens_preserved,
+    extract_at_tokens_from_docx,
+    filter_out_at_tokens,
+    safe_replace_non_at_placeholders,
+)
+from oficio_normalize import (
+    DESCRICAO_CONHECIMENTO_PROVIDENCIAS,
+    DESCRICAO_DILACAO,
+    DESCRICAO_JUIZO_SINGULAR,
+    DESCRICAO_REITERACAO,
+    normalize_descricao_comunicacao,
+    signer_name_matches_roseli_chaves,
+)
+
 
 def env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name, str(default))
@@ -2478,11 +2496,23 @@ def _resolve_oficio_template() -> Optional[Path]:
     """Resolve template path from env vars.
 
     Regras:
-    - Se OFICIO_TEMPLATE apontar para um arquivo (.docx ou .dotx) existente, usa.
-    - Se OFICIO_TEMPLATE for apenas nome de arquivo e OFICIO_TEMPLATES_DIR existir, usa o arquivo dentro da pasta.
-    - Caso contrário, se OFICIO_TEMPLATES_DIR existir, escolhe o primeiro .docx; se não houver .docx, escolhe .dotx.
-    - Senão, tenta templates/oficio_modelo.docx
+    - Quando OFICIO_TEMPLATE_MODE=auto, ignora OFICIO_TEMPLATE/OFICIO_TEMPLATES_DIR
+      e retorna None — sinalizando ao chamador para usar
+      classify_and_select_template_path() (escolha por tipo + secretaria).
+    - Caso contrario, se OFICIO_TEMPLATE apontar para um arquivo (.docx ou .dotx)
+      existente, usa.
+    - Se OFICIO_TEMPLATE for apenas nome de arquivo e OFICIO_TEMPLATES_DIR existir,
+      usa o arquivo dentro da pasta.
+    - Se nenhum dos anteriores, e OFICIO_TEMPLATES_DIR existir, escolhe o primeiro
+      .docx; se nao houver .docx, escolhe .dotx.
+    - Senao, tenta templates/oficio_modelo.docx.
     """
+    template_mode = (os.getenv("OFICIO_TEMPLATE_MODE") or "").strip().lower()
+    if template_mode == "auto":
+        # Modo automatico: o chamador deve usar classify_and_select_template_path
+        # para escolher pelo tipo (UTAP/DILACAO/REITERACAO/JUIZO) + secretaria.
+        return None
+
     template_env = os.getenv("OFICIO_TEMPLATE")
     templates_dir_env = os.getenv("OFICIO_TEMPLATES_DIR")
 
@@ -2633,6 +2663,36 @@ def _python_convert_dotx_only(template_path: Path, out_path: Path) -> bool:
         return False
 
 
+def _validate_oficio_at_tokens(template: Optional[Path], generated: Path) -> Optional[Path]:
+    """Pos-validacao do DOCX gerado: confirma preservacao dos tokens @@ do modelo.
+
+    Comportamento:
+      - Se `template` for None (modo fallback simples), nao ha referencia e o
+        gerado e devolvido sem validacao.
+      - Quando OFICIO_PRESERVE_AT_TOKENS=true (default), uma violacao bloqueia:
+        a funcao loga o erro, retorna None e o orquestrador NAO deve anexar o
+        DOCX comprometido no e-TCM.
+      - Quando OFICIO_PRESERVE_AT_TOKENS=false, apenas loga aviso e devolve o
+        Path (modo permissivo, util para depuracao).
+    """
+    if template is None:
+        return generated
+    preserve = env_bool("OFICIO_PRESERVE_AT_TOKENS", True)
+    try:
+        report = assert_at_tokens_preserved(template, generated)
+        print(report.as_log_line())
+        return generated
+    except AtTokenViolation as e:
+        if preserve:
+            print(
+                f"ERRO bloqueante na preservacao de @@: {e}. "
+                "Defina OFICIO_PRESERVE_AT_TOKENS=false para apenas avisar."
+            )
+            return None
+        print(f"AVISO preservacao @@: {e}")
+        return generated
+
+
 def generate_oficio_from_template(processo: str, output_dir: Path, extra: dict | None = None, template_path: Optional[Path] = None) -> Path | None:
     """Generate a DOCX response using a template when available; fallback to a simple layout.
 
@@ -2648,42 +2708,31 @@ def generate_oficio_from_template(processo: str, output_dir: Path, extra: dict |
     oficio_data = _oficio_data()
     mapping = {"{{NUM_PROCESSO}}": processo, "{{DATA}}": oficio_data}
     if extra:
-        mapping.update({str(k): str(v) for k, v in extra.items()})
+        # Cuidado: o brief obriga preservar todos os tokens @@... no DOCX.
+        # Filtramos defensivamente toda chave que comece por '@@', independente
+        # do valor de OFICIO_PRESERVE_AT_TOKENS (default True). Quem precisar
+        # de metadados internos derivados do PDF deve usar prefixo '_meta_'.
+        preserve_at = env_bool("OFICIO_PRESERVE_AT_TOKENS", True)
+        if preserve_at:
+            extra_clean = filter_out_at_tokens(extra)
+        else:
+            extra_clean = extra
+        # Tambem ignoramos chaves _meta_* aqui: elas sao consumo interno
+        # do orquestrador em main.py, NAO devem entrar no replace do DOCX.
+        extra_clean = {
+            str(k): str(v)
+            for k, v in extra_clean.items()
+            if not str(k).startswith("_meta_")
+        }
+        mapping.update(extra_clean)
 
-    # Alias uteis para modelos que usam nomes diferentes
+    # Alias uteis para modelos que usam nomes diferentes (apenas placeholders
+    # nao-@@). NUNCA inserimos chaves @@... aqui — o e-TCM e quem preenche os
+    # campos @@ apos o upload da minuta.
     nome = mapping.get("{{INTERESSADO}}") or mapping.get("{{REQUERENTE}}")
     if nome:
         mapping.setdefault("{{NOME}}", nome)
         mapping.setdefault("{{NOME_COMPLETO}}", nome)
-
-    # Garantir placeholders @@ usados no DOTX
-    proc_val = mapping.get("{{NUM_PROCESSO}}", processo) or processo or ""
-    mapping.setdefault("@@processo", proc_val)
-    # Data por extenso, baseada na data do documento (se houver)
-    data_doc = oficio_data or mapping.get("{{DATA_DOCUMENTO}}")
-    if data_doc and re.match(r"\d{1,2}/\d{1,2}/\d{4}", str(data_doc)):
-        mapping["@@data_extenso"] = _pt_data_extenso_from_ddmmyyyy(str(data_doc))
-    elif data_doc:
-        mapping["@@data_extenso"] = str(data_doc)
-    else:
-        mapping["@@data_extenso"] = _pt_data_extenso_from_ddmmyyyy(date.today().strftime("%d/%m/%Y"))
-
-    # Numero do ofício (env ou s/n)
-    mapping.setdefault("@@numero_oficio", os.getenv("NUMERO_OFICIO", "s/n"))
-
-    # Nome do interessado para @@Nome_interessado
-    if nome:
-        mapping.setdefault("@@Nome_interessado", nome)
-
-    # Demais chaves @@ com valor padrão vazio para evitar lixos no DOCX
-    for key in (
-        "@@natureza_processo",
-        "@@Tipo_Processo",
-        "@@processoexterno",
-        "@@nome_relator",
-        "@@instancia",
-    ):
-        mapping.setdefault(key, "")
 
     doc: Optional["Document"] = None
     # Allow override via argument; otherwise resolve from env
@@ -2697,24 +2746,26 @@ def generate_oficio_from_template(processo: str, output_dir: Path, extra: dict |
                 ok = _python_convert_dotx_only(template_path, out_path)
                 if ok:
                     print(f"Oficio convertido de DOTX para DOCX (sem alterações): {out_path.resolve()}")
-                    return out_path
+                    return _validate_oficio_at_tokens(template_path, out_path)
                 # Fallback com Word (sem replace)
                 ok2 = _word_generate_from_dotx(template_path, out_path, mapping={})
                 if ok2:
                     print(f"Oficio convertido via Word (sem alterações): {out_path.resolve()}")
-                    return out_path
+                    return _validate_oficio_at_tokens(template_path, out_path)
                 print("Aviso: conversão DOTX->DOCX (sem alterações) falhou; usando modelo simples.")
             else:
-                # 1) Tenta gerar via python-docx (sem Word): copia DOTX -> DOCX e faz replace
+                # Como OFICIO_PRESERVE_AT_TOKENS bloqueia @@ no mapping, na
+                # pratica o caminho DOTX-com-substituicao opera apenas em
+                # placeholders nao-@@ (ex.: {CARGO}). Mantemos as estrategias
+                # python-docx / Word; ambas passam pelo validador final.
                 ok = _python_generate_from_dotx(template_path, out_path, mapping)
                 if ok:
                     print(f"Oficio gerado (DOTX via python-docx) em: {out_path.resolve()}")
-                    return out_path
-                # 2) Fallback: tenta MS Word via COM
+                    return _validate_oficio_at_tokens(template_path, out_path)
                 ok2 = _word_generate_from_dotx(template_path, out_path, mapping)
                 if ok2:
                     print(f"Oficio gerado (Word/DOTX) em: {out_path.resolve()}")
-                    return out_path
+                    return _validate_oficio_at_tokens(template_path, out_path)
                 else:
                     print("Aviso: conversao DOTX->DOCX falhou; usando modelo simples.")
         else:
@@ -2748,7 +2799,9 @@ def generate_oficio_from_template(processo: str, output_dir: Path, extra: dict |
     try:
         doc.save(str(out_path))
         print(f"Oficio gerado em: {out_path.resolve()}")
-        return out_path
+        # Quando ha template, validamos preservacao dos @@. No caminho de
+        # fallback (template_path=None), nao ha @@ a preservar.
+        return _validate_oficio_at_tokens(template_path, out_path)
     except Exception as e:
         print(f"Aviso: falha ao salvar oficio: {e}")
         return None
@@ -2887,7 +2940,13 @@ def parse_fields_from_pdf_text(text: str, processo: Optional[str] = None) -> dic
     if snippet:
         out["{{EXTRATO}}"] = snippet[:400]
 
-    # Additional fields for @@ placeholders
+    # Metadados internos (prefixo _meta_*) — NUNCA tokens @@.
+    # O e-TCM e quem preenche os tokens @@... apos o upload da minuta. Aqui
+    # guardamos os valores derivados do PDF apenas para logs, relatorios e
+    # decisoes do orquestrador (ex.: descobrir o relator para a comunicacao
+    # processual). Estes _meta_* sao filtrados antes do replace no DOCX por
+    # generate_oficio_from_template.
+
     # Tipo do processo
     tipo_proc = _m([
         r"Tipo\s*de\s*Processo\s*[:\-]\s*(.+)",
@@ -2897,7 +2956,7 @@ def parse_fields_from_pdf_text(text: str, processo: Optional[str] = None) -> dic
         r"Tipo\s*[:\-]\s*(.+)",
     ])
     if tipo_proc:
-        out["@@Tipo_Processo"] = tipo_proc
+        out["_meta_Tipo_Processo"] = tipo_proc
 
     # Natureza do processo
     natureza = _m([
@@ -2905,7 +2964,7 @@ def parse_fields_from_pdf_text(text: str, processo: Optional[str] = None) -> dic
         r"Classe\s*Processual\s*[:\-]\s*(.+)",
     ])
     if natureza:
-        out["@@natureza_processo"] = natureza
+        out["_meta_natureza_processo"] = natureza
 
     # Processo externo
     proc_ext = _m([
@@ -2914,15 +2973,15 @@ def parse_fields_from_pdf_text(text: str, processo: Optional[str] = None) -> dic
         r"Externo\s*[:\-]\s*(.+)",
     ])
     if proc_ext:
-        out["@@processoexterno"] = proc_ext
+        out["_meta_processoexterno"] = proc_ext
 
-    # Relator
+    # Relator (usado pelo orquestrador para preencher quem assina/recebe)
     relator = _m([
         r"Conselheiro\s*Relator\s*[:\-]\s*(.+)",
         r"Relator\s*[:\-]\s*(.+)",
     ])
     if relator:
-        out["@@nome_relator"] = relator
+        out["_meta_nome_relator"] = relator
 
     # Instância
     instancia = _m([
@@ -2930,29 +2989,27 @@ def parse_fields_from_pdf_text(text: str, processo: Optional[str] = None) -> dic
         r"Instancia\s*[:\-]\s*(.+)",
     ])
     if instancia:
-        out["@@instancia"] = instancia
+        out["_meta_instancia"] = instancia
 
-    # Interessado → Nome_interessado
+    # Interessado e processo (apenas metadata interno)
     if interessado:
-        out["@@Nome_interessado"] = interessado
+        out["_meta_Nome_interessado"] = interessado
+    out["_meta_processo"] = proc
 
-    # Processo → @@processo
-    out["@@processo"] = proc
-
-    # Número do ofício: opcional via env; não costuma vir no PDF
+    # Numero do oficio: opcional via env; nao costuma vir no PDF.
+    # Mantido apenas como metadata; o e-TCM gera o numero apos o upload.
     num_of = os.getenv("NUMERO_OFICIO", "").strip()
-    out["@@numero_oficio"] = num_of if num_of else "s/n"
+    out["_meta_numero_oficio"] = num_of if num_of else "s/n"
 
-    # Data por extenso
+    # Data por extenso (metadata; o token @@data_extenso e preenchido pelo e-TCM)
     data_src = out.get("{{DATA_DOCUMENTO}}")
     if data_src:
-        # Se já estiver por extenso, mantém; caso contrário, converte dd/mm/yyyy
         if re.match(r"\d{1,2}/\d{1,2}/\d{4}", data_src):
-            out["@@data_extenso"] = _pt_data_extenso_from_ddmmyyyy(data_src)
+            out["_meta_data_extenso"] = _pt_data_extenso_from_ddmmyyyy(data_src)
         else:
-            out["@@data_extenso"] = data_src
+            out["_meta_data_extenso"] = data_src
     else:
-        out["@@data_extenso"] = _pt_data_extenso_from_ddmmyyyy(date.today().strftime("%d/%m/%Y"))
+        out["_meta_data_extenso"] = _pt_data_extenso_from_ddmmyyyy(date.today().strftime("%d/%m/%Y"))
 
     return out
 
@@ -4257,8 +4314,20 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
 
         data_decadencia = extract_data_decadencia(pdf_text)
         prazo = calcular_prazo_res_22_21(data_decadencia, date.today())
-        relator = fields.get("@@nome_relator") or fields.get("{{RELATOR}}") or fields.get("{{RELATOR_PROCESSO}}") or ""
-        descricao = f"Oficio {tipo} - modelo {secretaria} - gerado automaticamente"
+        # _meta_nome_relator e preenchido por parse_fields_from_pdf_text com
+        # o conselheiro extraido do PDF (uso interno; nunca vai para o DOCX).
+        relator = fields.get("_meta_nome_relator") or fields.get("{{RELATOR}}") or fields.get("{{RELATOR_PROCESSO}}") or ""
+        # Descricao oficial da comunicacao processual (sempre minusculas,
+        # com acento e barra quando aplicavel). Se o tipo nao for reconhecido,
+        # retornamos um fallback explicito que sinaliza pendencia ao operador.
+        try:
+            descricao = normalize_descricao_comunicacao(tipo)
+        except ValueError:
+            descricao = DESCRICAO_CONHECIMENTO_PROVIDENCIAS
+            print(
+                f"Aviso: tipo '{tipo}' nao reconhecido para descricao da "
+                f"comunicacao; usando fallback '{descricao}'."
+            )
 
         if use_caixa_correio:
             try:
