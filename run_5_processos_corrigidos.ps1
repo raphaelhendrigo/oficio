@@ -24,8 +24,18 @@ $ErrorActionPreference = "Stop"
 
 # --------------------------- Sanidade de credenciais ------------------------
 
-$user = [Environment]::GetEnvironmentVariable("ETCM_USERNAME", "User")
-$pass = [Environment]::GetEnvironmentVariable("ETCM_PASSWORD", "User")
+# Quando o PowerShell e iniciado a partir de outro processo (sandbox, etc),
+# pode nao herdar as vars de User scope automaticamente. Le explicitamente
+# do registro e injeta no processo atual (e nos filhos).
+foreach ($name in @("ETCM_USERNAME", "ETCM_PASSWORD", "ETCM_USER", "ETCM_LOGIN", "ETCM_PASS", "ETCM_SENHA")) {
+    $val = [Environment]::GetEnvironmentVariable($name, "User")
+    if (-not [string]::IsNullOrEmpty($val)) {
+        Set-Item -Path "Env:$name" -Value $val
+    }
+}
+
+$user = $env:ETCM_USERNAME
+$pass = $env:ETCM_PASSWORD
 if ([string]::IsNullOrWhiteSpace($user)) {
     Write-Host "[ERRO] ETCM_USERNAME nao esta configurado em User scope." -ForegroundColor Red
     Write-Host "      Rode scripts\set_local_user_env.ps1 antes de executar." -ForegroundColor Yellow
@@ -37,6 +47,14 @@ if ([string]::IsNullOrWhiteSpace($pass)) {
     Write-Host "        (timeout via LOGIN_MANUAL_WAIT_MS); voce vai precisar digitar a senha" -ForegroundColor Yellow
     Write-Host "        no navegador quando ele abrir." -ForegroundColor Yellow
 }
+
+# --------------------------- Ambiente alvo (PROD) ---------------------------
+
+# Os 5 processos alvo estao em PRODUCAO. URL correta confirmada pelo usuario
+# em 2026-05-13: https://etcm.tcm.sp.gov.br/ (sem o prefixo "homologacao-").
+# config.py aceita ETCM_URL OR BASE_URL — definimos ambos por seguranca.
+$env:ETCM_URL  = "https://etcm.tcm.sp.gov.br/paginas/login.aspx"
+$env:BASE_URL  = "https://etcm.tcm.sp.gov.br/paginas/login.aspx"
 
 # --------------------------- Lista de processos -----------------------------
 
@@ -73,11 +91,13 @@ $env:REUSE_EXISTING_OFICIO = "false"
 
 # --------------------------- Limpeza de minutas antigas ---------------------
 
-# Ambiente alvo: homologacao. Quando aplicavel e seguro, derrubar/cancelar
-# minutas anteriores criadas pelo proprio robo Euclides antes de subir nova.
-# Em PRODUCAO, manter SAFE_DELETE_OWN_DRAFTS=false (regra conservadora).
-$env:ENVIRONMENT = "homologacao"
-$env:SAFE_DELETE_OWN_DRAFTS = "true"
+# Ambiente alvo: PRODUCAO. Por seguranca, SAFE_DELETE_OWN_DRAFTS=false:
+# nenhuma minuta sera derrubada/cancelada automaticamente. Em caso de
+# duplicidade detectada, o robo apenas registra pendencia no log para
+# revisao humana. _can_safe_delete_drafts ainda exige duplo guard,
+# entao deixar ENVIRONMENT=producao tambem bloqueia delete acidental.
+$env:ENVIRONMENT = "producao"
+$env:SAFE_DELETE_OWN_DRAFTS = "false"
 
 # --------------------------- Limite de lote ---------------------------------
 
