@@ -1487,6 +1487,14 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
     if exact_form:
         destinatario = (dados.get("destinatario") or secretaria or "").strip()
         referencia = (dados.get("referencia") or desc_custom or processo).strip()
+        # Marcador do robo Euclides na propria Referencia da Comunicacao
+        # Processual. Critico para o cleanup conseguir identificar as
+        # comunicacoes que ele proprio criou em rodadas anteriores (sem
+        # marcador o cleanup deixa intacto, para nao excluir comunicacao
+        # humana). 'euclides' e o token monitorado por
+        # _is_robot_created_comunicacao_text.
+        if "euclides" not in referencia.lower():
+            referencia = f"{referencia} - euclides".strip(" -")
         status_entrega = (dados.get("status") or os.getenv("STATUS_ENTREGA") or "Urgente").strip()
         try:
             # Aguarda Loading Panel do popup sumir antes de tentar preencher.
