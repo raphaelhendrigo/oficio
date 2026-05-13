@@ -135,8 +135,26 @@ Write-Host "[2/2] Executando fluxo APO-PEN nos 5 processos..." -ForegroundColor 
 Write-Host ("Processos: " + $env:PROCESSOS_LIST) -ForegroundColor Cyan
 Write-Host ""
 
-& $pythonExe .\src\main.py
-$rc = $LASTEXITCODE
+# Usa Start-Process com stdout/stderr separados em arquivos. Evita o bug do
+# PowerShell 5.1 onde linhas em stderr de native exes viram NativeCommandError
+# (que aborta a pipeline mesmo quando o python terminou com sucesso).
+$ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+$outFile = "logs\main_stdout_$ts.log"
+$errFile = "logs\main_stderr_$ts.log"
+Write-Host "stdout: $outFile"
+Write-Host "stderr: $errFile"
+$proc = Start-Process -FilePath $pythonExe -ArgumentList ".\src\main.py" `
+    -NoNewWindow -Wait -PassThru `
+    -RedirectStandardOutput $outFile `
+    -RedirectStandardError $errFile
+$rc = $proc.ExitCode
+
+Write-Host ""
+Write-Host "--- stdout (ultimas 40 linhas) ---" -ForegroundColor Cyan
+if (Test-Path $outFile) { Get-Content $outFile -Tail 40 }
+Write-Host ""
+Write-Host "--- stderr (ultimas 20 linhas) ---" -ForegroundColor Cyan
+if (Test-Path $errFile) { Get-Content $errFile -Tail 20 }
 
 Write-Host ""
 if ($rc -eq 0) {
