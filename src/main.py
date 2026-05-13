@@ -15,16 +15,26 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 from docx_utils import (
     AT_TOKEN_RE,
     AtTokenViolation,
+    DocxValidationError,
+    add_euclides_marker_to_docx,
+    assert_encaminha_has_piece_number,
+    assert_encaminha_text_not_bold,
     assert_at_tokens_preserved,
+    assert_euclides_marker_present_once,
+    convert_dotx_to_docx_preserving_layout,
     extract_at_tokens_from_docx,
+    extract_visible_text_from_docx,
     filter_out_at_tokens,
+    format_encaminha_from_piece_numbers,
     safe_replace_non_at_placeholders,
+    set_encaminha_text_without_bold,
 )
 from oficio_normalize import (
     DESCRICAO_CONHECIMENTO_PROVIDENCIAS,
     DESCRICAO_DILACAO,
     DESCRICAO_JUIZO_SINGULAR,
     DESCRICAO_REITERACAO,
+    decode_zip_unicode_escape_name,
     normalize_descricao_comunicacao,
     signer_name_matches_roseli_chaves,
 )
@@ -33,6 +43,24 @@ from oficio_normalize import (
 def env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name, str(default))
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _post_conclusion_policy(signer_name: str | None = None, destino: str | None = None) -> dict[str, bool]:
+    """Decide ações pós-conclusão do Ofício SSG a partir de flags explícitas."""
+    signer = (signer_name or os.getenv("ASSINANTE_NOME") or os.getenv("SIGNER_NAME") or os.getenv("ASSINANTE") or "").strip()
+    dest = (destino if destino is not None else os.getenv("TRAMITAR_DESTINO") or "").strip()
+    skip_signature = env_bool("SKIP_SIGNATURE", False)
+    skip_tramitacao = env_bool("SKIP_TRAMITACAO", False)
+    stop_after = env_bool("STOP_AFTER_OFICIO_CONCLUIDO", False)
+    signature_required = (not skip_signature) and (env_bool("REQUEST_SIGNATURE", False) or bool(signer))
+    tramitacao_required = (not skip_tramitacao) and (not stop_after) and bool(dest)
+    return {
+        "skip_signature": skip_signature,
+        "skip_tramitacao": skip_tramitacao,
+        "stop_after_oficio_concluido": stop_after,
+        "signature_required": signature_required,
+        "tramitacao_required": tramitacao_required,
+    }
 
 
 def _is_login_page(page) -> bool:
@@ -68,6 +96,18 @@ def _strip_quotes(v: Optional[str]) -> str:
     if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
         s = s[1:-1]
     return s.strip()
+
+
+def _accept_dialog_safely(dialog) -> None:
+    """Aceita diálogo Playwright sem quebrar quando outro listener já aceitou."""
+    try:
+        dialog.accept()
+    except Exception as e:
+        if "already handled" not in str(e).lower():
+            try:
+                print(f"Aviso: falha ao aceitar dialog automaticamente: {e}")
+            except Exception:
+                pass
 
 
 def _extract_login_error(page) -> str:
@@ -615,6 +655,35 @@ def _open_fresh_apo_pen_page(context):
         return None
 
 
+def open_process_action_context_anywhere(context, main_page, processo: str):
+    """Localiza o processo em APO-PEN ou por busca geral quando saiu da fila."""
+    attempts: list[tuple[str, object]] = []
+    fresh = _open_fresh_apo_pen_page(context)
+    if fresh is not None:
+        attempts.append(("APO-PEN", fresh))
+    if main_page is not None:
+        attempts.append(("página principal", main_page))
+
+    for label, page_like in attempts:
+        try:
+            row = _filter_process_grid_row(page_like, processo, timeout_ms=5000)
+            if row is not None:
+                print(f"Processo {processo}: localizado em {label}.")
+                return page_like
+        except Exception:
+            pass
+
+    try:
+        base = fresh or main_page
+        found = search_processo_and_open_viewer(context, base, processo)
+        if found is not None:
+            print(f"Processo {processo}: localizado por busca geral/visualizador.")
+            return found
+    except Exception as e:
+        print(f"Aviso: busca geral não localizou {processo}: {e}")
+    return fresh or main_page
+
+
 def open_apo_pen_menu(page) -> bool:
     """Abre Processos -> UNIDADE TECNICA DE OFICIOS -> Em confeccao APO-PEN."""
     # Caminho direto observado em produção/homologação: UNIDADE TÉCNICA DE OFÍCIOS -> Em confecção APO-PEN.
@@ -903,6 +972,84 @@ def open_caixa_correio_from_grid(context, page, processo: str):
     return target
 
 
+def _wait_dx_loading_panel_done(container, popup_base_id: str, timeout_ms: int = 60000) -> bool:
+    """Aguarda o Loading Panel (LP/LD) de um popup DevExpress sumir.
+
+    Em PROD, popups complexos (ex: ppcNoificacao) demoram mais que 30s
+    para inicializar — o textarea fica no DOM porem invisivel enquanto
+    `_LP` (Loading Panel) ou `_LD` (Loading Div) estiverem visiveis. Sem
+    essa espera, `locator.fill()` repete dezenas de vezes ate timeout.
+
+    Retorna True se o loading sumiu, False se o timeout estourou. Em
+    ambos os casos o fluxo continua — o `_safe_dx_fill` tem fallback.
+    """
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        try:
+            still_loading = container.evaluate(
+                """(baseId) => {
+                    const candidates = [baseId + '_LP', baseId + '_LD'];
+                    for (const id of candidates) {
+                        const el = document.getElementById(id);
+                        if (el && el.offsetParent !== null) {
+                            const cs = window.getComputedStyle(el);
+                            if (cs.display !== 'none' && cs.visibility !== 'hidden') {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }""",
+                popup_base_id,
+            )
+            if not still_loading:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.4)
+    return False
+
+
+def _safe_dx_fill(container, selector: str, value: str, timeout_ms: int = 30000) -> bool:
+    """Preenche um campo DevExpress com fallback via JS.
+
+    Primeiro tenta `locator.fill(value)` (que espera visibilidade). Se
+    falhar (timeout ou elemento "scrim coberto"), injeta o valor via JS
+    direto no DOM e dispara `input`/`change` para que o DevExpress
+    registre a mudanca via JavaScript. Retorna True em sucesso.
+    """
+    value = "" if value is None else str(value)
+    try:
+        container.locator(selector).first.fill(value, timeout=timeout_ms)
+        return True
+    except Exception as e:
+        try:
+            ok = bool(container.evaluate(
+                """([sel, value]) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return false;
+                    el.value = value;
+                    try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch(e) {}
+                    try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch(e) {}
+                    try {
+                        if (window.ASPx && ASPx.EValueChanged) {
+                            const idBase = el.id.endsWith('_I') ? el.id.slice(0, -2) : el.id;
+                            ASPx.EValueChanged(idBase);
+                        }
+                    } catch(e) {}
+                    return true;
+                }""",
+                [selector, value],
+            ))
+            if ok:
+                return True
+            print(f"  Aviso: _safe_dx_fill nao encontrou '{selector}' nem via JS")
+        except Exception as e2:
+            print(f"  Aviso: _safe_dx_fill JS fallback falhou para '{selector}': {e2}")
+        print(f"  Aviso: _safe_dx_fill nao conseguiu preencher '{selector}': {e}")
+        return False
+
+
 def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
     """Preenche e cria uma nova Comunicacao Processual."""
     processo = dados.get("processo") or ""
@@ -1014,6 +1161,28 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
         except Exception:
             continue
 
+    def _find_container_with_selector(root, selector: str, timeout_ms: int = 15000):
+        deadline = time.time() + (timeout_ms / 1000.0)
+        while time.time() < deadline:
+            candidates = [root]
+            try:
+                candidates.extend(list(getattr(root, "frames", [])))
+            except Exception:
+                pass
+            for candidate in candidates:
+                try:
+                    loc = candidate.locator(selector).first
+                    if loc.count() > 0:
+                        try:
+                            loc.wait_for(state="visible", timeout=1000)
+                        except Exception:
+                            pass
+                        return candidate
+                except Exception:
+                    continue
+            time.sleep(0.3)
+        return None
+
     def _exact_set_combo(container, base_id: str, value: str) -> bool:
         value = (value or "").strip()
         if not value:
@@ -1110,43 +1279,67 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
             pass
 
     # Caminho validado no projeto anexado: cadastro ppcNoificacao_*.
-    exact_form = False
-    try:
-        form_container.locator("#ppcNoificacao_txtDescricao_I").first.wait_for(state="visible", timeout=12000)
-        exact_form = True
-    except Exception:
-        exact_form = False
+    exact_target = _find_container_with_selector(target, "#ppcNoificacao_txtDescricao_I", timeout_ms=18000)
+    exact_form = exact_target is not None
+    if exact_target is not None:
+        form_container = exact_target
     if exact_form:
         destinatario = (dados.get("destinatario") or secretaria or "").strip()
         referencia = (dados.get("referencia") or desc_custom or processo).strip()
         status_entrega = (dados.get("status") or os.getenv("STATUS_ENTREGA") or "Urgente").strip()
         try:
+            # Aguarda Loading Panel do popup sumir antes de tentar preencher.
+            # Em PROD o ppcNoificacao_LP/LD pode demorar >30s para liberar,
+            # e o textarea fica no DOM porem invisivel ate la — sem essa
+            # espera, fill() repete >60 vezes ate timeout.
+            _wait_dx_loading_panel_done(form_container, "ppcNoificacao", timeout_ms=90000)
             _exact_set_combo(form_container, "ppcNoificacao_cbbUsuarios", destinatario)
             _exact_set_combo(form_container, "ppcNoificacao_cbbPessoa", relator)
-            form_container.locator("#ppcNoificacao_txtDescricao_I").first.fill(desc_custom)
-            try:
-                form_container.locator("#ppcNoificacao_txtReferencia_I").first.fill(referencia)
-            except Exception:
-                pass
+            _wait_dx_loading_panel_done(form_container, "ppcNoificacao", timeout_ms=30000)
+            if not _safe_dx_fill(form_container, "#ppcNoificacao_txtDescricao_I", desc_custom, timeout_ms=60000):
+                raise RuntimeError("nao conseguiu preencher #ppcNoificacao_txtDescricao_I")
+            _safe_dx_fill(form_container, "#ppcNoificacao_txtReferencia_I", referencia, timeout_ms=15000)
             _exact_set_combo(form_container, "ppcNoificacao_cbbStatusProvidencia", status_entrega)
-            try:
-                form_container.locator("#ppcNoificacao_txtPrazo_I").first.fill(str(prazo or ""))
-            except Exception:
-                pass
+            _safe_dx_fill(form_container, "#ppcNoificacao_txtPrazo_I", str(prazo or ""), timeout_ms=15000)
             _prepare_notificacao_defaults(form_container, status_entrega, destinatario)
+            clicked_save = False
             for sel in [
                 "#ppcNoificacao_btnPopNova_I",
                 "#ppcNoificacao_btnPopNova_CD",
                 "#ppcNoificacao_btnPopSalvar_I",
                 "#ppcNoificacao_btnPopSalvar_CD",
+                "input[id*='btnPopNova' i]",
+                "input[id*='btnPopSalvar' i]",
             ]:
                 try:
                     loc = form_container.locator(sel).first
                     if loc.count() > 0:
                         loc.click(force=True, timeout=5000)
+                        clicked_save = True
                         break
                 except Exception:
                     continue
+            if not clicked_save:
+                try:
+                    clicked_save = bool(form_container.evaluate(
+                        """() => {
+                            const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+                            const names = ['ppcNoificacao_btnPopNova', 'btnPopNova', 'ppcNoificacao_btnPopSalvar', 'btnPopSalvar'];
+                            for (const name of names) {
+                                const btn = coll && coll.GetByName ? coll.GetByName(name) : window[name];
+                                if (btn && btn.DoClick) { btn.DoClick(); return true; }
+                            }
+                            for (const id of ['ppcNoificacao_btnPopNova_I', 'ppcNoificacao_btnPopSalvar_I']) {
+                                const el = document.getElementById(id);
+                                if (el) { el.click(); return true; }
+                            }
+                            return false;
+                        }"""
+                    ))
+                except Exception:
+                    clicked_save = False
+            if not clicked_save:
+                raise RuntimeError("botão Salvar/Nova comunicação não localizado no formulário ppcNoificacao")
             try:
                 form_container.wait_for_selector("#gvNotificacao, #gvNotificacao_DXMainTable", timeout=20000)
             except Exception:
@@ -1266,6 +1459,13 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
     if saved:
         print(f"Comunicacao processual criada para o processo {processo} (prazo {prazo} dias, tipo {tipo}, secretaria {secretaria}).")
     else:
+        try:
+            html = form_container.content() if hasattr(form_container, "content") else form_container.evaluate("() => document.documentElement.outerHTML")
+            path = _save_evidence_text("comunicacao_nao_confirmada", processo, html)
+            if path:
+                print(f"Evidência da comunicação não confirmada salva em: {path}")
+        except Exception:
+            pass
         print("Aviso: nao foi possivel confirmar o formulario de Comunicacao Processual.")
     return saved
 
@@ -2252,7 +2452,44 @@ def attach_docx_via_gerenciador_atos(context, page, processo: str, docx_path: Pa
     time.sleep(2.0)
     return bool(clicked_confirm and closed_after_upload)
 
-def click_last_piece_and_open_pdf(context, page, output_dir: Path, processo: str, position: str = "last") -> tuple[Path | None, Optional[str]]:
+def _extract_piece_ordinal_from_label(label: str | None) -> str | None:
+    """Extrai ordinal de peça de rótulos como 'peça 03' ou '03 - MANUTAP-OF'."""
+    if not label:
+        return None
+    text = normalize(label).lower()
+    patterns = [
+        r"\bpeca\s*(\d{1,4})\b",
+        r"^\s*(\d{1,4})\s*[-.)]",
+        r"\b(\d{1,4})\s*[-.)]\s*[a-z]",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            try:
+                value = int(m.group(1))
+                if value > 0:
+                    return f"{value:02d}"
+            except Exception:
+                continue
+    return None
+
+
+def _format_piece_ordinal_from_position(label: str | None, position_index: int) -> str:
+    """Usa o ordinal no rótulo da árvore; se ausente, usa a ordem DOM da peça."""
+    found = _extract_piece_ordinal_from_label(label)
+    if found:
+        return found
+    return f"{max(position_index + 1, 1):02d}"
+
+
+def click_last_piece_and_open_pdf(
+    context,
+    page,
+    output_dir: Path,
+    processo: str,
+    position: str = "last",
+    return_piece_number: bool = False,
+):
     """Within the VisualizarDocsProtocolo viewer, click the most recent piece and download its PDF.
 
     Set position to "first" to fetch the capa/first piece; defaults to the last piece.
@@ -2316,13 +2553,20 @@ def click_last_piece_and_open_pdf(context, page, output_dir: Path, processo: str
             time.sleep(0.5)
     if count == 0:
         print("Aviso: Nenhuma peca encontrada no visualizador.")
+        if return_piece_number:
+            return None, None, None
         return None, None
 
     pos_norm = (position or "last").lower()
+    match_pattern = ""
+    if pos_norm.startswith("match:"):
+        match_pattern = position.split(":", 1)[1].strip()
+        pos_norm = "match"
     max_idx = -1
     max_n = 0
     min_idx = None
     min_n = 0
+    match_n = None
     for i in range(count):
         item = loc.nth(i)
         val = item.get_attribute("index_ato") or item.get_attribute("index") or ""
@@ -2336,9 +2580,21 @@ def click_last_piece_and_open_pdf(context, page, output_dir: Path, processo: str
         if min_idx is None or iv < min_idx:
             min_idx = iv
             min_n = i
+        if match_pattern:
+            try:
+                raw_text = (item.inner_text(timeout=500) or item.text_content(timeout=500) or "")
+            except Exception:
+                raw_text = ""
+            if re.search(match_pattern, normalize(raw_text), flags=re.I):
+                match_n = i
 
-    target_n = min_n if pos_norm.startswith("first") else max_n
+    if pos_norm == "match" and match_n is not None:
+        target_n = match_n
+    else:
+        target_n = min_n if pos_norm.startswith("first") else max_n
     label = "primeiro-ato" if pos_norm.startswith("first") else "ultimo-ato"
+    if pos_norm == "match":
+        label = "peca-preferida"
 
     # Capture piece title/name before clicking
     piece_title: Optional[str] = None
@@ -2355,6 +2611,12 @@ def click_last_piece_and_open_pdf(context, page, output_dir: Path, processo: str
     except Exception:
         loc.nth(target_n).click()
     time.sleep(1.0)
+    piece_number = _format_piece_ordinal_from_position(piece_title, target_n)
+
+    def _result(pdf_path: Path | None):
+        if return_piece_number:
+            return pdf_path, piece_title, piece_number
+        return pdf_path, piece_title
 
     def _pick_attr(pl, sel, attr):
         el = pl.locator(sel)
@@ -2407,7 +2669,7 @@ def click_last_piece_and_open_pdf(context, page, output_dir: Path, processo: str
         abs_url = urljoin(base_url, pdf_url)
         pdf_path_try = _download_and_save_pdf(abs_url, referer_url=base_url)
         if pdf_path_try:
-            return pdf_path_try, piece_title
+            return _result(pdf_path_try)
         else:
             print("Aviso: conteudo nao-PDF retornado no embed direto. Tentando nova janela...")
 
@@ -2432,7 +2694,7 @@ def click_last_piece_and_open_pdf(context, page, output_dir: Path, processo: str
 
     if not btn_clicked or not pdf_page:
         print("Aviso: Botao 'abrir em nova janela' nao encontrado e nenhum embed localizado.")
-        return None, piece_title
+        return _result(None)
 
     try:
         pdf_page.wait_for_load_state("domcontentloaded", timeout=30000)
@@ -2453,14 +2715,14 @@ def click_last_piece_and_open_pdf(context, page, output_dir: Path, processo: str
     )
     if not pdf_url:
         print("Aviso: URL do PDF nao encontrada na nova janela.")
-        return None, piece_title
+        return _result(None)
 
     abs_url = urljoin(pdf_page.url, pdf_url)
     pdf_path_try = _download_and_save_pdf(abs_url, referer_url=pdf_page.url)
     if pdf_path_try:
-        return pdf_path_try, piece_title
+        return _result(pdf_path_try)
     print("Aviso: conteudo nao-PDF retornado na nova janela.")
-    return None, piece_title
+    return _result(None)
 
 
 def _docx_replace_all(doc, mapping: dict[str, str]):
@@ -2669,24 +2931,31 @@ def _python_convert_dotx_only(template_path: Path, out_path: Path) -> bool:
 
 
 def _validate_oficio_at_tokens(template: Optional[Path], generated: Path) -> Optional[Path]:
-    """Pos-validacao do DOCX gerado: confirma preservacao dos tokens @@ do modelo.
+    """Pós-validação do DOCX gerado antes de anexar no e-TCM.
 
     Comportamento:
-      - Se `template` for None (modo fallback simples), nao ha referencia e o
-        gerado e devolvido sem validacao.
       - Quando OFICIO_PRESERVE_AT_TOKENS=true (default), uma violacao bloqueia:
         a funcao loga o erro, retorna None e o orquestrador NAO deve anexar o
         DOCX comprometido no e-TCM.
       - Quando OFICIO_PRESERVE_AT_TOKENS=false, apenas loga aviso e devolve o
         Path (modo permissivo, util para depuracao).
     """
-    if template is None:
-        return generated
     preserve = env_bool("OFICIO_PRESERVE_AT_TOKENS", True)
+    marker_enabled = env_bool("OFICIO_ADD_EUCLIDES_MARKER", False)
+    require_piece = env_bool("OFICIO_REQUIRE_PIECE_NUMBER_IN_ENCAMINHA", False)
+    marker = os.getenv("OFICIO_EUCLIDES_MARKER", r"\euclides")
+
     try:
-        report = assert_at_tokens_preserved(template, generated)
-        print(report.as_log_line())
-        return generated
+        if marker_enabled:
+            add_euclides_marker_to_docx(generated, marker=marker)
+    except Exception as e:
+        print(f"ERRO bloqueante ao inserir marcador Euclides em {generated.name}: {e}")
+        return None
+
+    try:
+        if template is not None:
+            report = assert_at_tokens_preserved(template, generated)
+            print(report.as_log_line())
     except AtTokenViolation as e:
         if preserve:
             print(
@@ -2695,7 +2964,19 @@ def _validate_oficio_at_tokens(template: Optional[Path], generated: Path) -> Opt
             )
             return None
         print(f"AVISO preservacao @@: {e}")
-        return generated
+
+    try:
+        if require_piece:
+            assert_encaminha_has_piece_number(generated)
+            if not env_bool("OFICIO_ENCAMINHA_TEXT_BOLD", False):
+                assert_encaminha_text_not_bold(generated)
+        if marker_enabled:
+            assert_euclides_marker_present_once(generated, marker=marker)
+    except DocxValidationError as e:
+        print(f"ERRO bloqueante na validação do DOCX final: {e}")
+        return None
+
+    return generated
 
 
 def generate_oficio_from_template(processo: str, output_dir: Path, extra: dict | None = None, template_path: Optional[Path] = None) -> Path | None:
@@ -2739,66 +3020,58 @@ def generate_oficio_from_template(processo: str, output_dir: Path, extra: dict |
         mapping.setdefault("{{NOME}}", nome)
         mapping.setdefault("{{NOME_COMPLETO}}", nome)
 
-    doc: Optional["Document"] = None
     # Allow override via argument; otherwise resolve from env
     template_path = template_path or _resolve_oficio_template()
     if template_path and template_path.exists():
-        if template_path.suffix.lower() == ".dotx":
-            out_path = output_dir / f"oficio_{safe_filename(processo)}.docx"
-            convert_only = env_bool("OFICIO_CONVERT_ONLY", False)
-            if convert_only:
-                # Apenas converter DOTX -> DOCX, sem substituir placeholders
-                ok = _python_convert_dotx_only(template_path, out_path)
-                if ok:
-                    print(f"Oficio convertido de DOTX para DOCX (sem alterações): {out_path.resolve()}")
-                    return _validate_oficio_at_tokens(template_path, out_path)
-                # Fallback com Word (sem replace)
-                ok2 = _word_generate_from_dotx(template_path, out_path, mapping={})
-                if ok2:
-                    print(f"Oficio convertido via Word (sem alterações): {out_path.resolve()}")
-                    return _validate_oficio_at_tokens(template_path, out_path)
-                print("Aviso: conversão DOTX->DOCX (sem alterações) falhou; usando modelo simples.")
+        out_path = output_dir / f"oficio_{safe_filename(processo)}.docx"
+        try:
+            convert_dotx_to_docx_preserving_layout(template_path, out_path)
+            visible_text = "\n".join(extract_visible_text_from_docx(out_path))
+            effective_mapping = {
+                str(k): str(v)
+                for k, v in mapping.items()
+                if str(k) and str(k) in visible_text
+            }
+            if effective_mapping:
+                report = safe_replace_non_at_placeholders(
+                    out_path,
+                    effective_mapping,
+                    template_path=template_path,
+                )
+                print(report.as_log_line())
+                encaminha_value = (
+                    effective_mapping.get("{{ENCAMINHA}}")
+                    or effective_mapping.get("{ENCAMINHA}")
+                    or effective_mapping.get("Cópia da(s) peça(s) dos autos.")
+                    or effective_mapping.get("Cópia da(s) peça(s) dos autos")
+                )
+                if encaminha_value and not env_bool("OFICIO_ENCAMINHA_TEXT_BOLD", False):
+                    set_encaminha_text_without_bold(out_path, encaminha_value)
+                    assert_at_tokens_preserved(template_path, out_path)
+                print(f"Oficio gerado por cópia/conversão + substituições seguras: {out_path.resolve()}")
             else:
-                # Como OFICIO_PRESERVE_AT_TOKENS bloqueia @@ no mapping, na
-                # pratica o caminho DOTX-com-substituicao opera apenas em
-                # placeholders nao-@@ (ex.: {CARGO}). Mantemos as estrategias
-                # python-docx / Word; ambas passam pelo validador final.
-                ok = _python_generate_from_dotx(template_path, out_path, mapping)
-                if ok:
-                    print(f"Oficio gerado (DOTX via python-docx) em: {out_path.resolve()}")
-                    return _validate_oficio_at_tokens(template_path, out_path)
-                ok2 = _word_generate_from_dotx(template_path, out_path, mapping)
-                if ok2:
-                    print(f"Oficio gerado (Word/DOTX) em: {out_path.resolve()}")
-                    return _validate_oficio_at_tokens(template_path, out_path)
-                else:
-                    print("Aviso: conversao DOTX->DOCX falhou; usando modelo simples.")
-        else:
-            try:
-                doc = Document(str(template_path))
-            except Exception as e:
-                print(f"Aviso: nao foi possivel abrir o template '{template_path.name}' ({e}). Usando modelo simples.")
+                print(f"Oficio gerado por cópia/conversão sem reserialização: {out_path.resolve()}")
+            return _validate_oficio_at_tokens(template_path, out_path)
+        except Exception as e:
+            print(f"Aviso: falha ao gerar pelo template '{template_path.name}' ({e}). Usando modelo simples.")
 
-    if doc is None:
-        # Fallback: cria um documento basico com campos comuns
-        doc = Document()
-        doc.add_heading(f"Oficio – Processo {processo}", level=1)
-        doc.add_paragraph(f"Data: {mapping.get('{{DATA}}','')}")
-        if extra:
-            # Inclui alguns campos relevantes quando existirem
-            for k in ("{{ASSUNTO}}", "{{INTERESSADO}}", "{{REQUERENTE}}", "{{DATA_DOCUMENTO}}"):
-                v = mapping.get(k)
-                if v:
-                    label = k.strip("{} ")
-                    doc.add_paragraph(f"{label}: {v}")
-        doc.add_paragraph("")
-        corpo = mapping.get("{{EXTRATO}}") or ""
-        if corpo:
-            doc.add_paragraph(corpo)
-        else:
-            doc.add_paragraph("Em atendimento, encaminhamos resposta referente ao processo informado.")
+    # Fallback: cria um documento basico com campos comuns.
+    doc = Document()
+    doc.add_heading(f"Oficio - Processo {processo}", level=1)
+    doc.add_paragraph(f"Data: {mapping.get('{{DATA}}','')}")
+    if extra:
+        # Inclui alguns campos relevantes quando existirem.
+        for k in ("{{ASSUNTO}}", "{{INTERESSADO}}", "{{REQUERENTE}}", "{{DATA_DOCUMENTO}}"):
+            v = mapping.get(k)
+            if v:
+                label = k.strip("{} ")
+                doc.add_paragraph(f"{label}: {v}")
+    doc.add_paragraph("")
+    corpo = mapping.get("{{EXTRATO}}") or ""
+    if corpo:
+        doc.add_paragraph(corpo)
     else:
-        _docx_replace_all(doc, mapping)
+        doc.add_paragraph("Em atendimento, encaminhamos resposta referente ao processo informado.")
 
     out_path = output_dir / f"oficio_{safe_filename(processo)}.docx"
     try:
@@ -3160,12 +3433,28 @@ def _select_template_for(tipo: str, secretaria: str) -> Optional[Path]:
     if not d.exists() or not d.is_dir():
         return None
 
-    sec_norm = normalize(secretaria).lower()
-    # Primeiro, escolha todos que combinem a secretaria
-    candidates = list(d.glob("*"))
-    candidates = [p for p in candidates if p.is_file() and sec_norm in normalize(p.name).lower()]
+    sec_norm = normalize(decode_zip_unicode_escape_name(secretaria)).lower()
+    # Primeiro, escolha todos que combinem a secretaria. O nome pode ter vindo
+    # do ZIP com escapes (#U00fa etc.), entao comparamos sempre decodificado.
+    candidates = []
+    for p in d.glob("*"):
+        if not p.is_file():
+            continue
+        decoded_name = decode_zip_unicode_escape_name(p.name)
+        if sec_norm in normalize(decoded_name).lower():
+            candidates.append(p)
     if not candidates:
-        # fallback: qualquer arquivo (pasta deve conter só os 3 modelos)
+        # fallback explícito para Geral antes de aceitar qualquer arquivo.
+        geral = []
+        for p in d.glob("*"):
+            if not p.is_file():
+                continue
+            decoded_name = decode_zip_unicode_escape_name(p.name)
+            if "geral" in normalize(decoded_name).lower():
+                geral.append(p)
+        candidates = geral
+    if not candidates:
+        # Último fallback: qualquer arquivo da pasta.
         candidates = [p for p in d.glob("*") if p.is_file()]
     if not candidates:
         return None
@@ -3236,7 +3525,10 @@ def classify_and_select_template_path(pdf_text: str, last_piece_name: Optional[s
         return None
     p2 = _ensure_docx_if_doc(p)
     try:
-        print(f"Modelo selecionado: tipo={tipo}, secretaria={secretaria}, arquivo={p2.name}")
+        print(
+            "Modelo selecionado: "
+            f"tipo={tipo}, secretaria={secretaria}, arquivo={decode_zip_unicode_escape_name(p2.name)}"
+        )
     except Exception:
         pass
     return p2
@@ -3886,10 +4178,158 @@ def _find_oficio_ssg_row(pop, preferred_statuses: list[str] | None = None):
     return None, ""
 
 
+def _save_evidence_text(prefix: str, processo: str, content: str, suffix: str = ".html") -> Path | None:
+    try:
+        out_dir = Path("artifacts") / "evidence"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = out_dir / f"{safe_filename(processo)}_{prefix}_{stamp}{suffix}"
+        path.write_text(content or "", encoding="utf-8")
+        return path
+    except Exception:
+        return None
+
+
+def _click_row_action_by_keywords(pop, row, keywords: list[str], processo: str, desc: str) -> tuple[bool, str]:
+    """Clica em ação da linha por title/alt/onclick/texto, tolerando ícones DevExpress."""
+    norm_keywords = [normalize(k).lower() for k in keywords if k]
+    try:
+        candidates = row.locator("img, a, input, button, span[onclick], td[onclick]")
+        count = min(candidates.count(), 80)
+    except Exception:
+        count = 0
+
+    for i in range(count):
+        try:
+            cand = candidates.nth(i)
+            attrs: list[str] = []
+            for attr in ("title", "alt", "aria-label", "onclick", "src", "id", "name", "value"):
+                try:
+                    attrs.append(cand.get_attribute(attr) or "")
+                except Exception:
+                    pass
+            try:
+                attrs.append(cand.inner_text(timeout=300) or "")
+            except Exception:
+                pass
+            hay = normalize(" ".join(attrs)).lower()
+            if not hay or not any(k in hay for k in norm_keywords):
+                continue
+            try:
+                pop.on("dialog", _accept_dialog_safely)
+            except Exception:
+                pass
+            try:
+                cand.click(force=True, timeout=3000)
+            except Exception:
+                handle = cand.element_handle(timeout=1000)
+                if handle:
+                    pop.evaluate(
+                        "(el) => {"
+                        "  try { el.click(); return true; } catch(e) {}"
+                        "  try { if (el.onclick) { el.onclick.call(el); return true; } } catch(e) {}"
+                        "  try { const code = el.getAttribute('onclick'); if (code) { (new Function(code)).call(el); return true; } } catch(e) {}"
+                        "  return false;"
+                        "}",
+                        handle,
+                    )
+            return True, f"{desc} via candidato[{i}] keywords={keywords} attrs='{hay[:140]}'"
+        except Exception:
+            continue
+
+    try:
+        html = row.evaluate("el => el.outerHTML")
+    except Exception:
+        html = ""
+    path = _save_evidence_text(f"acao_nao_encontrada_{safe_filename(desc)}", processo, html)
+    if path:
+        return False, f"ação '{desc}' não encontrada; HTML da linha salvo em {path}"
+    return False, f"ação '{desc}' não encontrada; não foi possível salvar HTML da linha"
+
+
 _NON_PROD_ENVIRONMENTS: frozenset[str] = frozenset({
     "homologacao", "homologação", "homolog", "hml", "hmg",
     "teste", "test", "tst", "dev", "desenvolvimento",
 })
+
+_PROD_ENVIRONMENTS: frozenset[str] = frozenset({"producao", "produção", "prod"})
+_TERMINAL_FINAL_STATUS_RE = re.compile(r"\b(assinad[oa]|finalizad[oa]|publicad[oa])\b", re.I)
+_PENDING_SIGNATURE_STATUS_RE = re.compile(
+    r"\b(em assinatura|aguardando assinatura|pendente de assinatura)\b",
+    re.I,
+)
+
+
+def _parse_processos_env(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    sep = ";" if ";" in value and "," not in value else ","
+    return {item.strip().upper() for item in value.split(sep) if item.strip()}
+
+
+def is_terminal_final_status(status_text: str) -> bool:
+    """True para status definitivo que nunca deve ser excluído automaticamente."""
+    if not status_text:
+        return False
+    text = normalize(status_text).lower()
+    return bool(_TERMINAL_FINAL_STATUS_RE.search(text)) and "em assinatura" not in text
+
+
+def is_pending_signature_status(status_text: str) -> bool:
+    """True para status em que estorno de assinatura ainda é reversível."""
+    if not status_text:
+        return False
+    return bool(_PENDING_SIGNATURE_STATUS_RE.search(normalize(status_text).lower()))
+
+
+def _is_robot_created_comunicacao_text(row_text: str) -> bool:
+    """Heurística conservadora para comunicação criada pelo robô Euclides."""
+    text = normalize(row_text or "").lower()
+    robot_markers = (
+        "euclides",
+        "gerado automaticamente",
+        "gerada automaticamente",
+        "oficio utap - modelo",
+        "oficio dilacao - modelo",
+        "oficio reiteracao - modelo",
+        "oficio juizo - modelo",
+    )
+    return any(marker in text for marker in robot_markers)
+
+
+def destructive_cleanup_authorized(
+    processo: str,
+    required_force_flag: str | None = None,
+) -> tuple[bool, str]:
+    """Guarda de produção para ações destrutivas nos cinco processos autorizados."""
+    proc = (processo or "").strip().upper()
+    authorized = _parse_processos_env(os.getenv("ONLY_PROCESSOS_AUTHORIZED"))
+    env_raw = (os.getenv("ENVIRONMENT") or "").strip()
+    env_norm = normalize(env_raw).lower()
+
+    if proc not in authorized:
+        return False, f"processo {processo} fora de ONLY_PROCESSOS_AUTHORIZED"
+    if env_norm not in _PROD_ENVIRONMENTS:
+        return False, f"ENVIRONMENT='{env_raw}' não é producao"
+    if not env_bool("SAFE_DELETE_OWN_DRAFTS", False):
+        return False, "SAFE_DELETE_OWN_DRAFTS=false"
+    if not env_bool("RUN_PROD_DESTRUCTIVE_CLEANUP", False):
+        return False, "RUN_PROD_DESTRUCTIVE_CLEANUP=false"
+    if required_force_flag and not env_bool(required_force_flag, False):
+        return False, f"{required_force_flag}=false"
+    return True, f"produção autorizada para {processo}"
+
+
+def _cleanup_guard_for_process(
+    processo: str,
+    required_force_flag: str | None = None,
+) -> tuple[bool, str]:
+    """Compatibilidade: em produção exige guarda forte; fora dela usa guarda legada."""
+    env_norm = normalize((os.getenv("ENVIRONMENT") or "").strip()).lower()
+    prod_requested = env_norm in _PROD_ENVIRONMENTS or env_bool("RUN_PROD_DESTRUCTIVE_CLEANUP", False)
+    if prod_requested:
+        return destructive_cleanup_authorized(processo, required_force_flag=required_force_flag)
+    return _can_safe_delete_drafts()
 
 
 def _can_safe_delete_drafts() -> tuple[bool, str]:
@@ -3930,7 +4370,7 @@ def delete_ato_oficio_ssg_qualquer_estado(context, page, processo: str) -> tuple
 
     Retorna (sucesso_final, lista_de_acoes_tomadas) — a lista entra no relatorio.
     """
-    ok, reason = _can_safe_delete_drafts()
+    ok, reason = _cleanup_guard_for_process(processo, "FORCE_DELETE_OLD_OFICIO_SSG")
     if not ok:
         return False, [f"bloqueado: {reason}"]
 
@@ -3951,46 +4391,73 @@ def delete_ato_oficio_ssg_qualquer_estado(context, page, processo: str) -> tuple
         except Exception:
             pass
 
-        for tentativa in range(1, 5):
+        for tentativa in range(1, 11):
             row, row_text = _find_oficio_ssg_row(pop)
             if row is None:
                 acoes.append(f"t{tentativa}: nenhuma linha Oficio SSG remanescente (presumido excluido)")
                 return True, acoes
 
             # Status 'Assinado' definitivo: nao tocar.
-            if re.search(r"\bassinad[oa]\b", row_text) and "em assinatura" not in row_text and "aguardando" not in row_text:
-                acoes.append(f"t{tentativa}: ato Oficio SSG ja Assinado — NAO TOCAR (status='{row_text[:100]}')")
+            if is_terminal_final_status(row_text):
+                acoes.append(f"t{tentativa}: ato Oficio SSG em status final — NAO TOCAR (status='{row_text[:100]}')")
                 return False, acoes
 
             # Decide acao pela ordem: assinatura -> conclusao -> rascunho.
-            if "em assinatura" in row_text or "aguardando assinatura" in row_text:
+            if is_pending_signature_status(row_text):
                 desc = "estornar assinatura"
                 action_selectors = [
                     "img[title*='Estornar' i][title*='ssinatura' i]",
+                    "a[title*='Estornar' i][title*='ssinatura' i]",
                     "img[onclick*='EstornarAssinatura' i]",
                     "img[onclick*='f_EstornarAssinatura' i]",
                     "img[title*='Cancelar' i][title*='ssinatura' i]",
                     "img[onclick*='CancelarAssinatura' i]",
                 ]
+                keyword_fallback = ["estornar assinatura", "cancelar assinatura", "retirar assinatura", "assinatura"]
             elif "concluido" in row_text or "concluído" in row_text:
                 desc = "estornar conclusao"
                 action_selectors = [
                     "img[title*='Estornar' i][title*='oncl' i]",
+                    "a[title*='Estornar' i][title*='oncl' i]",
+                    "img[title*='Estornar' i]",
+                    "a[title*='Estornar' i]",
+                    "img[title*='Reabrir' i]",
+                    "a[title*='Reabrir' i]",
+                    "img[title*='Rascunho' i]",
+                    "a[title*='Rascunho' i]",
                     "img[onclick*='EstornarConclusao' i]",
                     "img[onclick*='f_EstornarConclusao' i]",
+                    "img[onclick*='CancelarConclusao' i]",
                     "img[onclick*='ReabrirAto' i]",
                     "img[onclick*='f_ReabrirAto' i]",
+                    "a[onclick*='Estornar' i]",
+                    "a[onclick*='Reabrir' i]",
+                ]
+                keyword_fallback = [
+                    "estornar conclusao",
+                    "estornar conclusão",
+                    "estornar",
+                    "reabrir",
+                    "rascunho",
+                    "desfazer",
+                    "retornar",
+                    "voltar",
+                    "cancelar conclusao",
+                    "cancelar conclusão",
                 ]
             elif "rascunho" in row_text:
                 desc = "cancelar/excluir rascunho"
                 action_selectors = [
                     "img[title*='Cancelar' i]",
+                    "a[title*='Cancelar' i]",
                     "img[title*='Excluir' i]",
+                    "a[title*='Excluir' i]",
                     "img[onclick*='CancelarAto' i]",
                     "img[onclick*='ExcluirAto' i]",
                     "img[onclick*='f_CancelarAto' i]",
                     "img[onclick*='f_ExcluirAto' i]",
                 ]
+                keyword_fallback = ["cancelar", "excluir", "apagar", "remover"]
             else:
                 acoes.append(f"t{tentativa}: estado nao reconhecido em row='{row_text[:100]}'")
                 return False, acoes
@@ -4003,11 +4470,24 @@ def delete_ato_oficio_ssg_qualquer_estado(context, page, processo: str) -> tuple
                         continue
                     onclick = action.get_attribute("onclick") or ""
                     try:
-                        pop.on("dialog", lambda d: d.accept())
+                        pop.on("dialog", _accept_dialog_safely)
                     except Exception:
                         pass
                     if onclick:
-                        pop.evaluate(onclick)
+                        try:
+                            action.click(force=True, timeout=3000)
+                        except Exception:
+                            handle = action.element_handle(timeout=1000)
+                            if handle:
+                                pop.evaluate(
+                                    "(el) => {"
+                                    "  try { el.click(); return true; } catch(e) {}"
+                                    "  try { if (el.onclick) { el.onclick.call(el); return true; } } catch(e) {}"
+                                    "  try { const code = el.getAttribute('onclick'); if (code) { (new Function(code)).call(el); return true; } } catch(e) {}"
+                                    "  return false;"
+                                    "}",
+                                    handle,
+                                )
                     else:
                         try:
                             action.click(force=True, timeout=3000)
@@ -4022,8 +4502,12 @@ def delete_ato_oficio_ssg_qualquer_estado(context, page, processo: str) -> tuple
                     continue
 
             if not acted:
-                acoes.append(f"t{tentativa}: acao '{desc}' nao encontrada no DOM")
-                return False, acoes
+                acted, detail = _click_row_action_by_keywords(pop, row, keyword_fallback, processo, desc)
+                if acted:
+                    acoes.append(f"t{tentativa}: {detail}")
+                else:
+                    acoes.append(f"t{tentativa}: {detail}")
+                    return False, acoes
 
             # Aguarda refresh do grid antes da proxima iteracao.
             time.sleep(2)
@@ -4035,7 +4519,7 @@ def delete_ato_oficio_ssg_qualquer_estado(context, page, processo: str) -> tuple
                 pass
             time.sleep(1)
 
-        acoes.append("excedeu 4 tentativas sem resolver o estado")
+        acoes.append("excedeu 10 tentativas sem resolver o estado")
         return False, acoes
     finally:
         try:
@@ -4053,7 +4537,7 @@ def delete_comunicacao_processual(context, page, processo: str) -> tuple[bool, l
 
     Retorna (alguma_exclusao_feita, lista_de_acoes_tomadas).
     """
-    ok, reason = _can_safe_delete_drafts()
+    ok, reason = _cleanup_guard_for_process(processo, "FORCE_RECREATE_COMUNICACAO")
     if not ok:
         return False, [f"bloqueado: {reason}"]
 
@@ -4097,8 +4581,11 @@ def delete_comunicacao_processual(context, page, processo: str) -> tuple[bool, l
                 row_text = normalize(row.inner_text(timeout=1500)).lower()
             except Exception:
                 row_text = ""
-            if re.search(r"\bassinad[oa]\b|respondid[oa]|finalizad[oa]", row_text):
+            if re.search(r"\brespondid[oa]\b", row_text) or is_terminal_final_status(row_text):
                 acoes.append(f"linha {it}: status terminal '{row_text[:80]}' — NAO TOCAR")
+                break
+            if not _is_robot_created_comunicacao_text(row_text):
+                acoes.append(f"linha {it}: sem marcador de robô; NAO TOCAR (row='{row_text[:80]}')")
                 break
 
             action_selectors = [
@@ -4119,7 +4606,7 @@ def delete_comunicacao_processual(context, page, processo: str) -> tuple[bool, l
                         continue
                     onclick = action.get_attribute("onclick") or ""
                     try:
-                        caixa.on("dialog", lambda d: d.accept())
+                        caixa.on("dialog", _accept_dialog_safely)
                     except Exception:
                         pass
                     if onclick:
@@ -4149,6 +4636,132 @@ def delete_comunicacao_processual(context, page, processo: str) -> tuple[bool, l
             pass
 
 
+def revoke_pending_roseli_signature_for_oficio_ssg(context, page, processo: str) -> tuple[bool, list[str]]:
+    """Estorna assinatura pendente de Ofício SSG antigo, se reversível."""
+    ok, reason = _cleanup_guard_for_process(processo, "FORCE_REVOKE_PENDING_ROSELI_SIGNATURE")
+    if not ok:
+        return False, [f"bloqueado: {reason}"]
+
+    acoes: list[str] = []
+    try:
+        pop = open_gerenciador_atos_from_grid(context, page, processo)
+    except Exception:
+        pop = None
+    if not pop:
+        return False, ["gerenciador de atos nao abriu"]
+
+    try:
+        row, row_text = _find_oficio_ssg_row(pop)
+        if row is None:
+            return True, ["nenhum Ofício SSG encontrado para estorno de assinatura"]
+        if is_terminal_final_status(row_text):
+            return False, [f"status final definitivo; NAO TOCAR: {row_text[:100]}"]
+        if not is_pending_signature_status(row_text):
+            return True, [f"sem assinatura pendente no Ofício SSG atual: {row_text[:100]}"]
+
+        signer_visible = signer_name_matches_roseli_chaves(row_text)
+        if not signer_visible:
+            acoes.append("assinante não visível/confirmável na linha; prosseguindo por autorização explícita do processo")
+
+        selectors = [
+            "img[title*='Estornar' i][title*='ssinatura' i]",
+            "img[onclick*='EstornarAssinatura' i]",
+            "img[onclick*='f_EstornarAssinatura' i]",
+            "img[title*='Cancelar' i][title*='ssinatura' i]",
+            "img[onclick*='CancelarAssinatura' i]",
+            "img[title*='Retirar' i][title*='ssinatura' i]",
+        ]
+        for sel in selectors:
+            try:
+                action = row.locator(sel).first
+                if action.count() == 0:
+                    continue
+                try:
+                    pop.on("dialog", _accept_dialog_safely)
+                except Exception:
+                    pass
+                onclick = action.get_attribute("onclick") or ""
+                if onclick:
+                    pop.evaluate(onclick)
+                else:
+                    action.click(force=True, timeout=3000)
+                time.sleep(2)
+                acoes.append(f"assinatura pendente estornada via {sel}")
+                return True, acoes
+            except Exception:
+                continue
+        return False, acoes + ["ação de estorno/cancelamento de assinatura não encontrada"]
+    finally:
+        try:
+            if not pop.is_closed():
+                pop.close()
+        except Exception:
+            pass
+
+
+def delete_all_old_oficio_ssg_for_process(context, page, processo: str) -> tuple[bool, list[str]]:
+    """Remove todos os Ofícios SSG antigos reversíveis antes da recriação."""
+    ok, reason = _cleanup_guard_for_process(processo, "FORCE_DELETE_OLD_OFICIO_SSG")
+    if not ok:
+        return False, [f"bloqueado: {reason}"]
+
+    all_actions: list[str] = []
+    for cycle in range(1, 11):
+        ok_cycle, actions = delete_ato_oficio_ssg_qualquer_estado(context, page, processo)
+        all_actions.extend([f"ciclo {cycle}: {line}" for line in actions])
+        if not ok_cycle:
+            return False, all_actions
+        if any("nenhuma linha Oficio SSG remanescente" in line for line in actions):
+            return True, all_actions
+        # A função chamada já tentou remover o ato corrente; abre novo ciclo
+        # para garantir que múltiplos Ofícios SSG antigos também saiam.
+        time.sleep(1)
+    all_actions.append("excedeu 10 ciclos removendo Ofícios SSG antigos")
+    return False, all_actions
+
+
+def delete_all_comunicacoes_processuais_for_process(context, page, processo: str) -> tuple[bool, list[str]]:
+    """Exclui/cancela comunicações processuais abertas antes da nova correta."""
+    ok, reason = _cleanup_guard_for_process(processo, "FORCE_RECREATE_COMUNICACAO")
+    if not ok:
+        return False, [f"bloqueado: {reason}"]
+
+    all_actions: list[str] = []
+    for cycle in range(1, 11):
+        deleted, actions = delete_comunicacao_processual(context, page, processo)
+        all_actions.extend([f"ciclo {cycle}: {line}" for line in actions])
+        if any("status terminal" in line for line in actions):
+            return False, all_actions
+        if not deleted:
+            return True, all_actions
+        time.sleep(1)
+    all_actions.append("excedeu 10 ciclos removendo comunicações processuais")
+    return False, all_actions
+
+
+def cleanup_robot_created_comunicacao_and_oficio(context, page, processo: str) -> tuple[bool, list[str]]:
+    """Remove tentativa anterior do robô, sem tocar em comunicação humana.
+
+    Ofícios SSG reversíveis nos cinco processos autorizados são removidos para
+    permitir recriação. Comunicação processual só é excluída quando a linha
+    contém marcador/descrição legada do robô; na dúvida, registra pendência e
+    não exclui.
+    """
+    actions: list[str] = []
+    oficio_ok, oficio_actions = delete_all_old_oficio_ssg_for_process(context, page, processo)
+    actions.extend([f"[oficio] {line}" for line in oficio_actions])
+    if not oficio_ok:
+        return False, actions
+
+    comm_ok, comm_actions = delete_all_comunicacoes_processuais_for_process(context, page, processo)
+    actions.extend([f"[comunicacao] {line}" for line in comm_actions])
+    # Se a comunicação existente não é identificável como robô, não é erro
+    # destrutivo: é um bloqueio seguro para não apagar trabalho humano.
+    if any("sem marcador de robô" in line for line in comm_actions):
+        return True, actions
+    return comm_ok, actions
+
+
 def cancel_oficio_ssg_rascunho(context, page, processo: str) -> tuple[bool, str]:
     """Cancela/exclui o ato Oficio SSG quando esta em RASCUNHO.
 
@@ -4157,7 +4770,7 @@ def cancel_oficio_ssg_rascunho(context, page, processo: str) -> tuple[bool, str]
 
     Retorna (sucesso, motivo) para registro no relatorio final.
     """
-    ok, reason = _can_safe_delete_drafts()
+    ok, reason = _cleanup_guard_for_process(processo, "FORCE_DELETE_OLD_OFICIO_SSG")
     if not ok:
         return False, reason
 
@@ -4197,7 +4810,7 @@ def cancel_oficio_ssg_rascunho(context, page, processo: str) -> tuple[bool, str]
 
         onclick = action.get_attribute("onclick") or ""
         try:
-            pop.on("dialog", lambda d: d.accept())
+            pop.on("dialog", _accept_dialog_safely)
         except Exception:
             pass
         if onclick:
@@ -4270,7 +4883,7 @@ def concluir_oficio_ssg_ato(context, page, processo: str) -> bool:
 
         onclick = action.get_attribute("onclick") or ""
         try:
-            pop.on("dialog", lambda d: d.accept())
+            pop.on("dialog", _accept_dialog_safely)
         except Exception:
             pass
         if onclick:
@@ -4522,7 +5135,7 @@ def tramitar_processo_para_destino(context, page, processo: str, destino: str) -
                 _set_devexpress_combo_item(pop, "cbbPrioridadeDist", prioridade_dist)
 
             try:
-                pop.on("dialog", lambda dialog: dialog.accept())
+                pop.on("dialog", _accept_dialog_safely)
             except Exception:
                 pass
             try:
@@ -4648,31 +5261,30 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
     caixa_target = None
     try:
         print(f"Iniciando pipeline do processo {processo_num}.")
-        grid_page = _open_fresh_apo_pen_page(context) or main_page
+        authorized_processos = _parse_processos_env(os.getenv("ONLY_PROCESSOS_AUTHORIZED"))
+        if authorized_processos and processo_num.strip().upper() not in authorized_processos:
+            print(f"ERRO bloqueante: processo {processo_num} fora de ONLY_PROCESSOS_AUTHORIZED.")
+            return
+        grid_page = open_process_action_context_anywhere(context, main_page, processo_num) or main_page
 
         # --- Cleanup pre-fluxo (apenas quando SAFE_DELETE_OWN_DRAFTS=true) ---
         # Conforme decisao do operador, derrubamos ato Oficio SSG e comunicacao
         # processual existentes antes de recriar do zero. Cada acao e logada
         # para entrar no RELATORIO_EXECUCAO_5_PROCESSOS.md.
-        _safe_ok, _safe_reason = _can_safe_delete_drafts()
+        _safe_ok, _safe_reason = _cleanup_guard_for_process(processo_num)
         if _safe_ok:
             print(f"Processo {processo_num}: CLEANUP autorizado ({_safe_reason}).")
             try:
-                ato_ok, ato_log = delete_ato_oficio_ssg_qualquer_estado(context, grid_page, processo_num)
-                for line in ato_log:
-                    print(f"  [cleanup-ato] {line}")
-                print(f"Processo {processo_num}: cleanup do ato Oficio SSG -> {'OK' if ato_ok else 'pendente/parcial'}")
+                cleanup_ok, cleanup_log = cleanup_robot_created_comunicacao_and_oficio(context, grid_page, processo_num)
+                for line in cleanup_log:
+                    print(f"  [cleanup-robo] {line}")
+                print(f"Processo {processo_num}: cleanup robô -> {'OK' if cleanup_ok else 'pendente/parcial'}")
+                if not cleanup_ok:
+                    print(f"ERRO bloqueante: cleanup de Ofício/comunicação do robô não concluído em {processo_num}.")
+                    return
             except Exception as e:
-                print(f"Processo {processo_num}: falha no cleanup do ato Oficio SSG: {e}")
-            try:
-                # Reabre a grid APO-PEN porque a derruba abriu/fechou popups.
-                grid_page = _open_fresh_apo_pen_page(context) or grid_page
-                comm_ok, comm_log = delete_comunicacao_processual(context, grid_page, processo_num)
-                for line in comm_log:
-                    print(f"  [cleanup-comunicacao] {line}")
-                print(f"Processo {processo_num}: cleanup da comunicacao processual -> {'OK' if comm_ok else 'pendente/parcial'}")
-            except Exception as e:
-                print(f"Processo {processo_num}: falha no cleanup da comunicacao: {e}")
+                print(f"Processo {processo_num}: falha no cleanup robô: {e}")
+                return
             # Reabre a grid limpa antes do fluxo normal.
             grid_page = _open_fresh_apo_pen_page(context) or grid_page
         else:
@@ -4688,18 +5300,63 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
                 active_page.locator(f"#cod_processo[value*='{processo_num}']").first.wait_for(state="attached", timeout=8000)
             except Exception:
                 active_page = search_processo_and_open_viewer(context, grid_page, processo_num)
-        print(f"Processo {processo_num}: baixando ultima peca/PDF.")
-        pdf_path, piece_title = click_last_piece_and_open_pdf(context, active_page, output_dir, processo_num)
+        print(f"Processo {processo_num}: baixando peça/PDF preferencial (MANUTAP-OF; fallback última peça).")
+        pdf_path, piece_title, piece_number = click_last_piece_and_open_pdf(
+            context,
+            active_page,
+            output_dir,
+            processo_num,
+            position="match:MANUTAP-OF",
+            return_piece_number=True,
+        )
         if not pdf_path:
-            print(f"Aviso: nenhum PDF encontrado para {processo_num}.")
-            return
-        print(f"Processo {processo_num}: PDF capturado em {pdf_path.name}.")
+            print(f"Aviso: nenhum PDF encontrado para {processo_num} no visualizador atual; tentando busca geral.")
+            try:
+                active_page = search_processo_and_open_viewer(context, grid_page, processo_num)
+                pdf_path, piece_title, piece_number = click_last_piece_and_open_pdf(
+                    context,
+                    active_page,
+                    output_dir,
+                    processo_num,
+                    position="match:MANUTAP-OF",
+                    return_piece_number=True,
+                )
+            except Exception as e:
+                print(f"Aviso: retry de visualizador falhou para {processo_num}: {e}")
+            if not pdf_path:
+                print(f"Aviso: nenhum PDF encontrado para {processo_num}.")
+                return
+        print(
+            f"Processo {processo_num}: PDF capturado em {pdf_path.name}; "
+            f"peça={piece_number or 'indeterminada'}; título={piece_title or '-'}."
+        )
         pdf_text = extract_text_from_pdf(pdf_path)
         cover_text = _extract_cover_text(context, active_page, output_dir, processo_num)
         fields = parse_fields_from_pdf_text(pdf_text, processo_num)
         tipo = _classify_tipo_from_text_and_piece(pdf_text or "", piece_title, cover_text=cover_text)
         secretaria_text = f"{cover_text}\n{pdf_text}" if cover_text else pdf_text
         secretaria = _detect_secretaria_from_text(secretaria_text)
+        require_piece_number = env_bool("OFICIO_REQUIRE_PIECE_NUMBER_IN_ENCAMINHA", False)
+        if require_piece_number and not piece_number:
+            print(
+                f"ERRO bloqueante: não foi possível determinar o número ordinal da peça "
+                f"para preencher Encaminha em {processo_num}."
+            )
+            return
+        encaminha_text = ""
+        if piece_number:
+            try:
+                encaminha_text = format_encaminha_from_piece_numbers([piece_number])
+                fields.update({
+                    "Cópia da(s) peça(s) dos autos.": encaminha_text,
+                    "Cópia da(s) peça(s) dos autos": encaminha_text.rstrip("."),
+                    "{{ENCAMINHA}}": encaminha_text,
+                    "{ENCAMINHA}": encaminha_text,
+                })
+                print(f"Processo {processo_num}: Encaminha definido como '{encaminha_text}'")
+            except Exception as e:
+                print(f"ERRO bloqueante ao formatar Encaminha em {processo_num}: {e}")
+                return
         forced_tpl = _resolve_oficio_template() if os.getenv("OFICIO_TEMPLATE") else None
         tpl_path = forced_tpl or classify_and_select_template_path(pdf_text, piece_title, cover_text=cover_text)
         if forced_tpl:
@@ -4728,7 +5385,7 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
                 print(f"Processo {processo_num}: criando comunicacao processual.")
                 action_page = _open_fresh_apo_pen_page(context) or grid_page or main_page
                 caixa_target = open_caixa_correio_from_grid(context, action_page, processo_num)
-                criar_comunicacao_processual(context, caixa_target, {
+                comunicacao_ok = criar_comunicacao_processual(context, caixa_target, {
                     "processo": processo_num,
                     "secretaria": secretaria,
                     "relator": relator,
@@ -4736,8 +5393,12 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
                     "prazo": prazo,
                     "descricao": descricao,
                 })
+                if not comunicacao_ok:
+                    print(f"ERRO bloqueante: comunicação processual não foi confirmada para {processo_num}; DOCX não será anexado.")
+                    return
             except Exception as e:
                 print(f"Aviso: falha ao criar comunicacao processual para {processo_num}: {e}")
+                return
 
         if docx_path:
             try:
@@ -4752,7 +5413,7 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
                 # Em assinatura/Assinado. Registro vai para o relatorio.
                 cleanup_done = False
                 cleanup_reason = ""
-                _safe_ok, _safe_reason = _can_safe_delete_drafts()
+                _safe_ok, _safe_reason = _cleanup_guard_for_process(processo_num, "FORCE_DELETE_OLD_OFICIO_SSG")
                 if _safe_ok and not reuse_existing_oficio:
                     cleanup_done, cleanup_reason = cancel_oficio_ssg_rascunho(context, action_page, processo_num)
                     if cleanup_done:
@@ -4781,21 +5442,30 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
                     or os.getenv("ASSINANTE")
                     or ""
                 ).strip()
-                signature_required = env_bool("REQUEST_SIGNATURE", False) or bool(signer_name)
+                policy = _post_conclusion_policy(signer_name=signer_name)
+                signature_required = policy["signature_required"]
                 signature_ok = True
-                if attached and signature_required:
+                concluded = False
+                if attached:
                     concluded = concluir_oficio_ssg_ato(context, action_page, processo_num)
-                    if concluded:
-                        signature_ok = request_signature_for_docx(context, action_page, processo_num, docx_path, signer_name)
-                    else:
-                        signature_ok = False
-                        print(f"Aviso: assinatura de {processo_num} ignorada porque o ato nao foi concluido com sucesso.")
+                    if not concluded:
+                        print(f"ERRO bloqueante: Ofício SSG não foi concluído em {processo_num}.")
+                        return
+                    if policy["stop_after_oficio_concluido"]:
+                        print(f"Processo {processo_num}: STOP_AFTER_OFICIO_CONCLUIDO=true; parando após Ofício SSG concluído.")
+                        return
+                if attached and signature_required:
+                    signature_ok = request_signature_for_docx(context, action_page, processo_num, docx_path, signer_name)
+                elif attached and policy["skip_signature"]:
+                    print(f"Processo {processo_num}: assinatura ignorada por SKIP_SIGNATURE=true.")
                 destino_tramitacao = (os.getenv("TRAMITAR_DESTINO") or "").strip()
-                if attached and destino_tramitacao:
+                if attached and policy["tramitacao_required"]:
                     if signature_ok:
                         tramitar_processo_para_destino(context, action_page, processo_num, destino_tramitacao)
                     else:
                         print(f"Aviso: tramitação de {processo_num} ignorada porque a assinatura não foi solicitada com sucesso.")
+                elif attached and policy["skip_tramitacao"]:
+                    print(f"Processo {processo_num}: tramitação ignorada por SKIP_TRAMITACAO=true.")
             except Exception as e:
                 print(f"Aviso: falha ao anexar DOCX: {e}")
     finally:
@@ -4818,8 +5488,8 @@ def main():
     load_dotenv()  # load .env if present
 
     url = os.getenv("ETCM_URL", "https://homologacao-etcm.tcm.sp.gov.br/paginas/login.aspx")
-    username = os.getenv("ETCM_USERNAME")
-    password = os.getenv("ETCM_PASSWORD")
+    username = os.getenv("ETCM_USERNAME") or os.getenv("ETCM_LOGIN") or os.getenv("ETCM_USER")
+    password = os.getenv("ETCM_PASSWORD") or os.getenv("ETCM_SENHA") or os.getenv("ETCM_PASS")
     headless = env_bool("HEADLESS", False)
     show_browser = env_bool("SHOW_BROWSER", False) or env_bool("WATCH_MODE", False) or env_bool("FORCE_HEADED", False)
     if show_browser:
