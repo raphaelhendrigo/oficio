@@ -1,8 +1,21 @@
 # Relatório de execução — 5 processos APO-PEN até Ofício SSG concluído
 
+> **Atualização 18:36–19:09**: 5 processos **recriados do zero** após o
+> usuário identificar que o conteúdo do Encaminha vinha com fonte/tamanho
+> diferente do resto do documento. Corrigido no commit `7695bf2`
+> (preserva `rPr` do run original em `set_encaminha_text_without_bold`).
+> Cleanup destrutivo reativado com `_close_extra_pages` para fechar abas
+> abertas pelo Gerenciador de Atos / Cadastro de Comunicação. O Ato
+> Ofício SSG anterior foi estornado + excluído em cada processo; as
+> comunicações processuais anteriores **ficaram na grid** (criadas sem
+> marcador `euclides`) e devem ser excluídas manualmente. A partir desta
+> rodada, novas comunicações trazem `- euclides` na Referência (commit
+> `18e6177`), então cleanups futuros vão derrubar automaticamente.
+
 | Item | Valor |
 |---|---|
-| Data da execução | 2026-05-13 (rodada final 18:07–18:13 e 18:13–18:24) |
+| Data da execução final | 2026-05-13 18:36–19:09 (recriação completa) |
+| Data da 1ª execução | 2026-05-13 18:07–18:24 (fonte do Encaminha estava errada) |
 | Ambiente | **PRODUÇÃO** (`https://etcm.tcm.sp.gov.br/`) |
 | Branch | `fix/apopen-stop-after-oficio-concluido` |
 | Operador | `20386` (Raphael Hendrigo de Souza Goncalves) |
@@ -52,8 +65,9 @@ TRAMITAR_DESTINO      = (vazio)
 
 ## Pendências e riscos abertos
 
-1. **Senha em PROD** — a credencial `rhg#1004` continua exposta no chat e em orphan refs do GitHub (~30 dias). Recomendo trocar quando possível.
-2. **Cleanup destrutivo (`SAFE_DELETE_OWN_DRAFTS=true`)** ficou **desativado** nesta rodada porque deixava abas extras abertas e quebrava o pipeline subsequente. Não foi necessário aqui — todos os processos estavam limpos do robô ou tinham apenas fragmentos antigos que o e-TCM ignorou. Se em futuras rodadas houver minutas erradas para derrubar, a função `delete_ato_oficio_ssg_qualquer_estado` + `delete_comunicacao_processual` existe mas precisa ser ajustada para fechar abas extras antes de devolver o controle ao pipeline.
+1. **Comunicações antigas duplicadas** — as comunicações criadas na 1ª rodada (18:07) ficaram na grid sem marcador `euclides` na Referência, e por isso o cleanup da 2ª rodada (18:36) tratou-as como "sem marcador de robô; NAO TOCAR". **Você precisa excluí-las manualmente no e-TCM**. A partir das rodadas pós-`18e6177`, comunicações novas trazem `- euclides` na Referência e o cleanup futuro derruba sozinho.
+2. **Senha em PROD** — a credencial `rhg#1004` continua exposta no chat e em orphan refs do GitHub (~30 dias). Recomendo trocar quando possível.
+3. **Cleanup destrutivo (`SAFE_DELETE_OWN_DRAFTS=true`)** está **ativo** com proteção de duplo guard (`_can_safe_delete_drafts` + `_close_extra_pages` que fecha abas abertas pelo Gerenciador de Atos / Cadastro de Comunicação após o cleanup). Funcionou em todos os 5 processos da 2ª rodada.
 3. **Assinatura e tramitação** — não foram feitas nesta etapa, conforme escopo definido. Você validará as 5 comunicações + ofícios manualmente; quando aprovar, basta tirar `SKIP_SIGNATURE` e `SKIP_TRAMITACAO` do runner e rodar de novo.
 4. **Regra de dilação** (extrair "dias concedidos" do despacho do Conselheiro) — **não implementada** nesta sessão. Esses 5 processos são todos UTAP/Providências; sem dilação na lista atual.
 5. **`SAFE_DELETE_OWN_DRAFTS` em PROD** — `_can_safe_delete_drafts` agora aceita PROD quando a flag é explicitamente `true`, conforme regra do brief original. Para esta rodada deixei `false` para minimizar risco.
