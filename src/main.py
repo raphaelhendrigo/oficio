@@ -1302,6 +1302,26 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
         except Exception:
             pass
 
+    # O popup ppcNoificacao e DevExpress in-page (nao janela do browser).
+    # Garantir explicitamente que foi acionado via JS — o click no botao
+    # generico btnAdicionarNotificacao as vezes nao dispara
+    # PrepararIncluirNotificacao() em PROD (overlay, callback pending, etc).
+    try:
+        target.evaluate(
+            r"""() => {
+                try { if (typeof PrepararIncluirNotificacao === 'function') { PrepararIncluirNotificacao(); return 'PrepararIncluirNotificacao()'; } } catch(e) {}
+                try { if (window.ppcNoificacao && ppcNoificacao.Show) { ppcNoificacao.Show(); return 'ppcNoificacao.Show()'; } } catch(e) {}
+                return 'no-op';
+            }"""
+        )
+    except Exception:
+        pass
+    # Aguarda o popup aparecer (Loading Panel + textarea presente).
+    try:
+        target.wait_for_selector("#ppcNoificacao_txtDescricao_I", state="attached", timeout=30000)
+    except Exception:
+        pass
+
     # Escolhe o container do formulario (frame ou propria pagina)
     form_container = target
     try:
