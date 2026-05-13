@@ -272,6 +272,67 @@ def set_encaminha_text_without_bold(docx_path: Path | str, encaminha_text: str) 
     path = Path(docx_path)
     doc = Document(str(path))
 
+    def _copy_run_format(src, dst) -> None:
+        """Copia atributos visiveis (fonte/tamanho/estilo/cor) de src para dst."""
+        if src is None or dst is None:
+            return
+        try:
+            if src.style is not None:
+                dst.style = src.style
+        except Exception:
+            pass
+        for attr in ("name", "size", "italic", "underline", "strike",
+                     "subscript", "superscript", "all_caps", "small_caps"):
+            try:
+                value = getattr(src.font, attr)
+                if value is not None:
+                    setattr(dst.font, attr, value)
+            except Exception:
+                pass
+        # Cor RGB (pode falhar com tema; tolerante a None)
+        try:
+            if src.font.color is not None and src.font.color.rgb is not None:
+                dst.font.color.rgb = src.font.color.rgb
+        except Exception:
+            pass
+        # Propaga rPr (XML) como ultimo recurso para preservar mais detalhes.
+        try:
+            from copy import deepcopy
+            src_rpr = src._element.find(
+                "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}rPr"
+            )
+            if src_rpr is not None:
+                existing = dst._element.find(
+                    "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}rPr"
+                )
+                if existing is not None:
+                    dst._element.remove(existing)
+                dst._element.insert(0, deepcopy(src_rpr))
+        except Exception:
+            pass
+
+    def _find_content_run_style(paragraph, label_end_in_full: int):
+        """Retorna um run que represente o estilo do CONTEUDO (depois de Encaminha)."""
+        if not paragraph.runs:
+            return None
+        # Conta o offset acumulado dos runs e devolve o primeiro run cujo
+        # range cobre o pos `label_end_in_full + 1` (ou seja, o primeiro
+        # caractere apos o rotulo). Se nao achar, devolve o ultimo run
+        # do paragrafo (fallback razoavel — geralmente o conteudo padrao).
+        offset = 0
+        for run in paragraph.runs:
+            run_len = len(run.text or "")
+            if offset + run_len > label_end_in_full and (run.text or "").strip():
+                # Excluir run que contenha 'Encaminha' (e' o rotulo, nao conteudo).
+                if "encaminha" not in _strip_accents_for_compare(run.text or "").lower():
+                    return run
+            offset += run_len
+        # Fallback: ultimo run com texto nao vazio que nao seja o label.
+        for run in reversed(paragraph.runs):
+            if run.text and "encaminha" not in _strip_accents_for_compare(run.text).lower():
+                return run
+        return None
+
     def rewrite_same_paragraph(paragraph) -> bool:
         full_text = "".join(run.text for run in paragraph.runs) if paragraph.runs else paragraph.text
         if not full_text:
@@ -291,11 +352,15 @@ def set_encaminha_text_without_bold(docx_path: Path | str, encaminha_text: str) 
 
         label_text = full_text[:m.end()].rstrip()
         label_bold = None
+        label_run_ref = None
         if paragraph.runs:
             for run in paragraph.runs:
                 if run.text and "encaminha" in _strip_accents_for_compare(run.text).lower():
                     label_bold = run.bold
+                    label_run_ref = run
                     break
+        # Captura o estilo do CONTEUDO original (antes de zerar os runs).
+        content_style_ref = _find_content_run_style(paragraph, m.end())
         if not paragraph.runs:
             paragraph.text = ""
         else:
@@ -305,8 +370,16 @@ def set_encaminha_text_without_bold(docx_path: Path | str, encaminha_text: str) 
         label_run.text = f"{label_text} "
         if label_bold is not None:
             label_run.bold = label_bold
+        if label_run_ref is not None:
+            _copy_run_format(label_run_ref, label_run)
         content_run = paragraph.add_run(encaminha_text)
         content_run.bold = False
+        # IMPORTANTE: copia fonte/tamanho/cor do run de conteudo original
+        # para nao cair no default do python-docx (Calibri 11pt).
+        if content_style_ref is not None:
+            _copy_run_format(content_style_ref, content_run)
+            # Bold do conteudo sempre False, mesmo que o estilo trouxesse True.
+            content_run.bold = False
         return True
 
     def rewrite_content_paragraph(paragraph) -> bool:
@@ -322,8 +395,11 @@ def set_encaminha_text_without_bold(docx_path: Path | str, encaminha_text: str) 
             for run in paragraph.runs:
                 run.bold = False
             return True
-        paragraph.runs[0].text = encaminha_text
-        paragraph.runs[0].bold = False
+        # Preserva o estilo do primeiro run com texto util como referencia
+        # e edita apenas o texto.
+        first_run = paragraph.runs[0]
+        first_run.text = encaminha_text
+        first_run.bold = False
         for run in paragraph.runs[1:]:
             run.text = ""
             run.bold = False
