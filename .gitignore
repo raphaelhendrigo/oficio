@@ -1,11 +1,38 @@
+# Python / venv
 .venv/
 __pycache__/
-output/
-playwright/.cache/
 *.pyc
-.env
-storage_state*.json
+
+# Outputs e artefatos
+output/
 artifacts/
 logs/
+playwright/.cache/
+*.log
+*.err.log
+
+# Credenciais e sessao
+.env
+.env.*
+!.env.example
+storage_state*.json
+cookies*.json
+scripts/set_local_user_env.ps1
+
+# Snippets temporarios e dumps de analise
+tmp_*
+tmp_*.py
+tmp_*.txt
+_chunk*.txt
+_frag.txt
+_snippet.txt
+_tmp.txt
+_all.txt
+_zip_analysis/
+
+# Backup do filter-repo (contem historico antigo, pode conter segredos)
+backup_pre_filter_repo/
+
+# Outros
 docs/video_frames/
 video_silvana.mp4

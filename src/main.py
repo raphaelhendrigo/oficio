@@ -6,7 +6,7 @@ import unicodedata
 from datetime import date, datetime
 from typing import Optional
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
@@ -107,33 +107,89 @@ def login_etcm(
     print(f"Acessando: {url}")
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
+    if (not username or not password) and not headless and login_manual_wait_ms > 0:
+        print(
+            "Credenciais nao definidas. Conclua o login manualmente na janela aberta "
+            f"em ate {login_manual_wait_ms} ms..."
+        )
+        deadline = time.time() + (login_manual_wait_ms / 1000.0)
+        while time.time() < deadline:
+            if not _is_login_page(page):
+                break
+            time.sleep(1.5)
+        if _is_login_page(page):
+            raise RuntimeError("Login manual nao concluido dentro do tempo limite.")
+        try:
+            if "mesatrabalho.aspx" not in (page.url or "").lower():
+                mesa_url = urljoin(url, "/paginas/mesatrabalho.aspx")
+                print(f"Abrindo Mesa de Trabalho: {mesa_url}")
+                page.goto(mesa_url, wait_until="load", timeout=60000)
+        except Exception:
+            pass
+        return
+
     # Aguarda os campos de login ficarem visiveis quando existirem.
     try:
-        page.locator("#ctl00_cphMain_txtUsuario_I, input[name='ctl00$cphMain$txtUsuario']").first.wait_for(
-            state="visible", timeout=30000
-        )
+        page.locator(
+            "input[name='username'], input#username, "
+            "#ctl00_cphMain_txtUsuario_I, input[name='ctl00$cphMain$txtUsuario']"
+        ).first.wait_for(state="visible", timeout=30000)
     except Exception:
         pass
 
-    # Usuario
-    try:
-        page.locator("#ctl00_cphMain_txtUsuario_I, input[name='ctl00$cphMain$txtUsuario']").first.fill(username)
-    except Exception:
-        try:
-            page.locator("input[placeholder*='Usu'], input[name*='Usuario' i]").first.fill(username)
-        except Exception:
-            page.locator("input[type='text']").first.fill(username)
+    def fill_first(selectors: list[str], value: str, field_name: str) -> None:
+        last_error = None
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() == 0:
+                    continue
+                loc.fill(value, timeout=5000)
+                return
+            except Exception as e:
+                last_error = e
+        raise RuntimeError(f"Nao foi possivel localizar o campo de {field_name}.") from last_error
 
-    # Senha
+    fill_first(
+        [
+            "input[name='username'], input#username",
+            "#ctl00_cphMain_txtUsuario_I, input[name='ctl00$cphMain$txtUsuario']",
+            "input[placeholder*='Usu'], input[name*='Usuario' i]",
+            "input[type='text']",
+        ],
+        username,
+        "usuario",
+    )
+
     try:
-        page.locator("#ctl00_cphMain_txtSenha_I, input[name='ctl00$cphMain$txtSenha'][type='password']").first.fill(password)
+        fill_first(
+            [
+                "input[name='password'], input#password",
+                "#ctl00_cphMain_txtSenha_I, input[name='ctl00$cphMain$txtSenha'][type='password']",
+                "input[type='password']",
+            ],
+            password,
+            "senha",
+        )
     except Exception:
-        try:
-            page.locator("input[type='password']").first.fill(password)
-        except Exception as e:
-            raise RuntimeError("Nao foi possivel localizar o campo de senha.") from e
+        if not headless and login_manual_wait_ms > 0:
+            print(
+                "Campo de senha nao localizado automaticamente. "
+                f"Conclua o login manualmente na janela aberta em ate {login_manual_wait_ms} ms..."
+            )
+            deadline = time.time() + (login_manual_wait_ms / 1000.0)
+            while time.time() < deadline:
+                if not _is_login_page(page):
+                    break
+                time.sleep(1.5)
+            if _is_login_page(page):
+                raise
+        else:
+            raise
 
     btn_selectors = [
+        "button[type='submit']",
+        "#kc-login",
         "#ctl00_cphMain_btnLogin_I",  # input interno DevExpress (mais confiavel)
         "#ctl00_cphMain_btnLogin",
         "input[name='ctl00$cphMain$btnLogin']",
@@ -316,6 +372,14 @@ def _pt_data_extenso_from_ddmmyyyy(s: str) -> str:
         return s
 
 
+def _oficio_data() -> str:
+    """Data que deve constar no oficio, aceitando override por env."""
+    value = (os.getenv("OFICIO_DATA") or os.getenv("DATA_OFICIO") or "").strip()
+    if value:
+        return value
+    return date.today().strftime("%d/%m/%Y")
+
+
 def find_latest_export_file(directory: Path) -> Path | None:
     candidates = []
     for ext in ("*.xlsx", "*.xls"):
@@ -485,16 +549,18 @@ def _ensure_apo_pen_grid_visible(page, timeout_ms: int = 20000) -> bool:
         "#gvProcesso",
         "table[id*='gvProcesso']",
     ]
-    containers = [page] + list(page.frames)
     while time.time() < deadline:
+        try:
+            containers = [page] + list(page.frames)
+        except Exception:
+            containers = [page]
         for container in containers:
             for root_sel in selectors:
                 try:
                     root = container.locator(root_sel).first
                     if root.count() == 0:
                         continue
-                    display = root.evaluate("el => getComputedStyle(el).display")  # type: ignore[call-arg]
-                    if display and display.lower() != "none":
+                    if root.is_visible(timeout=500):
                         return True
                 except Exception:
                     continue
@@ -502,36 +568,86 @@ def _ensure_apo_pen_grid_visible(page, timeout_ms: int = 20000) -> bool:
     return False
 
 
+def _go_to_mesa_trabalho(page) -> bool:
+    """Reabre a Mesa de Trabalho quando a pagina atual virou visualizador/popup."""
+    base = (os.getenv("ETCM_URL") or page.url or "https://etcm.tcm.sp.gov.br/").strip()
+    mesa_url = urljoin(base, "/paginas/mesatrabalho.aspx")
+    try:
+        page.goto(mesa_url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        print(f"Aviso: falha ao reabrir Mesa de Trabalho: {e}")
+        return False
+
+
+def _open_fresh_apo_pen_page(context):
+    """Abre uma aba limpa na Mesa de Trabalho e carrega a pasta APO-PEN."""
+    try:
+        page = context.new_page()
+        if not _go_to_mesa_trabalho(page):
+            return page
+        open_apo_pen_menu(page)
+        return page
+    except Exception as e:
+        print(f"Aviso: falha ao abrir aba limpa do APO-PEN: {e}")
+        return None
+
+
 def open_apo_pen_menu(page) -> bool:
     """Abre Processos -> UNIDADE TECNICA DE OFICIOS -> Em confeccao APO-PEN."""
+    # Caminho direto observado em produção/homologação: UNIDADE TÉCNICA DE OFÍCIOS -> Em confecção APO-PEN.
+    for container in [page] + list(page.frames):
+        try:
+            loc = container.locator("#confappen_16_PROCESSO").first
+            if loc.count() > 0:
+                try:
+                    loc.click(timeout=3000)
+                except Exception:
+                    try:
+                        container.evaluate("try{ AtualizarGrid('confappen_16','PROCESSO'); }catch(e){}")
+                    except Exception:
+                        pass
+                try:
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+                if _ensure_apo_pen_grid_visible(page, timeout_ms=12000):
+                    return True
+        except Exception:
+            continue
+
     containers = [page] + list(page.frames)
 
     def try_click(container):
         clicked_any = False
         try:
-            container.get_by_text("Processos", exact=False).first.click()
+            container.get_by_text("Processos", exact=False).first.click(timeout=3000)
             clicked_any = True
         except Exception:
             pass
         try:
-            container.get_by_text(re.compile(r"UNIDADE\s+T[EÉ]CNICA\s+DE\s+OF[ÍI]CIOS", re.I)).first.click()
+            container.get_by_text(re.compile(r"UNIDADE\s+T[EÉ]CNICA\s+DE\s+OF[ÍI]CIOS", re.I)).first.click(timeout=3000)
             clicked_any = True
         except Exception:
             try:
-                container.locator("a#016_PROCESSO, a[id*='UNIDADE']").first.click()
+                container.locator("a#016_PROCESSO, a[id*='UNIDADE']").first.click(timeout=3000)
                 clicked_any = True
             except Exception:
                 pass
         try:
-            container.get_by_text(re.compile(r"Em\s*confe[cç][aã]o\s*APO", re.I)).first.click()
+            container.get_by_text(re.compile(r"Em\s*confe[cç][aã]o\s*APO", re.I)).first.click(timeout=3000)
             clicked_any = True
         except Exception:
             try:
-                container.locator("a#confappen_16_PROCESSO, a[id*='confappen']").first.click()
+                container.locator("a#confappen_16_PROCESSO, a[id*='confappen']").first.click(timeout=3000)
                 clicked_any = True
             except Exception:
                 try:
-                    container.locator("a:has-text('Em confecção APO-PEN'), a:has-text('Em confecao APO-PEN')").first.click()
+                    container.locator("a:has-text('Em confecção APO-PEN'), a:has-text('Em confecao APO-PEN')").first.click(timeout=3000)
                     clicked_any = True
                 except Exception:
                     pass
@@ -667,60 +783,31 @@ def _select_option_like(container, selectors: list[str], desired: str, fallback_
     return False
 
 
+def _extract_notificacao_args_from_row(row) -> tuple[str, str]:
+    """Retorna (area, protocolo) para AbreCadastroNotificacao a partir da linha."""
+    if row is None:
+        return "", ""
+    try:
+        html = row.evaluate("el => el.outerHTML")
+    except Exception:
+        html = ""
+    m = re.search(r"AbreCadastroNotificacao\('([^']+)'\s*,\s*'([^']+)'\)", html or "", re.I)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.search(r"AbrePopupGerenciadorAtos\('([^']+)'\s*,\s*'[^']*'\s*,\s*'([^']+)'\)", html or "", re.I)
+    if m:
+        protocolo, area = m.group(1), m.group(2)
+        return area, protocolo
+    m = re.search(r"AbreMaximizadoIEApoioWork\('([^']+)'\s*,\s*'([^']+)'\)", html or "", re.I)
+    if m:
+        protocolo, area = m.group(1), m.group(2)
+        return area, protocolo
+    return "", ""
+
+
 def open_caixa_correio_from_grid(context, page, processo: str):
     """Abre a Caixa de Correio / Comunicacao Processual a partir da grid Em confeccao APO-PEN."""
-    try:
-        if not _ensure_apo_pen_grid_visible(page, timeout_ms=8000):
-            open_apo_pen_menu(page)
-            _ensure_apo_pen_grid_visible(page, timeout_ms=15000)
-    except Exception:
-        pass
-
-    # Filtra pelo numero do processo (mesmos seletores das funcoes existentes)
-    try:
-        inp = page.locator("input[id$='_DXFREditorcol17_I'], input[name$='$DXFREditorcol17']").first
-        inp.wait_for(state="visible", timeout=10000)
-        try:
-            inp.fill("")
-        except Exception:
-            pass
-        inp.fill(processo)
-        try:
-            inp.press("Enter")
-        except Exception:
-            pass
-    except Exception:
-        try:
-            header = page.locator("#sptMesaTrabalho_gvProcesso_DXHeadersRow0 td").filter(
-                has_text=re.compile(r"N\s*o?\s*Processo", re.I)
-            ).first
-            if header.count() > 0:
-                hid = header.get_attribute("id") or ""
-                m = re.search(r"col(\d+)$", hid)
-                if m:
-                    col_idx = m.group(1)
-                    inp = page.locator(f"#sptMesaTrabalho_gvProcesso_DXFREditorcol{col_idx}_I").first
-                    if inp.count() > 0:
-                        inp.fill(processo)
-                        try:
-                            inp.press("Enter")
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-
-    # Aguarda a primeira linha
-    row = None
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        try:
-            r = page.locator("#sptMesaTrabalho_gvProcesso_DXMainTable tr[id*='DXDataRow'], #gvProcesso_DXMainTable tr[id*='DXDataRow']").first
-            if r.count() > 0:
-                row = r
-                break
-        except Exception:
-            pass
-        time.sleep(0.2)
+    row = _filter_process_grid_row(page, processo)
     if row is None:
         return page
 
@@ -771,6 +858,25 @@ def open_caixa_correio_from_grid(context, page, processo: str):
             time.sleep(0.4)
 
     if target is None:
+        area, protocolo = _extract_notificacao_args_from_row(row)
+        if area and protocolo:
+            notif_url = urljoin(
+                page.url,
+                f"/paginas/notificacao/cadastronotificacao.aspx?a={area}&pt={protocolo}&ac=null",
+            )
+            print(f"Abrindo Comunicacao Processual por URL direta para {processo}.")
+            try:
+                target = context.new_page()
+                target.goto(notif_url, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    target.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"Aviso: falha ao abrir Comunicacao Processual por URL direta para {processo}: {e}")
+                target = None
+
+    if target is None:
         try:
             fr = find_frame_with_text(page, "Comunica", timeout_ms=8000)
             target = fr
@@ -807,10 +913,26 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
             continue
 
     # Clica no botao e captura possivel popup
-    try:
-        btn = target.get_by_role("button", name=re.compile(r"Nova\s+Comunic", re.I)).first
-    except Exception:
-        btn = None
+    btn = None
+    for sel in [
+        "#btnAdicionarNotificacao_I",
+        "#btnAdicionarNotificacao_CD",
+        "#btnAdicionarNotificacao",
+        "input[type='button'][value*='Comunica' i]",
+        "input[type='submit'][value*='Comunica' i]",
+    ]:
+        try:
+            loc = target.locator(sel).first
+            if loc.count() > 0:
+                btn = loc
+                break
+        except Exception:
+            continue
+    if btn is None:
+        try:
+            btn = target.get_by_role("button", name=re.compile(r"Nova\s+Comunic|Novo\s+Registro", re.I)).first
+        except Exception:
+            btn = None
     pages_before = list(context.pages)
     if btn and btn.count() > 0:
         popup_host = target if hasattr(target, "expect_popup") else None
@@ -868,6 +990,151 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
                 break
         except Exception:
             continue
+
+    def _exact_set_combo(container, base_id: str, value: str) -> bool:
+        value = (value or "").strip()
+        if not value:
+            return False
+        try:
+            return bool(container.evaluate(
+                """([baseId, text]) => {
+                    const input = document.getElementById(baseId + '_I');
+                    if (input) {
+                        input.value = text;
+                        try { input.dispatchEvent(new Event('change', { bubbles: true })); } catch(e) {}
+                    }
+                    const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+                    const shortName = baseId.replace(/^ppcNoificacao_/, '');
+                    const candidates = [baseId, shortName];
+                    for (const name of candidates) {
+                        const cb = (coll && coll.GetByName) ? coll.GetByName(name) : window[name];
+                        if (cb) {
+                            try { if (cb.SetText) cb.SetText(text); } catch(e) {}
+                            try { if (cb.SetValue) cb.SetValue(text); } catch(e) {}
+                            return true;
+                        }
+                    }
+                    return !!input;
+                }""",
+                [base_id, value],
+            ))
+        except Exception:
+            pass
+        try:
+            inp = container.locator(f"#{base_id}_I, input[id*='{base_id}'][id$='_I']").first
+            if inp.count() > 0:
+                inp.click()
+                inp.fill(value)
+                try:
+                    inp.press("Enter")
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _prepare_notificacao_defaults(container, status_text: str, ug_text: str) -> None:
+        status_map = {
+            "entrega normal": ("44068", "Normal"),
+            "normal": ("44068", "Normal"),
+            "correios": ("46590", "Correios"),
+            "entrega pessoal": ("46606", "Entrega pessoal"),
+            "preferencial": ("44067", "Preferencial"),
+            "publicacao": ("46591", "Publicação"),
+            "publicação": ("46591", "Publicação"),
+            "sigiloso": ("46636", "Sigiloso"),
+            "urgente": ("44066", "Urgente"),
+        }
+        status_value, status_label = status_map.get(normalize(status_text or "").lower(), ("44068", "Normal"))
+        try:
+            container.evaluate(
+                """([statusValue, statusText, ugText]) => {
+                    const setInput = (id, value) => {
+                        const el = document.getElementById(id);
+                        if (!el || value == null) return;
+                        el.value = value;
+                        try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch(e) {}
+                    };
+                    try {
+                        const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+                        const tipo = (coll && coll.GetByName) ? (coll.GetByName('cbbTipoNotificacao') || coll.GetByName('ppcNoificacao_cbbTipoNotificacao')) : window.cbbTipoNotificacao;
+                        if (tipo) {
+                            try { tipo.SetValue('119'); } catch(e) {}
+                            try { tipo.SetText('Pendente'); } catch(e) {}
+                        }
+                    } catch(e) {}
+                    setInput('ppcNoificacao_cbbTipoNotificacao_VI', '119');
+                    setInput('ppcNoificacao_cbbTipoNotificacao_I', 'Pendente');
+                    setInput('tipoNotificacao', '119');
+
+                    try {
+                        const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+                        const status = (coll && coll.GetByName) ? (coll.GetByName('cbbStatusProvidencia') || coll.GetByName('ppcNoificacao_cbbStatusProvidencia')) : window.cbbStatusProvidencia;
+                        if (status) {
+                            try { status.SetValue(statusValue); } catch(e) {}
+                            try { status.SetText(statusText); } catch(e) {}
+                        }
+                    } catch(e) {}
+                    setInput('ppcNoificacao_cbbStatusProvidencia_VI', statusValue);
+                    setInput('ppcNoificacao_cbbStatusProvidencia_I', statusText);
+                    if (ugText) setInput('txtUnidadeGestora_I', ugText);
+                    return true;
+                }""",
+                [status_value, status_label, ug_text or ""],
+            )
+        except Exception:
+            pass
+
+    # Caminho validado no projeto anexado: cadastro ppcNoificacao_*.
+    exact_form = False
+    try:
+        form_container.locator("#ppcNoificacao_txtDescricao_I").first.wait_for(state="visible", timeout=12000)
+        exact_form = True
+    except Exception:
+        exact_form = False
+    if exact_form:
+        destinatario = (dados.get("destinatario") or secretaria or "").strip()
+        referencia = (dados.get("referencia") or desc_custom or processo).strip()
+        status_entrega = (dados.get("status") or os.getenv("STATUS_ENTREGA") or "Urgente").strip()
+        try:
+            _exact_set_combo(form_container, "ppcNoificacao_cbbUsuarios", destinatario)
+            _exact_set_combo(form_container, "ppcNoificacao_cbbPessoa", relator)
+            form_container.locator("#ppcNoificacao_txtDescricao_I").first.fill(desc_custom)
+            try:
+                form_container.locator("#ppcNoificacao_txtReferencia_I").first.fill(referencia)
+            except Exception:
+                pass
+            _exact_set_combo(form_container, "ppcNoificacao_cbbStatusProvidencia", status_entrega)
+            try:
+                form_container.locator("#ppcNoificacao_txtPrazo_I").first.fill(str(prazo or ""))
+            except Exception:
+                pass
+            _prepare_notificacao_defaults(form_container, status_entrega, destinatario)
+            for sel in [
+                "#ppcNoificacao_btnPopNova_I",
+                "#ppcNoificacao_btnPopNova_CD",
+                "#ppcNoificacao_btnPopSalvar_I",
+                "#ppcNoificacao_btnPopSalvar_CD",
+            ]:
+                try:
+                    loc = form_container.locator(sel).first
+                    if loc.count() > 0:
+                        loc.click(force=True, timeout=5000)
+                        break
+                except Exception:
+                    continue
+            try:
+                form_container.wait_for_selector("#gvNotificacao, #gvNotificacao_DXMainTable", timeout=20000)
+            except Exception:
+                try:
+                    target.wait_for_selector("#gvNotificacao, #gvNotificacao_DXMainTable", timeout=20000)
+                except Exception:
+                    pass
+            print(f"Comunicacao processual criada para o processo {processo} (prazo {prazo} dias, tipo {tipo}, secretaria {secretaria}).")
+            return True
+        except Exception as e:
+            print(f"Aviso: falha no fluxo ppcNoificacao para {processo}: {e}. Tentando fallback generico.")
 
     # Destinatario
     dest_ok = False
@@ -1111,51 +1378,26 @@ def filter_and_open_processo(context, page, processo: str):
 
     Retorna a nova página (popup) quando abrir em janela separada, ou a página atual.
     """
-    # Tenta descobrir o índice da coluna 'N° Processo' pelo header
-    try:
-        header = page.locator("#sptMesaTrabalho_gvProcesso_DXHeadersRow0 td").filter(
-            has_text=re.compile(r"N\s*°?\s*Processo|N\s*o\.?\s*Processo", re.I)
-        ).first
-        if header.count() > 0:
-            hid = header.get_attribute("id") or ""
-            m = re.search(r"col(\d+)$", hid)
-            if m:
-                col_idx = m.group(1)
-                inp = page.locator(f"#sptMesaTrabalho_gvProcesso_DXFREditorcol{col_idx}_I").first
-                inp.wait_for(state="visible", timeout=10000)
-                try:
-                    inp.fill("")
-                except Exception:
-                    pass
-                inp.fill(processo)
-                try:
-                    inp.press("Enter")
-                except Exception:
-                    pass
-        else:
-            # Fallback: caixa superior
-            topInp = page.locator("input[placeholder*='Processo' i], #cbbProcesso_I").first
-            topInp.wait_for(state="visible", timeout=8000)
-            topInp.fill(processo)
+    def _target_matches(target) -> bool:
+        proc_norm = normalize(processo).lower()
+        proc_digits = re.sub(r"\D+", "", processo)
+        deadline_match = time.time() + 10
+        while time.time() < deadline_match:
             try:
-                page.locator("button[onclick='BuscaProcesso();']").first.click()
+                text = normalize(target.locator("body").inner_text(timeout=2000)).lower()
+                digits = re.sub(r"\D+", "", text)
+                if proc_norm in text or (proc_digits and proc_digits in digits):
+                    return True
             except Exception:
-                topInp.press("Enter")
-    except Exception:
-        pass
+                pass
+            time.sleep(0.4)
+        return False
 
-    # Aguarda a primeira linha
-    row = None
-    deadline = time.time() + 20
-    while time.time() < deadline:
-        try:
-            r = page.locator("#sptMesaTrabalho_gvProcesso_DXMainTable tr[id*='DXDataRow']").first
-            if r.count() > 0:
-                row = r
-                break
-        except Exception:
-            pass
-        time.sleep(0.2)
+    # Usa o filtro validado para evitar abrir uma linha antiga enquanto o grid atualiza.
+    try:
+        row = _filter_process_grid_row(page, processo)
+    except Exception:
+        row = None
     if row is None:
         return None
 
@@ -1181,10 +1423,17 @@ def filter_and_open_processo(context, page, processo: str):
                     pop_info.value.wait_for_load_state("domcontentloaded", timeout=10000)
                 except Exception:
                     pass
-                return pop_info.value
+                if _target_matches(pop_info.value):
+                    return pop_info.value
+                print(f"Aviso: visualizador aberto nao corresponde a {processo}; ignorando janela.")
+                try:
+                    pop_info.value.close()
+                except Exception:
+                    pass
+                return None
             except Exception:
                 loc.click()
-                return page
+                return page if _target_matches(page) else None
         except Exception:
             continue
     return page
@@ -1196,48 +1445,20 @@ def open_gerenciador_atos_from_grid(context, page, processo: str):
     - Reuse the filter input used by open_processo_from_grid.
     - In the first data row, look for a link to Ato/GerenciaAto.aspx or an icon that resembles a clip/attachment/atos.
     """
-    # Ensure grid is visible (if needed, try to open 'Em confecção APO-PEN')
+    row = _filter_process_grid_row(page, processo)
+    if row is None:
+        print(f"Aviso: linha do processo {processo} nao encontrada para abrir Gerenciador de Atos.")
+        return None
     try:
-        # If grid not present, try to navigate via menu
-        if page.locator("#sptMesaTrabalho_gvProcesso_DXMainTable").count() == 0:
-            fr_menu = find_frame_with_text(page, "Processos", timeout_ms=10000)
-            fr_menu.get_by_text("Processos", exact=True).first.click(force=True)
-            time.sleep(0.5)
-            fr_menu.get_by_text(re.compile(r"Em\s*confec.*APO-?PEN", re.I)).first.click(force=True)
-            page.wait_for_load_state("domcontentloaded", timeout=20000)
+        row_text = normalize(row.inner_text(timeout=3000)).lower()
+        proc_norm = normalize(processo).lower()
+        proc_digits = re.sub(r"\D+", "", processo)
+        row_digits = re.sub(r"\D+", "", row_text)
+        if proc_norm not in row_text and (not proc_digits or proc_digits not in row_digits):
+            print(f"Aviso: filtro retornou linha que nao corresponde a {processo}; Gerenciador de Atos nao sera aberto.")
+            return None
     except Exception:
         pass
-
-    # Filter by process number
-    try:
-        inp = page.locator("input[id$='_DXFREditorcol17_I'], input[name$='$DXFREditorcol17']").first
-        inp.wait_for(state="visible", timeout=10000)
-        try:
-            inp.fill("")
-        except Exception:
-            pass
-        inp.fill(processo)
-        try:
-            inp.press("Enter")
-        except Exception:
-            pass
-    except Exception:
-        return None
-
-    # Wait for the first row
-    row = None
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        try:
-            r = page.locator("#sptMesaTrabalho_gvProcesso_DXMainTable tr[id*='DXDataRow']").first
-            if r.count() > 0:
-                row = r
-                break
-        except Exception:
-            pass
-        time.sleep(0.2)
-    if row is None:
-        return None
 
     # Try to click the Gerenciador de Atos link/icon
     selectors = [
@@ -2036,12 +2257,40 @@ def click_last_piece_and_open_pdf(context, page, output_dir: Path, processo: str
         viewer_frame = page
 
     # 2) Locate pieces/attachments anchors and choose the last one (or first if requested)
-    loc = viewer_frame.locator("a[index_ato], a[cod_arquivo_digital_criptografado], a[index]")
-    count = loc.count()
+    piece_selector = (
+        "a[onclick*='LerPDF'], "
+        "a[onclick*='setCodArquivoDigital'], "
+        "a[index_ato], "
+        "a[cod_arquivo_digital_criptografado], "
+        "a[index]"
+    )
+    loc = viewer_frame.locator(piece_selector)
+    count = 0
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        try:
+            count = loc.count()
+            if count > 0:
+                break
+        except Exception:
+            count = 0
+        time.sleep(0.5)
     if count == 0:
-        # Try a broader selection inside the tree container
-        loc = viewer_frame.locator("#splLeitorDocumentos_pgcPecas_trePecas a, a[cod_arquivo_digital_criptografado]")
-        count = loc.count()
+        # Try a broader selection inside the tree container, keeping only links that can read PDFs.
+        loc = viewer_frame.locator(
+            "#splLeitorDocumentos_pgcPecas_trePecas a[onclick*='LerPDF'], "
+            "#splLeitorDocumentos_pgcPecas_trePecas a[onclick*='setCodArquivoDigital'], "
+            "a[cod_arquivo_digital_criptografado]"
+        )
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                count = loc.count()
+                if count > 0:
+                    break
+            except Exception:
+                count = 0
+            time.sleep(0.5)
     if count == 0:
         print("Aviso: Nenhuma peca encontrada no visualizador.")
         return None, None
@@ -2396,7 +2645,8 @@ def generate_oficio_from_template(processo: str, output_dir: Path, extra: dict |
         print(f"Aviso: python-docx nao instalado ({e}). Pulei geracao do oficio.")
         return None
 
-    mapping = {"{{NUM_PROCESSO}}": processo, "{{DATA}}": date.today().strftime("%d/%m/%Y")}
+    oficio_data = _oficio_data()
+    mapping = {"{{NUM_PROCESSO}}": processo, "{{DATA}}": oficio_data}
     if extra:
         mapping.update({str(k): str(v) for k, v in extra.items()})
 
@@ -2410,13 +2660,13 @@ def generate_oficio_from_template(processo: str, output_dir: Path, extra: dict |
     proc_val = mapping.get("{{NUM_PROCESSO}}", processo) or processo or ""
     mapping.setdefault("@@processo", proc_val)
     # Data por extenso, baseada na data do documento (se houver)
-    data_doc = mapping.get("{{DATA_DOCUMENTO}}")
+    data_doc = oficio_data or mapping.get("{{DATA_DOCUMENTO}}")
     if data_doc and re.match(r"\d{1,2}/\d{1,2}/\d{4}", str(data_doc)):
-        mapping.setdefault("@@data_extenso", _pt_data_extenso_from_ddmmyyyy(str(data_doc)))
+        mapping["@@data_extenso"] = _pt_data_extenso_from_ddmmyyyy(str(data_doc))
     elif data_doc:
-        mapping.setdefault("@@data_extenso", str(data_doc))
+        mapping["@@data_extenso"] = str(data_doc)
     else:
-        mapping.setdefault("@@data_extenso", _pt_data_extenso_from_ddmmyyyy(date.today().strftime("%d/%m/%Y")))
+        mapping["@@data_extenso"] = _pt_data_extenso_from_ddmmyyyy(date.today().strftime("%d/%m/%Y"))
 
     # Numero do ofício (env ou s/n)
     mapping.setdefault("@@numero_oficio", os.getenv("NUMERO_OFICIO", "s/n"))
@@ -2987,30 +3237,1022 @@ def attach_docx_to_portal(context, page, docx_path: Path) -> bool:
     return False
 
 
+def _page_like_containers(page_like):
+    containers = [page_like]
+    try:
+        containers.extend(list(getattr(page_like, "frames", [])))
+    except Exception:
+        pass
+    return containers
+
+
+def _click_action_opening_target(context, page_like, label_patterns: list[str], timeout_ms: int = 8000):
+    """Clica uma ação por texto/role e retorna popup quando houver."""
+    rx = re.compile("|".join(f"(?:{p})" for p in label_patterns), re.I)
+    pages_before = list(context.pages)
+    for c in _page_like_containers(page_like):
+        candidates = []
+        try:
+            candidates.append(c.get_by_role("button", name=rx).first)
+        except Exception:
+            pass
+        try:
+            candidates.append(c.get_by_role("link", name=rx).first)
+        except Exception:
+            pass
+        try:
+            candidates.append(c.locator("input[type='button'], input[type='submit']").filter(has_text=rx).first)
+        except Exception:
+            pass
+        try:
+            candidates.append(c.get_by_text(rx).first)
+        except Exception:
+            pass
+        for loc in candidates:
+            try:
+                if loc.count() == 0:
+                    continue
+                try:
+                    loc.click()
+                except Exception:
+                    loc.click(force=True)
+                deadline = time.time() + timeout_ms / 1000.0
+                while time.time() < deadline:
+                    pages_now = list(context.pages)
+                    if len(pages_now) > len(pages_before):
+                        target = [p for p in pages_now if p not in pages_before][-1]
+                        try:
+                            target.wait_for_load_state("domcontentloaded", timeout=5000)
+                        except Exception:
+                            pass
+                        return target
+                    time.sleep(0.25)
+                return page_like
+            except Exception:
+                continue
+    return None
+
+
+def _select_text_value(page_like, desired: str, field_words: list[str], extra_selectors: list[str] | None = None) -> bool:
+    """Seleciona/preenche um valor em select, combobox ou input por heurística de rótulo/id."""
+    desired = (desired or "").strip()
+    if not desired:
+        return False
+    selectors = list(extra_selectors or [])
+    for word in field_words:
+        selectors.extend([
+            f"select[id*='{word}' i]",
+            f"select[name*='{word}' i]",
+            f"input[id*='{word}' i]",
+            f"input[name*='{word}' i]",
+            f"textarea[id*='{word}' i]",
+            f"textarea[name*='{word}' i]",
+        ])
+    for c in _page_like_containers(page_like):
+        try:
+            if _select_option_like(c, selectors, desired, fallback_first=False):
+                return True
+        except Exception:
+            pass
+        for word in field_words:
+            try:
+                loc = c.get_by_label(re.compile(word, re.I)).first
+                if loc.count() > 0:
+                    try:
+                        loc.click()
+                    except Exception:
+                        pass
+                    try:
+                        loc.fill(desired)
+                    except Exception:
+                        pass
+                    try:
+                        c.get_by_text(re.compile(re.escape(desired), re.I)).first.click()
+                    except Exception:
+                        try:
+                            loc.press("Enter")
+                        except Exception:
+                            pass
+                    return True
+            except Exception:
+                pass
+        for sel in selectors:
+            try:
+                loc = c.locator(sel).first
+                if loc.count() == 0:
+                    continue
+                try:
+                    loc.click()
+                except Exception:
+                    pass
+                try:
+                    loc.fill(desired)
+                except Exception:
+                    continue
+                try:
+                    c.get_by_text(re.compile(re.escape(desired), re.I)).first.click()
+                except Exception:
+                    try:
+                        loc.press("Enter")
+                    except Exception:
+                        pass
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def _click_confirm_like(page_like, labels: list[str], timeout_ms: int = 12000) -> bool:
+    rx = re.compile("|".join(f"(?:{re.escape(label)})" for label in labels), re.I)
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        for c in _page_like_containers(page_like):
+            for getter in (
+                lambda x: x.get_by_role("button", name=rx).first,
+                lambda x: x.get_by_role("link", name=rx).first,
+                lambda x: x.locator("input[type='button'], input[type='submit']").filter(has_text=rx).first,
+                lambda x: x.get_by_text(rx).first,
+            ):
+                try:
+                    loc = getter(c)
+                    if loc.count() == 0:
+                        continue
+                    try:
+                        loc.click()
+                    except Exception:
+                        loc.click(force=True)
+                    try:
+                        if hasattr(page_like, "wait_for_load_state"):
+                            page_like.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    return True
+                except Exception:
+                    continue
+        time.sleep(0.3)
+    return False
+
+
+def _filter_process_grid_row(page, processo: str, timeout_ms: int = 20000):
+    """Filtra a grid atual pelo número de processo e retorna a primeira linha."""
+    try:
+        if not _ensure_apo_pen_grid_visible(page, timeout_ms=8000):
+            _go_to_mesa_trabalho(page)
+            open_apo_pen_menu(page)
+            _ensure_apo_pen_grid_visible(page, timeout_ms=15000)
+    except Exception:
+        pass
+    try:
+        header = page.locator("#sptMesaTrabalho_gvProcesso_DXHeadersRow0 td, #gvProcesso_DXHeadersRow0 td").filter(
+            has_text=re.compile(r"N\s*°?\s*Processo|N\s*o\.?\s*Processo", re.I)
+        ).first
+        if header.count() > 0:
+            hid = header.get_attribute("id") or ""
+            m = re.search(r"col(\d+)$", hid)
+            if m:
+                col_idx = m.group(1)
+                inp = page.locator(
+                    f"#sptMesaTrabalho_gvProcesso_DXFREditorcol{col_idx}_I, "
+                    f"#gvProcesso_DXFREditorcol{col_idx}_I"
+                ).first
+                inp.wait_for(state="visible", timeout=10000)
+                try:
+                    inp.fill("")
+                except Exception:
+                    pass
+                inp.fill(processo)
+                try:
+                    inp.press("Enter")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    deadline = time.time() + timeout_ms / 1000.0
+    proc_norm = normalize(processo).lower()
+    proc_digits = re.sub(r"\D+", "", processo)
+    while time.time() < deadline:
+        try:
+            row = page.locator(
+                "#sptMesaTrabalho_gvProcesso_DXMainTable tr[id*='DXDataRow'], "
+                "#gvProcesso_DXMainTable tr[id*='DXDataRow']"
+            ).first
+            if row.count() > 0:
+                try:
+                    row_text = normalize(row.inner_text(timeout=1000)).lower()
+                    row_digits = re.sub(r"\D+", "", row_text)
+                    if proc_norm in row_text or (proc_digits and proc_digits in row_digits):
+                        return row
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return None
+
+
+def _select_current_process_row(page, row) -> bool:
+    """Seleciona a linha filtrada da mesa e aguarda os hidden fields do DevExpress."""
+    if row is None:
+        return False
+    selected = False
+    try:
+        data = page.evaluate(
+            """(() => {
+                try {
+                    const gv = window.gvProcesso || ((window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection().GetByName('gvProcesso') : null);
+                    if (gv && gv.SelectRowOnPage) gv.SelectRowOnPage(0, true);
+                } catch(e) {
+                    try { ASPx.GVScheduleCommand('gvProcesso',['Select',0],1); } catch(e2) {}
+                }
+                try { if (window.TemporizadorAcoes) TemporizadorAcoes(); } catch(e) {}
+                return {
+                    count: (window.gvProcesso && gvProcesso.GetSelectedRowCount) ? gvProcesso.GetSelectedRowCount() : 0,
+                    codigos: window.RetornaCodigosConcatenados ? RetornaCodigosConcatenados() : "",
+                    area: window.intCodigoAreaCripto || ""
+                };
+            })()"""
+        )
+        if data and data.get("codigos") and data.get("area"):
+            selected = True
+    except Exception:
+        pass
+    for sel in [
+        "td.dxgvCommandColumn",
+        "td:first-child",
+        "td.dxgvCommandColumn input",
+        "td[id*='DXSel'] input",
+        "input[type='checkbox']",
+    ]:
+        if selected:
+            break
+        try:
+            loc = row.locator(sel).first
+            if loc.count() == 0:
+                continue
+            try:
+                loc.click(force=True, timeout=3000)
+            except Exception:
+                loc.click(timeout=3000)
+            selected = True
+            break
+        except Exception:
+            continue
+    if not selected:
+        try:
+            page.evaluate(
+                "try{ if(window.gvProcesso){ gvProcesso.SelectRowOnPage(0,true); } "
+                "else { ASPx.GVScheduleCommand('sptMesaTrabalho_gvProcesso',['Select',0],1); } }catch(e){}"
+            )
+            selected = True
+        except Exception:
+            pass
+    try:
+        page.evaluate("try{ TemporizadorAcoes(); }catch(e){}")
+    except Exception:
+        pass
+
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        try:
+            data = page.evaluate(
+                """(() => {
+                    const out = {count: 0, codigos: "", area: ""};
+                    try {
+                        const gv = window.gvProcesso || ((window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection().GetByName('gvProcesso') : null);
+                        if (gv && gv.GetSelectedRowCount) out.count = gv.GetSelectedRowCount();
+                    } catch(e) {}
+                    try {
+                        if (window.RetornaCodigosConcatenados) out.codigos = RetornaCodigosConcatenados();
+                    } catch(e) {}
+                    try { out.area = window.intCodigoAreaCripto || ""; } catch(e) {}
+                    return out;
+                })()"""
+            )
+            if data and data.get("codigos") and data.get("area"):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return selected
+
+
+def _extract_protocol_area_from_grid_row(row) -> tuple[str, str]:
+    """Extrai protocolo/area criptografados direto dos handlers da linha."""
+    if row is None:
+        return "", ""
+    try:
+        html = row.evaluate("el => el.outerHTML")
+    except Exception:
+        html = ""
+    patterns = [
+        r"AbreMaximizadoIEApoioWork\('([^']+)'\s*,\s*'([^']+)'",
+        r"AbreMaximizadoIEApoio\('([^']+)'\s*,\s*'([^']+)'",
+        r"AbrePopupGerenciadorAtos\('([^']+)'\s*,\s*'[^']*'\s*,\s*'([^']+)'",
+        r"AbreCadastroNotificacao\('([^']+)'\s*,\s*'([^']+)'",
+    ]
+    for pat in patterns:
+        m = re.search(pat, html or "", re.I)
+        if not m:
+            continue
+        first, second = m.group(1), m.group(2)
+        if "CadastroNotificacao" in pat:
+            return second, first
+        return first, second
+    return "", ""
+
+
+def _devexpress_combo_items(page_like, control_name: str) -> list[dict]:
+    try:
+        return page_like.evaluate(
+            """(name) => {
+                const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+                const cb = (coll ? coll.GetByName(name) : null) || window[name];
+                if (!cb || !cb.GetItemCount) return [];
+                const items = [];
+                for (let i = 0; i < cb.GetItemCount(); i++) {
+                    const it = cb.GetItem(i);
+                    items.push({index: i, text: it.text, value: it.value});
+                }
+                return items;
+            }""",
+            control_name,
+        )
+    except Exception:
+        return []
+
+
+def _set_devexpress_combo_item(page_like, control_name: str, desired_text: str) -> bool:
+    desired_norm = normalize(desired_text or "").lower()
+    if not desired_norm:
+        return False
+    match = None
+    for item in _devexpress_combo_items(page_like, control_name):
+        item_text = normalize(str(item.get("text") or "")).lower()
+        if item_text == desired_norm or desired_norm in item_text:
+            match = item
+            break
+    if not match:
+        return False
+    try:
+        return bool(
+            page_like.evaluate(
+                """(arg) => {
+                    const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+                    const cb = (coll ? coll.GetByName(arg.name) : null) || window[arg.name];
+                    if (!cb) return false;
+                    if (cb.SetSelectedIndex && arg.index !== undefined) cb.SetSelectedIndex(arg.index);
+                    if (cb.SetValue) cb.SetValue(arg.value);
+                    if (cb.SetText) cb.SetText(arg.text);
+                    return true;
+                }""",
+                {"name": control_name, "index": match.get("index"), "value": match.get("value"), "text": match.get("text")},
+            )
+        )
+    except Exception:
+        return False
+
+
+def _signer_filter_query(name: str) -> str:
+    norm = normalize(name or "").strip()
+    if not norm:
+        return "ROSELI"
+    parts = [p for p in re.split(r"\s+", norm) if len(p) > 2 and p.lower() not in {"de", "da", "do", "das", "dos"}]
+    if any(p.lower() == "roseli" for p in parts):
+        return "ROSELI"
+    return parts[0] if parts else norm
+
+
+def _row_text_matches_person(row_text: str, desired_name: str) -> bool:
+    text = normalize(row_text or "").lower()
+    desired = normalize(desired_name or "").lower()
+    tokens = [p for p in re.split(r"\s+", desired) if len(p) > 2 and p not in {"de", "da", "do", "das", "dos"}]
+    if "roseli" in tokens:
+        return "roseli" in text and "chaves" in text
+    if not tokens:
+        return bool(text.strip())
+    required = tokens[:1]
+    if len(tokens) > 1:
+        required.append(tokens[-1])
+    return all(tok in text for tok in required)
+
+
+def _select_distribuicao_usuario(page_like, signer_name: str) -> bool:
+    """Seleciona o usuário no GridLookup 'Distribuir para'."""
+    query = _signer_filter_query(signer_name)
+    try:
+        for sel in ["#cbbUsuarios_B-1", "#cbbUsuarios_I"]:
+            try:
+                loc = page_like.locator(sel).first
+                if loc.count() > 0:
+                    loc.click(force=True, timeout=3000)
+                    break
+            except Exception:
+                continue
+        inp = page_like.locator("#cbbUsuarios_DDD_gv_DXFREditorcol1_I").first
+        inp.wait_for(state="visible", timeout=8000)
+        try:
+            inp.fill("")
+        except Exception:
+            pass
+        inp.fill(query)
+        try:
+            inp.press("Enter")
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"Aviso: falha ao filtrar usuario de distribuicao ({signer_name}): {e}")
+        return False
+
+    row = None
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            candidate = page_like.locator("#cbbUsuarios_DDD_gv_DXMainTable tr[id*='DXDataRow']").first
+            if candidate.count() > 0:
+                text = candidate.inner_text(timeout=1000)
+                if _row_text_matches_person(text, signer_name):
+                    row = candidate
+                    print(f"Usuario selecionado para distribuicao: {text.strip()}")
+                    break
+        except Exception:
+            pass
+        time.sleep(0.35)
+    if row is None:
+        print(f"Aviso: usuario '{signer_name}' nao encontrado para distribuicao.")
+        return False
+
+    selected = False
+    for sel in ["td.dxgvCommandColumn", "td:first-child", "input[id*='DXSelBtn']"]:
+        try:
+            loc = row.locator(sel).first
+            if loc.count() > 0:
+                loc.click(force=True, timeout=3000)
+                selected = True
+                break
+        except Exception:
+            continue
+    if not selected:
+        try:
+            page_like.evaluate("try{ cbbUsuarios_DDD_gv.SelectRowOnPage(0,true); }catch(e){ try{ ASPx.GVScheduleCommand('cbbUsuarios_DDD_gv',['Select',0],1); }catch(e2){} }")
+            selected = True
+        except Exception:
+            pass
+    try:
+        close_btn = page_like.locator("#cbbUsuarios_DDD_gv_StatusBar_Close_0_I").first
+        if close_btn.count() > 0:
+            close_btn.click(force=True, timeout=3000)
+        else:
+            page_like.evaluate("try{ cbbUsuarios.HideDropDown(); }catch(e){}")
+    except Exception:
+        try:
+            page_like.evaluate("try{ cbbUsuarios.HideDropDown(); }catch(e){}")
+        except Exception:
+            pass
+
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        try:
+            data = page_like.evaluate(
+                """(() => {
+                    const c = window.cbbUsuarios || ((window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection().GetByName('cbbUsuarios') : null);
+                    return c ? {text: c.GetText ? c.GetText() : "", value: c.GetValue ? c.GetValue() : null} : null;
+                })()"""
+            )
+            if data and data.get("value") and _row_text_matches_person(data.get("text") or "", signer_name):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return selected
+
+
+def _open_distribuicao_assinatura_page(context, page, action_value: str, codigos: str = "", area: str = ""):
+    data = {}
+    if codigos and area:
+        try:
+            data = page.evaluate("() => ({origin: location.origin})")
+        except Exception:
+            data = {}
+    else:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                data = page.evaluate(
+                    """(actionValue) => {
+                        const cb = window.cbbAcoes || ((window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection().GetByName('cbbAcoes') : null);
+                        if (cb && cb.SetValue) cb.SetValue(actionValue);
+                        return {
+                            codigos: window.RetornaCodigosConcatenados ? RetornaCodigosConcatenados() : "",
+                            area: window.intCodigoAreaCripto || "",
+                            origin: location.origin
+                        };
+                    }""",
+                    action_value,
+                )
+                if (data or {}).get("codigos") and (data or {}).get("area") and (data or {}).get("origin"):
+                    break
+            except Exception:
+                data = {}
+            time.sleep(0.5)
+        codigos = (data or {}).get("codigos") or ""
+        area = (data or {}).get("area") or ""
+    origin = (data or {}).get("origin") or ""
+    if not codigos or not area or not origin:
+        print("Aviso: nao foi possivel montar URL de distribuicao para assinatura.")
+        return None
+    url = (
+        f"{origin}/paginas/inspetoria/distribuirprocesso.aspx?"
+        f"c={quote(codigos)}&a={quote(action_value)}&ar={quote(area)}"
+    )
+    try:
+        pop = context.new_page()
+        pop.goto(url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            pop.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        return pop
+    except Exception as e:
+        print(f"Aviso: falha ao abrir distribuicao para assinatura: {e}")
+        return None
+
+
+def _open_assinatura_processos_menu(page) -> None:
+    for attempt in range(2):
+        try:
+            loc = page.locator("#assina_16_PROCESSO").first
+            if loc.count() > 0:
+                loc.click(force=True, timeout=5000)
+                page.wait_for_timeout(1000)
+                return
+        except Exception:
+            pass
+        try:
+            page.evaluate("try{ AtualizarGrid('assina_16','PROCESSO'); }catch(e){}")
+            page.wait_for_timeout(1000)
+            return
+        except Exception:
+            pass
+        try:
+            open_apo_pen_menu(page)
+        except Exception:
+            pass
+
+
+def _find_oficio_ssg_row(pop, preferred_statuses: list[str] | None = None):
+    preferred_statuses = [normalize(s).lower() for s in (preferred_statuses or []) if s]
+    rows = pop.locator("#gvAtosArea_DXMainTable tr[id*='DXDataRow'], tr[id*='gvAtosArea_DXDataRow']")
+    matches = []
+    try:
+        count = rows.count()
+    except Exception:
+        count = 0
+    for i in range(count):
+        row = rows.nth(i)
+        try:
+            text = normalize(row.inner_text(timeout=1000)).lower()
+        except Exception:
+            continue
+        if ("oficio ssg" in text or "ofício ssg" in text or "of ssg" in text) and "excluir" not in text:
+            matches.append((row, text))
+    for status in preferred_statuses:
+        for row, text in matches:
+            if status in text:
+                return row, text
+    if matches:
+        return matches[0]
+    return None, ""
+
+
+def concluir_oficio_ssg_ato(context, page, processo: str) -> bool:
+    """Conclui o Ofício SSG antes da solicitação de assinatura."""
+    try:
+        pop = open_gerenciador_atos_from_grid(context, page, processo)
+    except Exception:
+        pop = None
+    if not pop:
+        print(f"Aviso: nao foi possivel abrir Gerenciador de Atos para concluir ato em {processo}.")
+        return False
+    try:
+        try:
+            pop.wait_for_selector("#gvAtosArea_DXMainTable tr[id*='DXDataRow'], tr[id*='gvAtosArea_DXDataRow']", timeout=15000)
+        except Exception:
+            pass
+
+        row, row_text = _find_oficio_ssg_row(pop, ["Rascunho"])
+        if row is None:
+            row, row_text = _find_oficio_ssg_row(pop, ["Concluído", "Concluido"])
+            if row is not None:
+                print(f"Ato Ofício SSG ja esta concluido em {processo}.")
+                return True
+            print(f"Aviso: ato Ofício SSG nao encontrado para concluir em {processo}.")
+            return False
+
+        action = row.locator(
+            "img[title*='Concluir ato' i], "
+            "img[alt*='Concluir' i], "
+            "img[onclick*='ConcluirAto' i], "
+            "img[onclick*='f_ConcluirAto' i]"
+        ).first
+        if action.count() == 0:
+            if "concluido" in row_text or "concluído" in row_text:
+                print(f"Ato Ofício SSG ja esta concluido em {processo}.")
+                return True
+            print(f"Aviso: acao de concluir ato nao encontrada para {processo}.")
+            return False
+
+        onclick = action.get_attribute("onclick") or ""
+        try:
+            pop.on("dialog", lambda d: d.accept())
+        except Exception:
+            pass
+        if onclick:
+            pop.evaluate(onclick)
+        else:
+            try:
+                action.click(force=True, timeout=3000)
+            except Exception:
+                handle = action.element_handle(timeout=1000)
+                if handle:
+                    pop.evaluate("el => el.click()", handle)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            row2, text2 = _find_oficio_ssg_row(pop, ["Concluído", "Concluido"])
+            if row2 is not None and ("concluido" in text2 or "concluído" in text2):
+                print(f"Ato Ofício SSG concluido para {processo}.")
+                return True
+            try:
+                pop.evaluate("try{ if(window.gvAtosArea && gvAtosArea.Refresh) gvAtosArea.Refresh(); }catch(e){}")
+            except Exception:
+                pass
+            time.sleep(1)
+        print(f"Aviso: nao foi possivel confirmar conclusao do ato em {processo}.")
+        return False
+    finally:
+        try:
+            if not pop.is_closed():
+                pop.close()
+        except Exception:
+            pass
+
+
+def oficio_ssg_ato_existe(context, page, processo: str) -> bool:
+    try:
+        pop = open_gerenciador_atos_from_grid(context, page, processo)
+    except Exception:
+        pop = None
+    if not pop:
+        return False
+    try:
+        row, _ = _find_oficio_ssg_row(pop, ["Rascunho", "Concluído", "Concluido"])
+        return row is not None
+    finally:
+        try:
+            if not pop.is_closed():
+                pop.close()
+        except Exception:
+            pass
+
+
+def request_signature_for_docx(context, page, processo: str, docx_path: Path, signer_name: str) -> bool:
+    """Solicita assinatura do DOCX anexado, sem confirmar se o assinante não for encontrado."""
+    signer_name = (signer_name or "").strip()
+    if not signer_name:
+        return False
+    try:
+        pop = open_gerenciador_atos_from_grid(context, page, processo)
+    except Exception:
+        pop = None
+    if not pop:
+        print(f"Aviso: nao foi possivel abrir Gerenciador de Atos para pedir assinatura em {processo}.")
+        return False
+
+    try:
+        row, _ = _find_oficio_ssg_row(pop, ["Concluído", "Concluido", "Rascunho"])
+        if row is not None:
+            action = row.locator(
+                "img[title*='Solicitar assinatura' i], "
+                "img[alt*='Solicitar assinatura' i], "
+                "img[onclick*='SolicitarAssinatura' i]"
+            ).first
+        else:
+            action = pop.locator(
+                "tr:has-text('Ofício SSG') img[title*='Solicitar assinatura' i], "
+                "tr:has-text('OF SSG') img[title*='Solicitar assinatura' i], "
+                "img[onclick*='SolicitarAssinatura' i]"
+            ).first
+        if action.count() == 0:
+            print(f"Aviso: acao de solicitar assinatura nao encontrada para {processo}.")
+            return False
+        onclick = action.get_attribute("onclick") or ""
+        if "SolicitarAssinatura" in onclick:
+            pop.evaluate(onclick)
+        else:
+            try:
+                action.click(timeout=3000)
+            except Exception:
+                h = action.element_handle(timeout=1000)
+                if h:
+                    pop.evaluate("el => el.click()", h)
+        pop.wait_for_selector("#gvAssinantes_DXFREditorcol2_I", timeout=15000)
+    except Exception as e:
+        print(f"Aviso: falha ao abrir tela de solicitacao de assinatura para {processo}: {e}")
+        return False
+
+    signer_norm = normalize(signer_name).lower()
+    must_tokens = [t for t in re.split(r"\s+", signer_norm) if t and t not in {"de", "da", "do", "das", "dos", "moraes", "morais"}]
+    if "roseli" in signer_norm and "chaves" in signer_norm:
+        must_tokens = ["roseli", "chaves"]
+    queries = []
+    if signer_name.strip():
+        queries.append(signer_name.strip())
+    if "roseli" in signer_norm:
+        queries.append("ROSELI")
+    if signer_name.strip().split():
+        queries.append(signer_name.strip().split()[0])
+    queries = [q for i, q in enumerate(queries) if q and q not in queries[:i]]
+
+    signer_ok = False
+    for query in queries:
+        try:
+            inp = pop.locator("#gvAssinantes_DXFREditorcol2_I").first
+            inp.fill("")
+            inp.fill(query)
+            try:
+                inp.press("Enter")
+            except Exception:
+                pass
+            deadline = time.time() + 12
+            while time.time() < deadline:
+                row = pop.locator("#gvAssinantes_DXMainTable tr[id*='DXDataRow']").first
+                if row.count() > 0:
+                    row_text = normalize(row.inner_text(timeout=1000)).lower()
+                    if all(tok in row_text for tok in must_tokens):
+                        try:
+                            cell = row.locator("td.dxgvCommandColumn").first
+                            if cell.count() > 0:
+                                cell.click(force=True)
+                            else:
+                                pop.evaluate("try{ ASPx.GVScheduleCommand('gvAssinantes',['Select',0],1); }catch(e){}")
+                        except Exception:
+                            pop.evaluate("try{ ASPx.GVScheduleCommand('gvAssinantes',['Select',0],1); }catch(e){}")
+                        signer_ok = True
+                        print(f"Assinante selecionado para {processo}: {row.inner_text(timeout=1000).strip()}")
+                        break
+                time.sleep(0.4)
+            if signer_ok:
+                break
+        except Exception:
+            continue
+
+    if not signer_ok:
+        print(f"Aviso: assinante '{signer_name}' nao encontrado/selecionado para {processo}; assinatura nao confirmada.")
+        return False
+
+    confirmed = False
+    try:
+        def _accept_dialog(d):
+            try:
+                d.accept()
+            except Exception:
+                pass
+        try:
+            pop.on("dialog", _accept_dialog)
+        except Exception:
+            pass
+        btn = pop.locator("#btnSolicitarAssinatura_I, input[name='btnSolicitarAssinatura']").first
+        if btn.count() > 0:
+            try:
+                btn.click(force=True, timeout=3000)
+            except Exception:
+                pop.evaluate(
+                    "(function(){"
+                    " try { var coll=(window.ASPx&&ASPx.GetControlCollection)?ASPx.GetControlCollection():null;"
+                    "       var b=coll?coll.GetByName('btnSolicitarAssinatura'):null;"
+                    "       if(b&&b.DoClick){ b.DoClick(); return true; } } catch(e) {}"
+                    " try { var el=document.getElementById('btnSolicitarAssinatura_I') || document.getElementsByName('btnSolicitarAssinatura')[0];"
+                    "       if(el){ el.click(); return true; } } catch(e) {}"
+                    " return false;"
+                    "})()"
+                )
+            confirmed = True
+        else:
+            confirmed = _click_confirm_like(pop, ["Solicitar assinaturas", "Solicitar", "Confirmar", "Enviar"])
+        try:
+            pop.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"Aviso: falha ao confirmar solicitacao de assinatura para {processo}: {e}")
+        confirmed = False
+    if confirmed:
+        print(f"Assinatura solicitada para {signer_name} no processo {processo}.")
+    else:
+        print(f"Aviso: nao foi possivel confirmar solicitacao de assinatura para {processo}.")
+    return confirmed
+
+
+def tramitar_processo_para_destino(context, page, processo: str, destino: str) -> bool:
+    """Tramita o processo para o destino informado, confirmando só após selecionar o destino."""
+    destino = (destino or "").strip()
+    if not destino:
+        return False
+    row = _filter_process_grid_row(page, processo)
+    if row is None:
+        print(f"Aviso: linha do processo {processo} nao encontrada para tramitar.")
+        return False
+
+    if "assin" in normalize(destino).lower():
+        protocolo_cript, area_cript = _extract_protocol_area_from_grid_row(row)
+        if not _select_current_process_row(page, row):
+            if not (protocolo_cript and area_cript):
+                print(f"Aviso: nao foi possivel selecionar {processo} para tramitar.")
+                return False
+        action_value = ""
+        for item in _devexpress_combo_items(page, "cbbAcoes"):
+            text_norm = normalize(str(item.get("text") or "")).lower()
+            if "enviar para assinatura" in text_norm:
+                action_value = str(item.get("value") or "")
+                break
+        if not action_value:
+            action_value = "998_envassdist"
+        codigos = f"{protocolo_cript}|" if protocolo_cript else ""
+        pop = _open_distribuicao_assinatura_page(context, page, action_value, codigos=codigos, area=area_cript)
+        if not pop:
+            return False
+        try:
+            signer_name = (
+                os.getenv("DISTRIBUIR_PARA")
+                or os.getenv("ASSINANTE_NOME")
+                or os.getenv("SIGNER_NAME")
+                or os.getenv("ASSINANTE")
+                or "Roseli Moraes Chaves"
+            ).strip()
+            if not _select_distribuicao_usuario(pop, signer_name):
+                print(f"Aviso: distribuicao de {processo} nao confirmada porque o usuario nao foi selecionado.")
+                return False
+
+            status_dist = (os.getenv("DISTRIBUICAO_STATUS") or "Para oficiar").strip()
+            if status_dist and not _set_devexpress_combo_item(pop, "cbbStatusDist", status_dist):
+                print(f"Aviso: status de distribuicao '{status_dist}' nao encontrado; seguindo sem status.")
+            prioridade_dist = (os.getenv("DISTRIBUICAO_PRIORIDADE") or "").strip()
+            if prioridade_dist:
+                _set_devexpress_combo_item(pop, "cbbPrioridadeDist", prioridade_dist)
+
+            try:
+                pop.on("dialog", lambda dialog: dialog.accept())
+            except Exception:
+                pass
+            try:
+                btn = pop.locator("#btnEnviar_I, input[name='btnEnviar']").first
+                btn.wait_for(state="attached", timeout=10000)
+                try:
+                    btn.click(force=True, timeout=5000)
+                except Exception:
+                    pop.evaluate("try{ btnEnviar.DoClick(); }catch(e){ document.getElementById('btnEnviar_I').click(); }")
+            except Exception as e:
+                print(f"Aviso: nao foi possivel acionar Enviar na distribuicao de {processo}: {e}")
+                return False
+
+            try:
+                pop.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            time.sleep(2)
+
+            try:
+                pop_text = normalize(pop.locator("body").inner_text(timeout=3000)).lower()
+                if any(msg in pop_text for msg in ["erro", "obrigatorio", "obrigatoria", "selecione"]):
+                    print(f"Aviso: a tela de distribuicao indicou pendencia para {processo}; tramitação pode nao ter sido concluida.")
+                    return False
+            except Exception:
+                pass
+
+            try:
+                pop.close()
+            except Exception:
+                pass
+            try:
+                _open_assinatura_processos_menu(page)
+                verified = _filter_process_grid_row(page, processo, timeout_ms=12000)
+                if verified is not None:
+                    print(f"Processo {processo} tramitado para '{destino}' e localizado em Em Assinatura.")
+                else:
+                    print(f"Processo {processo} tramitado para '{destino}' (nao foi possivel verificar na grid final).")
+            except Exception:
+                print(f"Processo {processo} tramitado para '{destino}'.")
+            return True
+        finally:
+            try:
+                if not pop.is_closed():
+                    pop.close()
+            except Exception:
+                pass
+
+    pages_before = list(context.pages)
+    action_clicked = False
+    for sel in [
+        "a[onclick*='Tramitar' i]",
+        "a[href*='Tramitar' i]",
+        "img[alt*='Tramitar' i]",
+        "img[title*='Tramitar' i]",
+        "img[src*='tramit' i]",
+        "a:has-text('Tramitar')",
+    ]:
+        try:
+            loc = row.locator(sel).first
+            if loc.count() == 0:
+                continue
+            try:
+                loc.click()
+            except Exception:
+                loc.click(force=True)
+            action_clicked = True
+            break
+        except Exception:
+            continue
+    if not action_clicked:
+        target_tmp = _click_action_opening_target(context, page, [r"\bTramitar\b"])
+    else:
+        target_tmp = page
+
+    target = target_tmp or page
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        pages_now = list(context.pages)
+        if len(pages_now) > len(pages_before):
+            target = [p for p in pages_now if p not in pages_before][-1]
+            try:
+                target.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            break
+        time.sleep(0.25)
+
+    dest_ok = _select_text_value(
+        target,
+        destino,
+        ["Destino", "Situacao", "Situação", "Fila", "Setor", "Unidade", "Local"],
+        extra_selectors=[
+            "select",
+            "input[type='text']",
+            "input[role='combobox']",
+            "[role='combobox'] input",
+        ],
+    )
+    if not dest_ok:
+        print(f"Aviso: destino '{destino}' nao encontrado/selecionado para {processo}; tramitação nao confirmada.")
+        return False
+
+    observacao = os.getenv("TRAMITAR_OBSERVACAO", "Encaminhado para assinatura do oficio.")
+    try:
+        _select_text_value(target, observacao, ["Observacao", "Observação", "Despacho", "Comentario", "Comentário"], extra_selectors=["textarea"])
+    except Exception:
+        pass
+
+    confirmed = _click_confirm_like(target, ["Tramitar", "Confirmar", "Salvar", "Enviar", "Encaminhar", "Gravar"])
+    if confirmed:
+        print(f"Processo {processo} tramitado para '{destino}'.")
+    else:
+        print(f"Aviso: nao foi possivel confirmar tramitação de {processo} para '{destino}'.")
+    return confirmed
+
+
 def process_processo_pipeline(context, main_page, output_dir: Path, processo_num: str, use_caixa_correio: bool):
     """Fluxo completo: abre o processo, baixa PDF, gera oficio, cria comunicacao e anexa DOCX."""
     active_page = None
+    grid_page = None
+    action_page = None
+    caixa_target = None
     try:
-        maybe_page = filter_and_open_processo(context, main_page, processo_num)
-        active_page = maybe_page or main_page
+        print(f"Iniciando pipeline do processo {processo_num}.")
+        grid_page = _open_fresh_apo_pen_page(context) or main_page
+        maybe_page = filter_and_open_processo(context, grid_page, processo_num)
+        active_page = maybe_page or grid_page
+        print(f"Processo {processo_num}: visualizador localizado/aberto.")
         try:
             find_frame_with_selector(active_page, "#splLeitorDocumentos_pgcPecas_trePecas", timeout_ms=15000)
         except Exception:
             try:
                 active_page.locator(f"#cod_processo[value*='{processo_num}']").first.wait_for(state="attached", timeout=8000)
             except Exception:
-                active_page = search_processo_and_open_viewer(context, main_page, processo_num)
+                active_page = search_processo_and_open_viewer(context, grid_page, processo_num)
+        print(f"Processo {processo_num}: baixando ultima peca/PDF.")
         pdf_path, piece_title = click_last_piece_and_open_pdf(context, active_page, output_dir, processo_num)
         if not pdf_path:
             print(f"Aviso: nenhum PDF encontrado para {processo_num}.")
             return
+        print(f"Processo {processo_num}: PDF capturado em {pdf_path.name}.")
         pdf_text = extract_text_from_pdf(pdf_path)
         cover_text = _extract_cover_text(context, active_page, output_dir, processo_num)
         fields = parse_fields_from_pdf_text(pdf_text, processo_num)
         tipo = _classify_tipo_from_text_and_piece(pdf_text or "", piece_title, cover_text=cover_text)
         secretaria_text = f"{cover_text}\n{pdf_text}" if cover_text else pdf_text
         secretaria = _detect_secretaria_from_text(secretaria_text)
-        tpl_path = classify_and_select_template_path(pdf_text, piece_title, cover_text=cover_text)
+        forced_tpl = _resolve_oficio_template() if os.getenv("OFICIO_TEMPLATE") else None
+        tpl_path = forced_tpl or classify_and_select_template_path(pdf_text, piece_title, cover_text=cover_text)
+        if forced_tpl:
+            print(f"Modelo selecionado por configuração: {forced_tpl.name}")
         docx_path = generate_oficio_from_template(processo_num, output_dir, extra=fields, template_path=tpl_path)
 
         data_decadencia = extract_data_decadencia(pdf_text)
@@ -3020,7 +4262,9 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
 
         if use_caixa_correio:
             try:
-                caixa_target = open_caixa_correio_from_grid(context, main_page, processo_num)
+                print(f"Processo {processo_num}: criando comunicacao processual.")
+                action_page = _open_fresh_apo_pen_page(context) or grid_page or main_page
+                caixa_target = open_caixa_correio_from_grid(context, action_page, processo_num)
                 criar_comunicacao_processual(context, caixa_target, {
                     "processo": processo_num,
                     "secretaria": secretaria,
@@ -3034,21 +4278,59 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
 
         if docx_path:
             try:
-                attached = attach_docx_via_gerenciador_atos(context, main_page, processo_num, docx_path)
-                if not attached:
-                    attached = attach_docx_to_portal(context, active_page, docx_path)
+                if action_page is None:
+                    action_page = _open_fresh_apo_pen_page(context) or grid_page or main_page
+                reuse_existing_oficio = env_bool("REUSE_EXISTING_OFICIO", False)
+                attached = False
+                if reuse_existing_oficio and oficio_ssg_ato_existe(context, action_page, processo_num):
+                    attached = True
+                    print(f"Processo {processo_num}: Ofício SSG existente localizado; anexo novo ignorado por REUSE_EXISTING_OFICIO.")
+                else:
+                    print(f"Processo {processo_num}: anexando DOCX {docx_path.name}.")
+                    attached = attach_docx_via_gerenciador_atos(context, action_page, processo_num, docx_path)
+                    if not attached:
+                        attached = attach_docx_to_portal(context, active_page, docx_path)
                 if attached:
                     print("Anexo do DOCX concluido.")
                 else:
                     print("Aviso: anexo do DOCX nao foi concluido automaticamente.")
+                signer_name = (
+                    os.getenv("ASSINANTE_NOME")
+                    or os.getenv("SIGNER_NAME")
+                    or os.getenv("ASSINANTE")
+                    or ""
+                ).strip()
+                signature_required = env_bool("REQUEST_SIGNATURE", False) or bool(signer_name)
+                signature_ok = True
+                if attached and signature_required:
+                    concluded = concluir_oficio_ssg_ato(context, action_page, processo_num)
+                    if concluded:
+                        signature_ok = request_signature_for_docx(context, action_page, processo_num, docx_path, signer_name)
+                    else:
+                        signature_ok = False
+                        print(f"Aviso: assinatura de {processo_num} ignorada porque o ato nao foi concluido com sucesso.")
+                destino_tramitacao = (os.getenv("TRAMITAR_DESTINO") or "").strip()
+                if attached and destino_tramitacao:
+                    if signature_ok:
+                        tramitar_processo_para_destino(context, action_page, processo_num, destino_tramitacao)
+                    else:
+                        print(f"Aviso: tramitação de {processo_num} ignorada porque a assinatura não foi solicitada com sucesso.")
             except Exception as e:
                 print(f"Aviso: falha ao anexar DOCX: {e}")
     finally:
-        try:
-            if active_page is not None and active_page != main_page:
-                active_page.close()
-        except Exception:
-            pass
+        seen_pages = set()
+        for p in [caixa_target, active_page, action_page, grid_page]:
+            try:
+                if p is None or p == main_page:
+                    continue
+                ident = id(p)
+                if ident in seen_pages:
+                    continue
+                seen_pages.add(ident)
+                if hasattr(p, "is_closed") and not p.is_closed():
+                    p.close()
+            except Exception:
+                pass
 
 
 def main():
@@ -3081,8 +4363,12 @@ def main():
     storage_state_file = Path(storage_state_path) if storage_state_path else None
 
     if not username or not password:
-        print("ERRO: defina ETCM_USERNAME e ETCM_PASSWORD (via .env ou variaveis de ambiente).")
-        sys.exit(2)
+        if headless:
+            print("ERRO: defina ETCM_USERNAME e ETCM_PASSWORD (via .env ou variaveis de ambiente).")
+            sys.exit(2)
+        print("Credenciais nao definidas no ambiente; login sera feito manualmente no navegador visivel.")
+        username = username or ""
+        password = password or ""
     try:
         print(f"Usando usuario: {username}")
     except Exception:
@@ -3110,7 +4396,11 @@ def main():
         else:
             launch_kwargs["slow_mo"] = slow_mo_ms
         browser = p.chromium.launch(**launch_kwargs)
-        context_kwargs = {"viewport": {"width": 1600, "height": 900}, "accept_downloads": True}
+        context_kwargs = {
+            "viewport": {"width": 1600, "height": 900},
+            "accept_downloads": True,
+            "ignore_https_errors": env_bool("IGNORE_HTTPS_ERRORS", True),
+        }
         if use_storage_state and storage_state_file and storage_state_file.exists():
             try:
                 context_kwargs["storage_state"] = str(storage_state_file)
@@ -3155,6 +4445,7 @@ def main():
                 find_frame_with_text(page, "Processos", timeout_ms=20000)
             except Exception:
                 pass
+        print("Login/mesa carregados; preparando processamento.")
 
         # Modo ATTACH_ONLY: apenas anexa o DOCX mais recente via Gerenciador de Atos
         ger_atos_url = os.getenv("ETCM_GERENCIA_ATO_URL")
@@ -3229,8 +4520,15 @@ def main():
             browser.close()
             return
 
-        # 2) Abrir APO-PEN e exportar a planilha
-        downloaded_file = open_apo_pen_and_export_excel(context, page, output_dir)
+        # 2) Abrir APO-PEN e exportar a planilha quando a lista nao foi fornecida
+        env_list_pre = os.getenv("PROCESSOS_LIST")
+        if env_list_pre:
+            print("Lista de processos fornecida; abrindo pasta APO-PEN sem exportar planilha.")
+            open_apo_pen_menu(page)
+            downloaded_file = None
+        else:
+            print("Abrindo pasta APO-PEN e tentando exportar a grid.")
+            downloaded_file = open_apo_pen_and_export_excel(context, page, output_dir)
 
         try:
             src_file = downloaded_file if downloaded_file and downloaded_file.exists() else find_latest_export_file(output_dir)

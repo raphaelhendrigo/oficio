@@ -10,6 +10,8 @@ import pandas as pd
 from dotenv import load_dotenv
 from playwright.sync_api import Page, sync_playwright
 
+import main as fluxo_atos
+
 # Configuracoes padrao (ajuste facilmente aqui)
 ETCM_URL = "https://homologacao-etcm.tcm.sp.gov.br/paginas/login.aspx"
 DESTINATARIO_PADRAO = "Secretaria Municipal de Educacao (*)"
@@ -215,9 +217,18 @@ def _abrir_fila_apopen(page: Page, timeout: int = 20000) -> Union[Page, "Frame"]
         re.compile(r"APO-?PEN", re.I),
     ]
 
+    try:
+        if fluxo_atos.open_apo_pen_menu(page):
+            found = _first_container_with_selector(page, selectors_grid, timeout_ms=3000)
+            if found:
+                log("Grid APO-PEN visivel.")
+                return found
+    except Exception:
+        pass
+
     deadline = time.time() + (timeout / 1000.0)
     # Tenta acionar via JavaScript (mais robusto que clicar na árvore renderizada)
-    try:
+    if False:
         page.evaluate(
             """
             () => {
@@ -237,15 +248,12 @@ def _abrir_fila_apopen(page: Page, timeout: int = 20000) -> Union[Page, "Frame"]
             }
             """
         )
-    except Exception:
-        pass
-
     while time.time() < deadline:
         containers = [page] + list(page.frames)
         for container in containers:
             for label in labels:
                 try:
-                    container.get_by_text(label, exact=False).first.click()
+                    container.get_by_text(label, exact=False).first.click(timeout=1500)
                     container.wait_for_timeout(200)
                 except Exception:
                     continue
@@ -256,7 +264,7 @@ def _abrir_fila_apopen(page: Page, timeout: int = 20000) -> Union[Page, "Frame"]
                 "a:has-text('Em confeccao APO-PEN')",
             ]:
                 try:
-                    container.locator(sel).first.click()
+                    container.locator(sel).first.click(timeout=1500)
                 except Exception:
                     pass
         wait_devexpress_idle(page)
@@ -365,33 +373,82 @@ def _filtrar_processo_na_grid(page: Page, numero_processo: str) -> Union[Page, "
     return container
 
 
+def _extract_notificacao_args_from_row(row) -> tuple[str, str]:
+    """Retorna (area, protocolo) para o cadastro de Comunicacao Processual."""
+    try:
+        html = row.evaluate("el => el.outerHTML")
+    except Exception:
+        html = ""
+    m = re.search(r"AbreCadastroNotificacao\('([^']+)'\s*,\s*'([^']+)'\)", html or "", re.I)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.search(r"AbrePopupGerenciadorAtos\('([^']+)'\s*,\s*'[^']*'\s*,\s*'([^']+)'\)", html or "", re.I)
+    if m:
+        protocolo, area = m.group(1), m.group(2)
+        return area, protocolo
+    m = re.search(r"AbreMaximizadoIEApoioWork\('([^']+)'\s*,\s*'([^']+)'\)", html or "", re.I)
+    if m:
+        protocolo, area = m.group(1), m.group(2)
+        return area, protocolo
+    return "", ""
+
+
 def abrir_comunicacoes_processo(page: Page, numero_processo: str) -> Page:
     container = _abrir_fila_apopen(page)
     container = _filtrar_processo_na_grid(page, numero_processo) or container
 
     row_selector = "#gvProcesso_DXMainTable tr[id*='DXDataRow'], #sptMesaTrabalho_gvProcesso_DXMainTable tr[id*='DXDataRow']"
-    row = container.locator(row_selector).filter(has_text=re.compile(re.escape(numero_processo), re.I)).first
+    row = container.locator(row_selector).first
     row.wait_for(state="visible", timeout=15000)
 
-    target_page = page
+    target_page: Optional[Page] = None
     icon = row.locator("img[src*='img_notificacao' i], a:has(img[src*='img_notificacao' i])").first
     try:
-        with page.expect_popup(timeout=8000) as pop_info:
-            icon.click()
-        target_page = pop_info.value
-        target_page.wait_for_load_state("domcontentloaded", timeout=8000)
+        if icon.count() > 0:
+            with page.expect_popup(timeout=8000) as pop_info:
+                icon.click()
+            target_page = pop_info.value
+            target_page.wait_for_load_state("domcontentloaded", timeout=8000)
     except Exception:
-        try:
-            icon.click()
-        except Exception:
-            pass
-        target_page = page
+        target_page = None
+
+    if target_page is None:
+        area, protocolo = _extract_notificacao_args_from_row(row)
+        if not area or not protocolo:
+            raise RuntimeError(f"Nao foi possivel obter area/protocolo para Comunicacao Processual de {numero_processo}.")
+        notif_url = urljoin(
+            page.url,
+            f"/paginas/notificacao/cadastronotificacao.aspx?a={area}&pt={protocolo}&ac=null",
+        )
+        log(f"Abrindo Comunicacao Processual por URL direta para {numero_processo}.")
+        target_page = page.context.new_page()
+        target_page.goto(notif_url, wait_until="domcontentloaded", timeout=60000)
 
     try:
         wait_visible(target_page, "#btnAdicionarNotificacao_I", timeout=12000)
     except Exception:
         pass
     return target_page
+
+
+def concluir_assinar_tramitar(context, page: Page, numero_processo: str) -> None:
+    signer_name = (
+        os.getenv("ASSINANTE_NOME")
+        or os.getenv("SIGNER_NAME")
+        or os.getenv("ASSINANTE")
+        or "Roseli Moraes Chaves"
+    ).strip()
+    destino = (os.getenv("TRAMITAR_DESTINO") or "Em assinatura").strip()
+
+    _abrir_fila_apopen(page)
+    if not fluxo_atos.concluir_oficio_ssg_ato(context, page, numero_processo):
+        log(f"Assinatura/tramitacao ignorada em {numero_processo}: ato nao concluido.")
+        return
+    if not fluxo_atos.request_signature_for_docx(context, page, numero_processo, Path("."), signer_name):
+        log(f"Tramitacao ignorada em {numero_processo}: assinatura nao solicitada.")
+        return
+    if destino:
+        fluxo_atos.tramitar_processo_para_destino(context, page, numero_processo, destino)
 
 
 def _selecionar_combo(page: Page, base_id: str, valor: str) -> None:
@@ -419,6 +476,34 @@ def _selecionar_combo(page: Page, base_id: str, valor: str) -> None:
         pass
 
 
+def _clicar_botao_devexpress(page: Page, base_id: str) -> None:
+    for sel in [
+        f"#{base_id}_CD",
+        f"#{base_id}",
+        f"#{base_id}_I",
+        f"input[name='{base_id}']",
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() == 0:
+                continue
+            loc.click(force=True, timeout=5000)
+            return
+        except Exception:
+            continue
+    page.evaluate(
+        """(name) => {
+            const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+            const btn = (coll && coll.GetByName) ? coll.GetByName(name) : window[name];
+            if (btn && btn.DoClick) { btn.DoClick(); return true; }
+            const el = document.getElementById(name + '_I') || document.getElementById(name);
+            if (el) { el.click(); return true; }
+            return false;
+        }""",
+        base_id,
+    )
+
+
 def criar_comunicacao(page: Page, dados_processo: dict) -> None:
     descricao = dados_processo.get("descricao", DESCRICAO_PADRAO)
     referencia = dados_processo.get("referencia", REFERENCIA_PADRAO)
@@ -427,8 +512,10 @@ def criar_comunicacao(page: Page, dados_processo: dict) -> None:
     status = dados_processo.get("status", STATUS_PADRAO)
     prazo = str(dados_processo.get("prazo", PRAZO_PADRAO))
 
-    wait_visible(page, "#btnAdicionarNotificacao_I", timeout=15000)
-    page.click("#btnAdicionarNotificacao_I")
+    page.locator("#btnAdicionarNotificacao_I, #btnAdicionarNotificacao_CD, #btnAdicionarNotificacao").first.wait_for(
+        state="attached", timeout=15000
+    )
+    _clicar_botao_devexpress(page, "btnAdicionarNotificacao")
     wait_visible(page, "#ppcNoificacao_txtDescricao_I", timeout=15000)
 
     _selecionar_combo(page, "ppcNoificacao_cbbUsuarios", destinatario)
@@ -451,7 +538,7 @@ def criar_comunicacao(page: Page, dados_processo: dict) -> None:
         pass
 
     wait_devexpress_idle(page)
-    page.click("#ppcNoificacao_btnPopSalvar_I")
+    _clicar_botao_devexpress(page, "ppcNoificacao_btnPopSalvar")
     try:
         page.wait_for_selector("#ppcNoificacao_btnPopSalvar_I", state="hidden", timeout=15000)
     except Exception:
@@ -512,7 +599,7 @@ def main() -> None:
                 if not need_login:
                     log("Sessao anterior reutilizada com sucesso.")
             if need_login:
-                login_etcm(
+                fluxo_atos.login_etcm(
                     page,
                     url,
                     username,
@@ -529,30 +616,45 @@ def main() -> None:
                         pass
             _abrir_fila_apopen(page)
 
-            planilha = exportar_planilha_apopen(page)
-            processos = carregar_processos(planilha)
+            env_list = (os.getenv("PROCESSOS_LIST") or "").strip()
+            if env_list:
+                sep = ";" if ";" in env_list and "," not in env_list else ","
+                processos = [s.strip() for s in env_list.split(sep) if s.strip()]
+                log(f"Processos fornecidos por PROCESSOS_LIST: {len(processos)}.")
+            else:
+                planilha = exportar_planilha_apopen(page)
+                processos = carregar_processos(planilha)
+            try:
+                max_proc = int(os.getenv("MAX_PROCESSOS", "0") or "0")
+            except Exception:
+                max_proc = 0
+            if max_proc > 0:
+                processos = processos[:max_proc]
+            skip_comunicacao = env_bool("SKIP_COMUNICACAO", False)
 
             for numero in processos:
                 log(f"Processando {numero} ...")
-                target_page = abrir_comunicacoes_processo(page, numero)
-                dados = {
-                    "processo": numero,
-                    "destinatario": DESTINATARIO_PADRAO,
-                    "relator": RELATOR_PADRAO,
-                    "descricao": DESCRICAO_PADRAO,
-                    "referencia": REFERENCIA_PADRAO,
-                    "status": STATUS_PADRAO,
-                    "prazo": PRAZO_PADRAO,
-                }
-                criar_comunicacao(target_page, dados)
-                anexar_atos(target_page, dados)  # stub opcional
-                if target_page != page:
-                    try:
-                        target_page.close()
-                    except Exception:
-                        pass
-                    page.bring_to_front()
-                    _abrir_fila_apopen(page)
+                if not skip_comunicacao:
+                    target_page = abrir_comunicacoes_processo(page, numero)
+                    dados = {
+                        "processo": numero,
+                        "destinatario": DESTINATARIO_PADRAO,
+                        "relator": RELATOR_PADRAO,
+                        "descricao": DESCRICAO_PADRAO,
+                        "referencia": REFERENCIA_PADRAO,
+                        "status": STATUS_PADRAO,
+                        "prazo": PRAZO_PADRAO,
+                    }
+                    criar_comunicacao(target_page, dados)
+                    anexar_atos(target_page, dados)  # stub opcional
+                    if target_page != page:
+                        try:
+                            target_page.close()
+                        except Exception:
+                            pass
+                        page.bring_to_front()
+                        _abrir_fila_apopen(page)
+                concluir_assinar_tramitar(context, page, numero)
         finally:
             context.close()
             browser.close()
