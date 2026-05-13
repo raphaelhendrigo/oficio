@@ -1555,6 +1555,66 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
             except Exception as e:
                 print(f"  Aviso: falha ao ajustar cbbPessoa.SetValue(codRelator): {e}")
 
+            # Mesmo problema para cbbUsuarios (destinatario): o servidor exige
+            # um ID numerico, nao o texto da secretaria. Abre o dropdown do
+            # combo (PerformCallback/ShowDropDown), enumera items, e usa
+            # SetSelectedIndex pelo match de texto — isso preenche o _VI
+            # com o ID interno do item, nao com a string.
+            try:
+                # 1) Pede para o combo carregar/expandir a lista
+                form_container.evaluate(
+                    r"""() => {
+                        try {
+                            const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+                            const ctl = coll && coll.GetByName ? (coll.GetByName('cbbUsuarios') || coll.GetByName('ppcNoificacao_cbbUsuarios')) : window.cbbUsuarios;
+                            if (ctl) {
+                                try { if (ctl.PerformCallback) ctl.PerformCallback(); } catch(e) {}
+                                try { if (ctl.ShowDropDown) ctl.ShowDropDown(); } catch(e) {}
+                            }
+                        } catch(e) {}
+                    }"""
+                )
+                # 2) Aguarda lista popular (callback assincrono)
+                time.sleep(2)
+                dest_fix = form_container.evaluate(
+                    r"""(target) => {
+                        const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+                        const ctl = coll && coll.GetByName ? (coll.GetByName('cbbUsuarios') || coll.GetByName('ppcNoificacao_cbbUsuarios')) : window.cbbUsuarios;
+                        if (!ctl) return { ok: false, reason: 'no-cbbUsuarios' };
+                        const norm = String(target || '').trim().toLowerCase();
+                        if (!norm) return { ok: false, reason: 'no-target-text' };
+                        // junta variantes (so 'educacao', 'sme', etc) para tolerar nomes longos
+                        const tokens = norm.split(/\s+/).filter(t => t.length > 2);
+                        const count = ctl.GetItemCount ? ctl.GetItemCount() : 0;
+                        const items = [];
+                        let chosen = -1;
+                        for (let i = 0; i < count; i++) {
+                            const it = ctl.GetItem(i);
+                            if (!it) continue;
+                            const t = String(it.text || '').toLowerCase();
+                            items.push(t);
+                            // match: substring ou tokens em comum
+                            if (t.includes(norm) || norm.includes(t)) { chosen = i; break; }
+                            if (tokens.some(tk => t.includes(tk))) { chosen = i; }
+                        }
+                        if (chosen < 0) return { ok: false, reason: 'no-match', items_count: count, items: items };
+                        try { ctl.SetSelectedIndex(chosen); } catch(e) { return { ok: false, reason: 'set-failed', err: String(e) }; }
+                        try { if (ctl.HideDropDown) ctl.HideDropDown(); } catch(e) {}
+                        const v = ctl.GetValue ? ctl.GetValue() : null;
+                        return { ok: !!v && !isNaN(parseInt(v, 10)), idx: chosen, value: v, text: ctl.GetText ? ctl.GetText() : '' };
+                    }""",
+                    destinatario,
+                )
+                # Reduz a lista de items no print pra nao poluir.
+                if isinstance(dest_fix, dict) and "items" in dest_fix:
+                    dest_fix_print = {k: v for k, v in dest_fix.items() if k != "items"}
+                    dest_fix_print["items_count"] = len(dest_fix.get("items") or [])
+                else:
+                    dest_fix_print = dest_fix
+                print(f"  [destinatario-fix] {dest_fix_print}")
+            except Exception as e:
+                print(f"  Aviso: falha ao ajustar cbbUsuarios via dropdown: {e}")
+
             # Conta linhas da grid ANTES de salvar (referência p/ confirmar sucesso).
             rows_before = _count_gv_notificacao_rows(form_container)
             try:
