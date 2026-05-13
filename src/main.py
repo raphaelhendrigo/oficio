@@ -3893,23 +3893,260 @@ _NON_PROD_ENVIRONMENTS: frozenset[str] = frozenset({
 
 
 def _can_safe_delete_drafts() -> tuple[bool, str]:
-    """Verifica duplo guard antes de cancelar minuta SSG em rascunho.
+    """Verifica autorizacao para derrubar minutas SSG criadas pelo robo.
 
-    Regras:
-      - SAFE_DELETE_OWN_DRAFTS deve ser true; e
-      - ENVIRONMENT deve ser um nome reconhecidamente nao-producao.
-    Retorna (autorizado, motivo) — o motivo entra no log/relatorio para
-    auditoria. Em PRODUCAO sempre retorna False (regra conservadora).
+    Conforme o brief: 'em producao, so derrubar minuta anterior se houver
+    variavel explicita SAFE_DELETE_OWN_DRAFTS=true'. Esta funcao trata a
+    flag como autorizacao explicita do operador:
+      - SAFE_DELETE_OWN_DRAFTS=true -> autorizado (em qualquer ambiente),
+        registra o ambiente no motivo para auditoria.
+      - SAFE_DELETE_OWN_DRAFTS=false/ausente -> bloqueado.
+
+    Retorna (autorizado, motivo) — o motivo entra no log/relatorio.
     """
     if not env_bool("SAFE_DELETE_OWN_DRAFTS", False):
-        return False, "SAFE_DELETE_OWN_DRAFTS=false"
+        return False, "SAFE_DELETE_OWN_DRAFTS=false (default seguro)"
     env_raw = (os.getenv("ENVIRONMENT") or "").strip()
     env_norm = normalize(env_raw).lower()
+    if env_norm in _NON_PROD_ENVIRONMENTS:
+        return True, f"ENVIRONMENT='{env_raw}' (nao-producao) + SAFE_DELETE_OWN_DRAFTS=true"
     if not env_norm:
-        return False, "ENVIRONMENT nao definido (default: producao)"
-    if env_norm not in _NON_PROD_ENVIRONMENTS:
-        return False, f"ENVIRONMENT='{env_raw}' bloqueia delete (nao-homologacao)"
-    return True, f"ENVIRONMENT='{env_raw}' + SAFE_DELETE_OWN_DRAFTS=true"
+        return True, "ENVIRONMENT nao definido + SAFE_DELETE_OWN_DRAFTS=true (autorizacao explicita)"
+    return True, f"ENVIRONMENT='{env_raw}' + SAFE_DELETE_OWN_DRAFTS=true (autorizacao explicita)"
+
+
+def delete_ato_oficio_ssg_qualquer_estado(context, page, processo: str) -> tuple[bool, list[str]]:
+    """Deleta o ato Oficio SSG do processo qualquer que seja o estado atual.
+
+    Sequencia automatica (do mais conservador ao mais agressivo):
+      1. Estado 'Em assinatura' / 'Aguardando assinatura' -> estornar assinatura
+      2. Estado 'Concluido' (apos estornar OU original)   -> estornar conclusao
+      3. Estado 'Rascunho' (apos estornos OU original)    -> cancelar / excluir
+
+    NUNCA mexe em ato com status 'Assinado' (definitivo). Quando encontra
+    esse status, registra e retorna False (pendencia para revisao manual).
+
+    Pre-condicao: _can_safe_delete_drafts() autoriza (SAFE_DELETE_OWN_DRAFTS=true).
+
+    Retorna (sucesso_final, lista_de_acoes_tomadas) — a lista entra no relatorio.
+    """
+    ok, reason = _can_safe_delete_drafts()
+    if not ok:
+        return False, [f"bloqueado: {reason}"]
+
+    acoes: list[str] = []
+    try:
+        pop = open_gerenciador_atos_from_grid(context, page, processo)
+    except Exception:
+        pop = None
+    if not pop:
+        return False, ["gerenciador de atos nao abriu"]
+
+    try:
+        try:
+            pop.wait_for_selector(
+                "#gvAtosArea_DXMainTable tr[id*='DXDataRow'], tr[id*='gvAtosArea_DXDataRow']",
+                timeout=15000,
+            )
+        except Exception:
+            pass
+
+        for tentativa in range(1, 5):
+            row, row_text = _find_oficio_ssg_row(pop)
+            if row is None:
+                acoes.append(f"t{tentativa}: nenhuma linha Oficio SSG remanescente (presumido excluido)")
+                return True, acoes
+
+            # Status 'Assinado' definitivo: nao tocar.
+            if re.search(r"\bassinad[oa]\b", row_text) and "em assinatura" not in row_text and "aguardando" not in row_text:
+                acoes.append(f"t{tentativa}: ato Oficio SSG ja Assinado — NAO TOCAR (status='{row_text[:100]}')")
+                return False, acoes
+
+            # Decide acao pela ordem: assinatura -> conclusao -> rascunho.
+            if "em assinatura" in row_text or "aguardando assinatura" in row_text:
+                desc = "estornar assinatura"
+                action_selectors = [
+                    "img[title*='Estornar' i][title*='ssinatura' i]",
+                    "img[onclick*='EstornarAssinatura' i]",
+                    "img[onclick*='f_EstornarAssinatura' i]",
+                    "img[title*='Cancelar' i][title*='ssinatura' i]",
+                    "img[onclick*='CancelarAssinatura' i]",
+                ]
+            elif "concluido" in row_text or "concluído" in row_text:
+                desc = "estornar conclusao"
+                action_selectors = [
+                    "img[title*='Estornar' i][title*='oncl' i]",
+                    "img[onclick*='EstornarConclusao' i]",
+                    "img[onclick*='f_EstornarConclusao' i]",
+                    "img[onclick*='ReabrirAto' i]",
+                    "img[onclick*='f_ReabrirAto' i]",
+                ]
+            elif "rascunho" in row_text:
+                desc = "cancelar/excluir rascunho"
+                action_selectors = [
+                    "img[title*='Cancelar' i]",
+                    "img[title*='Excluir' i]",
+                    "img[onclick*='CancelarAto' i]",
+                    "img[onclick*='ExcluirAto' i]",
+                    "img[onclick*='f_CancelarAto' i]",
+                    "img[onclick*='f_ExcluirAto' i]",
+                ]
+            else:
+                acoes.append(f"t{tentativa}: estado nao reconhecido em row='{row_text[:100]}'")
+                return False, acoes
+
+            acted = False
+            for sel in action_selectors:
+                try:
+                    action = row.locator(sel).first
+                    if action.count() == 0:
+                        continue
+                    onclick = action.get_attribute("onclick") or ""
+                    try:
+                        pop.on("dialog", lambda d: d.accept())
+                    except Exception:
+                        pass
+                    if onclick:
+                        pop.evaluate(onclick)
+                    else:
+                        try:
+                            action.click(force=True, timeout=3000)
+                        except Exception:
+                            handle = action.element_handle(timeout=1000)
+                            if handle:
+                                pop.evaluate("el => el.click()", handle)
+                    acoes.append(f"t{tentativa}: '{desc}' via '{sel}'")
+                    acted = True
+                    break
+                except Exception:
+                    continue
+
+            if not acted:
+                acoes.append(f"t{tentativa}: acao '{desc}' nao encontrada no DOM")
+                return False, acoes
+
+            # Aguarda refresh do grid antes da proxima iteracao.
+            time.sleep(2)
+            try:
+                pop.evaluate(
+                    "try{ if(window.gvAtosArea && gvAtosArea.Refresh) gvAtosArea.Refresh(); }catch(e){}"
+                )
+            except Exception:
+                pass
+            time.sleep(1)
+
+        acoes.append("excedeu 4 tentativas sem resolver o estado")
+        return False, acoes
+    finally:
+        try:
+            if not pop.is_closed():
+                pop.close()
+        except Exception:
+            pass
+
+
+def delete_comunicacao_processual(context, page, processo: str) -> tuple[bool, list[str]]:
+    """Exclui a Comunicacao Processual existente na Caixa de Correio do processo.
+
+    Pre-condicao: _can_safe_delete_drafts() autoriza.
+    Nao toca em comunicacao cuja linha mostre status terminal ja respondido.
+
+    Retorna (alguma_exclusao_feita, lista_de_acoes_tomadas).
+    """
+    ok, reason = _can_safe_delete_drafts()
+    if not ok:
+        return False, [f"bloqueado: {reason}"]
+
+    acoes: list[str] = []
+    try:
+        caixa = open_caixa_correio_from_grid(context, page, processo)
+    except Exception:
+        caixa = None
+    if not caixa:
+        return False, ["caixa de correio nao abriu"]
+
+    try:
+        time.sleep(2)
+
+        comm_selectors = (
+            "#gvNotificacoes_DXMainTable tr[id*='DXDataRow'], "
+            "table[id*='gvNotif'] tr[id*='DXDataRow'], "
+            "tr[id*='gvNotificacoes_DXDataRow']"
+        )
+        rows = caixa.locator(comm_selectors)
+        try:
+            count = rows.count()
+        except Exception:
+            count = 0
+        if count == 0:
+            acoes.append("grid sem comunicacoes processuais (nada a excluir)")
+            return False, acoes
+
+        any_deleted = False
+        # Loop ate nao haver mais linhas; sempre pega a primeira porque o
+        # grid re-renderiza apos cada exclusao.
+        for it in range(1, count + 2):
+            try:
+                cur_count = rows.count()
+            except Exception:
+                cur_count = 0
+            if cur_count == 0:
+                break
+            row = rows.nth(0)
+            try:
+                row_text = normalize(row.inner_text(timeout=1500)).lower()
+            except Exception:
+                row_text = ""
+            if re.search(r"\bassinad[oa]\b|respondid[oa]|finalizad[oa]", row_text):
+                acoes.append(f"linha {it}: status terminal '{row_text[:80]}' — NAO TOCAR")
+                break
+
+            action_selectors = [
+                "img[title*='Cancelar' i]",
+                "img[title*='Excluir' i]",
+                "img[onclick*='CancelarComunicacao' i]",
+                "img[onclick*='ExcluirComunicacao' i]",
+                "img[onclick*='CancelarNotificacao' i]",
+                "img[onclick*='ExcluirNotificacao' i]",
+                "img[onclick*='f_CancelarNotificacao' i]",
+                "img[onclick*='f_ExcluirNotificacao' i]",
+            ]
+            acted = False
+            for sel in action_selectors:
+                try:
+                    action = row.locator(sel).first
+                    if action.count() == 0:
+                        continue
+                    onclick = action.get_attribute("onclick") or ""
+                    try:
+                        caixa.on("dialog", lambda d: d.accept())
+                    except Exception:
+                        pass
+                    if onclick:
+                        caixa.evaluate(onclick)
+                    else:
+                        try:
+                            action.click(force=True, timeout=3000)
+                        except Exception:
+                            pass
+                    acoes.append(f"linha {it}: clicou '{sel}' (row='{row_text[:60]}')")
+                    acted = True
+                    any_deleted = True
+                    break
+                except Exception:
+                    continue
+            if not acted:
+                acoes.append(f"linha {it}: acao cancelar/excluir nao encontrada")
+                break
+            time.sleep(2)
+
+        return any_deleted, acoes
+    finally:
+        try:
+            if not caixa.is_closed():
+                caixa.close()
+        except Exception:
+            pass
 
 
 def cancel_oficio_ssg_rascunho(context, page, processo: str) -> tuple[bool, str]:
@@ -4412,6 +4649,35 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
     try:
         print(f"Iniciando pipeline do processo {processo_num}.")
         grid_page = _open_fresh_apo_pen_page(context) or main_page
+
+        # --- Cleanup pre-fluxo (apenas quando SAFE_DELETE_OWN_DRAFTS=true) ---
+        # Conforme decisao do operador, derrubamos ato Oficio SSG e comunicacao
+        # processual existentes antes de recriar do zero. Cada acao e logada
+        # para entrar no RELATORIO_EXECUCAO_5_PROCESSOS.md.
+        _safe_ok, _safe_reason = _can_safe_delete_drafts()
+        if _safe_ok:
+            print(f"Processo {processo_num}: CLEANUP autorizado ({_safe_reason}).")
+            try:
+                ato_ok, ato_log = delete_ato_oficio_ssg_qualquer_estado(context, grid_page, processo_num)
+                for line in ato_log:
+                    print(f"  [cleanup-ato] {line}")
+                print(f"Processo {processo_num}: cleanup do ato Oficio SSG -> {'OK' if ato_ok else 'pendente/parcial'}")
+            except Exception as e:
+                print(f"Processo {processo_num}: falha no cleanup do ato Oficio SSG: {e}")
+            try:
+                # Reabre a grid APO-PEN porque a derruba abriu/fechou popups.
+                grid_page = _open_fresh_apo_pen_page(context) or grid_page
+                comm_ok, comm_log = delete_comunicacao_processual(context, grid_page, processo_num)
+                for line in comm_log:
+                    print(f"  [cleanup-comunicacao] {line}")
+                print(f"Processo {processo_num}: cleanup da comunicacao processual -> {'OK' if comm_ok else 'pendente/parcial'}")
+            except Exception as e:
+                print(f"Processo {processo_num}: falha no cleanup da comunicacao: {e}")
+            # Reabre a grid limpa antes do fluxo normal.
+            grid_page = _open_fresh_apo_pen_page(context) or grid_page
+        else:
+            print(f"Processo {processo_num}: cleanup nao autorizado ({_safe_reason}).")
+
         maybe_page = filter_and_open_processo(context, grid_page, processo_num)
         active_page = maybe_page or grid_page
         print(f"Processo {processo_num}: visualizador localizado/aberto.")

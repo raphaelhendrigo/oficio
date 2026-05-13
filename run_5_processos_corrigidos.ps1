@@ -91,13 +91,17 @@ $env:REUSE_EXISTING_OFICIO = "false"
 
 # --------------------------- Limpeza de minutas antigas ---------------------
 
-# Ambiente alvo: PRODUCAO. Por seguranca, SAFE_DELETE_OWN_DRAFTS=false:
-# nenhuma minuta sera derrubada/cancelada automaticamente. Em caso de
-# duplicidade detectada, o robo apenas registra pendencia no log para
-# revisao humana. _can_safe_delete_drafts ainda exige duplo guard,
-# entao deixar ENVIRONMENT=producao tambem bloqueia delete acidental.
+# AUTORIZADO PELO OPERADOR em 2026-05-13: os oficios anteriores foram
+# considerados incorretos e devem ser derrubados antes de recriar com a
+# logica nova (preservacao @@). Em PROD a flag SAFE_DELETE_OWN_DRAFTS=true
+# atua como autorizacao explicita (conforme regra do brief original).
+#
+# O cleanup eh feito por processo via:
+#   - delete_ato_oficio_ssg_qualquer_estado (estorna assinatura -> estorna
+#     conclusao -> excluir; NUNCA toca em status 'Assinado').
+#   - delete_comunicacao_processual (exclui na Caixa de Correio).
 $env:ENVIRONMENT = "producao"
-$env:SAFE_DELETE_OWN_DRAFTS = "false"
+$env:SAFE_DELETE_OWN_DRAFTS = "true"
 
 # --------------------------- Limite de lote ---------------------------------
 
