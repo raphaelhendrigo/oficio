@@ -912,7 +912,12 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
     prazo = int(dados.get("prazo") or 0) if dados.get("prazo") is not None else 0
     desc_custom = dados.get("descricao") or ""
     if not desc_custom:
-        desc_custom = f"Oficio {tipo} - modelo {secretaria} - gerado automaticamente".strip(" -")
+        # Fallback: normaliza pelo tipo classificado em vez do label livre
+        # antigo "Oficio {tipo} - modelo {secretaria} - gerado automaticamente".
+        try:
+            desc_custom = normalize_descricao_comunicacao(tipo)
+        except ValueError:
+            desc_custom = DESCRICAO_CONHECIMENTO_PROVIDENCIAS
     target = page_like
 
     # Procura container que tenha o botao 'Nova Comunicacao Processual'
@@ -3881,6 +3886,114 @@ def _find_oficio_ssg_row(pop, preferred_statuses: list[str] | None = None):
     return None, ""
 
 
+_NON_PROD_ENVIRONMENTS: frozenset[str] = frozenset({
+    "homologacao", "homologação", "homolog", "hml", "hmg",
+    "teste", "test", "tst", "dev", "desenvolvimento",
+})
+
+
+def _can_safe_delete_drafts() -> tuple[bool, str]:
+    """Verifica duplo guard antes de cancelar minuta SSG em rascunho.
+
+    Regras:
+      - SAFE_DELETE_OWN_DRAFTS deve ser true; e
+      - ENVIRONMENT deve ser um nome reconhecidamente nao-producao.
+    Retorna (autorizado, motivo) — o motivo entra no log/relatorio para
+    auditoria. Em PRODUCAO sempre retorna False (regra conservadora).
+    """
+    if not env_bool("SAFE_DELETE_OWN_DRAFTS", False):
+        return False, "SAFE_DELETE_OWN_DRAFTS=false"
+    env_raw = (os.getenv("ENVIRONMENT") or "").strip()
+    env_norm = normalize(env_raw).lower()
+    if not env_norm:
+        return False, "ENVIRONMENT nao definido (default: producao)"
+    if env_norm not in _NON_PROD_ENVIRONMENTS:
+        return False, f"ENVIRONMENT='{env_raw}' bloqueia delete (nao-homologacao)"
+    return True, f"ENVIRONMENT='{env_raw}' + SAFE_DELETE_OWN_DRAFTS=true"
+
+
+def cancel_oficio_ssg_rascunho(context, page, processo: str) -> tuple[bool, str]:
+    """Cancela/exclui o ato Oficio SSG quando esta em RASCUNHO.
+
+    NUNCA toca em status diferente de Rascunho (Concluido, Em assinatura,
+    Assinado, etc). Pre-condicao: _can_safe_delete_drafts() retorna True.
+
+    Retorna (sucesso, motivo) para registro no relatorio final.
+    """
+    ok, reason = _can_safe_delete_drafts()
+    if not ok:
+        return False, reason
+
+    try:
+        pop = open_gerenciador_atos_from_grid(context, page, processo)
+    except Exception:
+        pop = None
+    if not pop:
+        return False, "Gerenciador de Atos nao abriu"
+
+    try:
+        try:
+            pop.wait_for_selector(
+                "#gvAtosArea_DXMainTable tr[id*='DXDataRow'], tr[id*='gvAtosArea_DXDataRow']",
+                timeout=15000,
+            )
+        except Exception:
+            pass
+
+        row, row_text = _find_oficio_ssg_row(pop, ["Rascunho"])
+        if row is None:
+            return False, "Sem Oficio SSG em Rascunho (nada a cancelar)"
+
+        # Acoes possiveis na linha do ato em Rascunho (DevExpress + variacoes).
+        action = row.locator(
+            "img[title*='Cancelar' i], "
+            "img[alt*='Cancelar' i], "
+            "img[title*='Excluir' i], "
+            "img[alt*='Excluir' i], "
+            "img[onclick*='CancelarAto' i], "
+            "img[onclick*='ExcluirAto' i], "
+            "img[onclick*='f_CancelarAto' i], "
+            "img[onclick*='f_ExcluirAto' i]"
+        ).first
+        if action.count() == 0:
+            return False, "Acao de cancelar/excluir nao encontrada na linha do rascunho"
+
+        onclick = action.get_attribute("onclick") or ""
+        try:
+            pop.on("dialog", lambda d: d.accept())
+        except Exception:
+            pass
+        if onclick:
+            pop.evaluate(onclick)
+        else:
+            try:
+                action.click(force=True, timeout=3000)
+            except Exception:
+                handle = action.element_handle(timeout=1000)
+                if handle:
+                    pop.evaluate("el => el.click()", handle)
+
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            row2, _ = _find_oficio_ssg_row(pop, ["Rascunho"])
+            if row2 is None:
+                return True, f"Rascunho cancelado/excluido ({reason})"
+            try:
+                pop.evaluate(
+                    "try{ if(window.gvAtosArea && gvAtosArea.Refresh) gvAtosArea.Refresh(); }catch(e){}"
+                )
+            except Exception:
+                pass
+            time.sleep(1)
+        return False, "Rascunho persiste apos tentativa de cancelar (timeout)"
+    finally:
+        try:
+            if not pop.is_closed():
+                pop.close()
+        except Exception:
+            pass
+
+
 def concluir_oficio_ssg_ato(context, page, processo: str) -> bool:
     """Conclui o Ofício SSG antes da solicitação de assinatura."""
     try:
@@ -4016,10 +4129,17 @@ def request_signature_for_docx(context, page, processo: str, docx_path: Path, si
         print(f"Aviso: falha ao abrir tela de solicitacao de assinatura para {processo}: {e}")
         return False
 
+    # Tokens-raiz para matching: derivados do nome solicitado e tolerantes a
+    # variacoes ("de", "da", "moraes", "morais", abreviacoes). Para o caso
+    # padrao "Roseli (de Morais|Moraes) Chaves", usamos a funcao utilitaria
+    # signer_name_matches_roseli_chaves do oficio_normalize (testada).
     signer_norm = normalize(signer_name).lower()
-    must_tokens = [t for t in re.split(r"\s+", signer_norm) if t and t not in {"de", "da", "do", "das", "dos", "moraes", "morais"}]
-    if "roseli" in signer_norm and "chaves" in signer_norm:
+    stop_words = {"de", "da", "do", "das", "dos", "moraes", "morais"}
+    must_tokens = [t for t in re.split(r"\s+", signer_norm) if t and t not in stop_words]
+    use_roseli_helper = "roseli" in signer_norm and "chaves" in signer_norm
+    if use_roseli_helper:
         must_tokens = ["roseli", "chaves"]
+
     queries = []
     if signer_name.strip():
         queries.append(signer_name.strip())
@@ -4043,8 +4163,16 @@ def request_signature_for_docx(context, page, processo: str, docx_path: Path, si
             while time.time() < deadline:
                 row = pop.locator("#gvAssinantes_DXMainTable tr[id*='DXDataRow']").first
                 if row.count() > 0:
-                    row_text = normalize(row.inner_text(timeout=1000)).lower()
-                    if all(tok in row_text for tok in must_tokens):
+                    row_text_raw = row.inner_text(timeout=1000)
+                    row_text = normalize(row_text_raw).lower()
+                    # Para Roseli Chaves, usa o helper testado (50 testes em
+                    # tests/test_oficio_normalize.py) que aceita variacoes
+                    # de "DE MORAIS" / "MORAES" / sem nome do meio.
+                    if use_roseli_helper:
+                        matched = signer_name_matches_roseli_chaves(row_text_raw)
+                    else:
+                        matched = all(tok in row_text for tok in must_tokens)
+                    if matched:
                         try:
                             cell = row.locator("td.dxgvCommandColumn").first
                             if cell.count() > 0:
@@ -4054,7 +4182,7 @@ def request_signature_for_docx(context, page, processo: str, docx_path: Path, si
                         except Exception:
                             pop.evaluate("try{ ASPx.GVScheduleCommand('gvAssinantes',['Select',0],1); }catch(e){}")
                         signer_ok = True
-                        print(f"Assinante selecionado para {processo}: {row.inner_text(timeout=1000).strip()}")
+                        print(f"Assinante selecionado para {processo}: {row_text_raw.strip()}")
                         break
                 time.sleep(0.4)
             if signer_ok:
@@ -4351,6 +4479,24 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
                     action_page = _open_fresh_apo_pen_page(context) or grid_page or main_page
                 reuse_existing_oficio = env_bool("REUSE_EXISTING_OFICIO", False)
                 attached = False
+
+                # Limpeza de minutas anteriores em Rascunho. Guard duplo via
+                # _can_safe_delete_drafts (SAFE_DELETE_OWN_DRAFTS=true +
+                # ENVIRONMENT de homologacao/teste). NUNCA toca em Concluido/
+                # Em assinatura/Assinado. Registro vai para o relatorio.
+                cleanup_done = False
+                cleanup_reason = ""
+                _safe_ok, _safe_reason = _can_safe_delete_drafts()
+                if _safe_ok and not reuse_existing_oficio:
+                    cleanup_done, cleanup_reason = cancel_oficio_ssg_rascunho(context, action_page, processo_num)
+                    if cleanup_done:
+                        print(f"Processo {processo_num}: minuta SSG anterior em rascunho derrubada — {cleanup_reason}.")
+                    else:
+                        print(f"Processo {processo_num}: limpeza nao aplicada — {cleanup_reason}.")
+                elif not _safe_ok:
+                    cleanup_reason = _safe_reason
+                    print(f"Processo {processo_num}: limpeza de rascunhos pulada — {cleanup_reason}.")
+
                 if reuse_existing_oficio and oficio_ssg_ato_existe(context, action_page, processo_num):
                     attached = True
                     print(f"Processo {processo_num}: Ofício SSG existente localizado; anexo novo ignorado por REUSE_EXISTING_OFICIO.")
