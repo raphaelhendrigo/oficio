@@ -1,0 +1,123 @@
+# run_5_processos_corrigidos.ps1
+#
+# Executa o fluxo APO-PEN nos 5 processos pendentes em homologacao,
+# usando os modelos novos (utap/dilacao/reiteracao/juizo x educacao/saude/geral)
+# e a regra de preservacao de tokens @@... (preenchimento pelo e-TCM).
+#
+# IMPORTANTE - Seguranca:
+#   - Este script NUNCA contem senha literal.
+#   - As credenciais sao lidas das variaveis de ambiente de USUARIO do
+#     Windows (ETCM_USERNAME, ETCM_PASSWORD, com aliases ETCM_USER,
+#     ETCM_LOGIN, ETCM_PASS, ETCM_SENHA todas suportadas pelo src/config.py).
+#   - Para configurar a senha de forma segura (sem ela passar pelo chat ou
+#     pelo repo), execute uma unica vez:
+#       Copy-Item scripts\set_local_user_env.template.ps1 scripts\set_local_user_env.ps1
+#       powershell -ExecutionPolicy Bypass -File scripts\set_local_user_env.ps1
+#     Depois feche e reabra o PowerShell antes de rodar este script.
+#
+# Pre-condicoes:
+#   - ETCM_USERNAME e ETCM_PASSWORD configurados em "User" scope.
+#   - .venv ja criado e dependencias instaladas (requirements.txt + playwright install).
+#   - Repo na branch fix/preserve-at-tokens-modelos-apopen (ou main apos merge).
+
+$ErrorActionPreference = "Stop"
+
+# --------------------------- Sanidade de credenciais ------------------------
+
+$user = [Environment]::GetEnvironmentVariable("ETCM_USERNAME", "User")
+$pass = [Environment]::GetEnvironmentVariable("ETCM_PASSWORD", "User")
+if ([string]::IsNullOrWhiteSpace($user)) {
+    Write-Host "[ERRO] ETCM_USERNAME nao esta configurado em User scope." -ForegroundColor Red
+    Write-Host "      Rode scripts\set_local_user_env.ps1 antes de executar." -ForegroundColor Yellow
+    exit 1
+}
+if ([string]::IsNullOrWhiteSpace($pass)) {
+    Write-Host "[AVISO] ETCM_PASSWORD vazio." -ForegroundColor Yellow
+    Write-Host "        O fluxo de src/main.py permite login MANUAL na janela aberta" -ForegroundColor Yellow
+    Write-Host "        (timeout via LOGIN_MANUAL_WAIT_MS); voce vai precisar digitar a senha" -ForegroundColor Yellow
+    Write-Host "        no navegador quando ele abrir." -ForegroundColor Yellow
+}
+
+# --------------------------- Lista de processos -----------------------------
+
+$env:PROCESSOS_LIST = "TC/007902/2022,TC/008636/2022,TC/008084/2023,TC/013838/2023,TC/018149/2024"
+
+# --------------------------- Modo navegador ---------------------------------
+
+$env:HEADLESS = "false"          # janela visivel
+$env:SHOW_BROWSER = "true"       # forca janela mesmo se algo virar headless
+$env:WATCH_MODE = "true"         # acompanhamento humano
+$env:SLOWMO_MS = "200"
+$env:LOGIN_MANUAL_WAIT_MS = "60000"
+$env:PAUSE_AFTER_LOGIN_MS = "5000"
+
+# --------------------------- Fluxo de comunicacao ---------------------------
+
+$env:USE_CAIXA_CORREIO = "true"
+$env:REQUEST_SIGNATURE = "true"
+$env:ASSINANTE_NOME = "Roseli Chaves"
+$env:TRAMITAR_DESTINO = "Em assinatura"
+
+# --------------------------- Selecao de modelo + tokens @@ ------------------
+
+# OFICIO_TEMPLATE_MODE=auto: ignora OFICIO_TEMPLATE fixo, usa classificacao
+# por tipo (utap/dilacao/reiteracao/juizo) x secretaria (educacao/saude/geral).
+$env:OFICIO_TEMPLATE_MODE = "auto"
+
+# OFICIO_PRESERVE_AT_TOKENS=true: bloqueia upload se algum @@ do modelo sumir
+# do DOCX gerado (validacao via docx_utils.assert_at_tokens_preserved).
+$env:OFICIO_PRESERVE_AT_TOKENS = "true"
+
+# Nao reaproveitar oficio SSG existente — vamos gerar nova minuta.
+$env:REUSE_EXISTING_OFICIO = "false"
+
+# --------------------------- Limpeza de minutas antigas ---------------------
+
+# Ambiente alvo: homologacao. Quando aplicavel e seguro, derrubar/cancelar
+# minutas anteriores criadas pelo proprio robo Euclides antes de subir nova.
+# Em PRODUCAO, manter SAFE_DELETE_OWN_DRAFTS=false (regra conservadora).
+$env:ENVIRONMENT = "homologacao"
+$env:SAFE_DELETE_OWN_DRAFTS = "true"
+
+# --------------------------- Limite de lote ---------------------------------
+
+$env:MAX_PROCESSOS = "0"   # sem limite (vai processar todos os 5)
+
+# --------------------------- Diretorios -------------------------------------
+
+if (-not (Test-Path "output")) { New-Item -ItemType Directory -Path "output" | Out-Null }
+if (-not (Test-Path "logs"))   { New-Item -ItemType Directory -Path "logs"   | Out-Null }
+if (-not (Test-Path "artifacts\evidence")) { New-Item -ItemType Directory -Path "artifacts\evidence" -Force | Out-Null }
+
+# --------------------------- Pre-validacao DOCX (offline) -------------------
+
+Write-Host ""
+Write-Host "[1/2] Rodando pytest para garantir preservacao @@ antes de tocar no e-TCM..." -ForegroundColor Cyan
+$pythonExe = Join-Path ".venv\Scripts" "python.exe"
+if (-not (Test-Path $pythonExe)) {
+    Write-Host "[ERRO] .venv nao encontrado em .venv\Scripts\python.exe. Rode python -m venv .venv e instale dependencias." -ForegroundColor Red
+    exit 1
+}
+& $pythonExe -m pytest tests -q
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERRO] pytest falhou. Abortando execucao no e-TCM para evitar regressao." -ForegroundColor Red
+    exit $LASTEXITCODE
+}
+
+# --------------------------- Execucao do fluxo ------------------------------
+
+Write-Host ""
+Write-Host "[2/2] Executando fluxo APO-PEN nos 5 processos..." -ForegroundColor Cyan
+Write-Host ("Processos: " + $env:PROCESSOS_LIST) -ForegroundColor Cyan
+Write-Host ""
+
+& $pythonExe .\src\main.py
+$rc = $LASTEXITCODE
+
+Write-Host ""
+if ($rc -eq 0) {
+    Write-Host "[OK] Fluxo executado." -ForegroundColor Green
+} else {
+    Write-Host "[FALHA] Fluxo retornou codigo $rc." -ForegroundColor Red
+}
+exit $rc
