@@ -40,6 +40,9 @@ OOXML_TEXT_PARTS: Tuple[str, ...] = (
     "word/footnotes.xml", "word/endnotes.xml", "word/comments.xml",
 )
 
+GENERIC_ENCAMINHA_TEXT = "Cópia da(s) peça(s) dos autos."
+DEFAULT_EUCLIDES_MARKER = r"\euclides"
+
 
 # ------------------------------ Excecoes ------------------------------------
 
@@ -51,6 +54,10 @@ class AtTokenViolation(RuntimeError):
       - @@token presente no modelo desaparece no DOCX gerado;
       - @@token recebe substituicao para valor real antes do upload.
     """
+
+
+class DocxValidationError(RuntimeError):
+    """Erro de validação do DOCX final antes do upload."""
 
 
 # ------------------------------ Estrutura -----------------------------------
@@ -146,6 +153,29 @@ def _iter_paragraph_texts(xml: str) -> Iterable[str]:
             yield joined
 
 
+def _strip_accents_for_compare(s: str) -> str:
+    import unicodedata
+
+    nfkd = unicodedata.normalize("NFKD", s or "")
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def _format_piece_number(value: int | str) -> str:
+    raw = str(value).strip()
+    m = re.search(r"\d+", raw)
+    if not m:
+        raise ValueError(f"Número de peça inválido: {value!r}")
+    n = int(m.group(0))
+    if n <= 0:
+        raise ValueError(f"Número de peça inválido: {value!r}")
+    return f"{n:02d}"
+
+
+def _marker_count_in_docx(docx_path: Path | str, marker: str) -> int:
+    text = "\n".join(extract_visible_text_from_docx(docx_path))
+    return text.count(marker)
+
+
 # ------------------------------ API publica ---------------------------------
 
 def extract_at_tokens_from_docx(path: Path | str) -> Set[str]:
@@ -174,6 +204,268 @@ def extract_at_tokens_from_docx(path: Path | str) -> Set[str]:
         for m in AT_TOKEN_RE.findall(xml):
             tokens.add(m)
     return tokens
+
+
+def extract_visible_text_from_docx(path: Path | str) -> List[str]:
+    """Retorna textos visíveis por parágrafo nas partes principais do OOXML."""
+    paragraphs: List[str] = []
+    for xml in _iter_ooxml_text_payload(Path(path)):
+        paragraphs.extend(_iter_paragraph_texts(xml))
+    return paragraphs
+
+
+def format_encaminha_from_piece_numbers(piece_numbers: list[int | str]) -> str:
+    """Formata a linha Encaminha com números ordinais das peças do processo.
+
+    Exemplos:
+      [3] -> "Cópia da peça 03 dos autos."
+      [3, 5] -> "Cópia das peças 03 e 05 dos autos."
+      [3, 5, 7] -> "Cópia das peças 03, 05 e 07 dos autos."
+    """
+    if not piece_numbers:
+        raise ValueError("Nenhum número de peça informado para Encaminha.")
+    nums: list[str] = []
+    for value in piece_numbers:
+        formatted = _format_piece_number(value)
+        if formatted not in nums:
+            nums.append(formatted)
+    if len(nums) == 1:
+        return f"Cópia da peça {nums[0]} dos autos."
+    if len(nums) == 2:
+        joined = " e ".join(nums)
+    else:
+        joined = ", ".join(nums[:-1]) + f" e {nums[-1]}"
+    return f"Cópia das peças {joined} dos autos."
+
+
+def assert_encaminha_has_piece_number(docx_path: Path | str) -> None:
+    """Falha se o DOCX mantiver Encaminha genérico ou sem peça numerada."""
+    text = "\n".join(extract_visible_text_from_docx(docx_path))
+    comparable = _strip_accents_for_compare(text).lower()
+    generic = _strip_accents_for_compare(GENERIC_ENCAMINHA_TEXT).lower()
+    if generic in comparable:
+        raise DocxValidationError(
+            f"Encaminha genérico encontrado em {Path(docx_path).name}: {GENERIC_ENCAMINHA_TEXT}"
+        )
+    if not re.search(r"c[oó]pia\s+d(?:a|as)\s+pe[cç]a(?:s)?\s+\d{2}\b", text, flags=re.I):
+        raise DocxValidationError(
+            f"Linha Encaminha sem referência a peça numerada em {Path(docx_path).name}."
+        )
+
+
+def set_encaminha_text_without_bold(docx_path: Path | str, encaminha_text: str) -> None:
+    """Atualiza o conteúdo de Encaminha e força esse conteúdo sem negrito.
+
+    O rótulo "Encaminha" pode manter a formatação original. O texto depois do
+    rótulo, por exemplo "Cópia da peça 03 dos autos.", recebe `bold=False`
+    explicitamente para não herdar negrito do rótulo no Word.
+    """
+    encaminha_text = (encaminha_text or "").strip()
+    if not encaminha_text:
+        raise ValueError("encaminha_text não pode ser vazio")
+
+    try:
+        from docx import Document  # type: ignore
+    except Exception as e:  # pragma: no cover - dependencia obrigatoria
+        raise RuntimeError(f"python-docx ausente; não foi possível editar Encaminha: {e}") from e
+
+    path = Path(docx_path)
+    doc = Document(str(path))
+
+    def rewrite_same_paragraph(paragraph) -> bool:
+        full_text = "".join(run.text for run in paragraph.runs) if paragraph.runs else paragraph.text
+        if not full_text:
+            return False
+        m = re.search(r"\bEncaminha\b", full_text, flags=re.I)
+        if not m:
+            return False
+        # Só mexe em parágrafos que contenham a linha genérica ou texto de peça.
+        tail = full_text[m.end():]
+        tail_cmp = _strip_accents_for_compare(tail).lower()
+        if (
+            "copia da(s) peca(s) dos autos" not in tail_cmp
+            and not re.search(r"copia\s+d(?:a|as)\s+peca(?:s)?\s+\d{2}", tail_cmp)
+            and encaminha_text not in full_text
+        ):
+            return False
+
+        label_text = full_text[:m.end()].rstrip()
+        label_bold = None
+        if paragraph.runs:
+            for run in paragraph.runs:
+                if run.text and "encaminha" in _strip_accents_for_compare(run.text).lower():
+                    label_bold = run.bold
+                    break
+        if not paragraph.runs:
+            paragraph.text = ""
+        else:
+            for run in paragraph.runs:
+                run.text = ""
+        label_run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
+        label_run.text = f"{label_text} "
+        if label_bold is not None:
+            label_run.bold = label_bold
+        content_run = paragraph.add_run(encaminha_text)
+        content_run.bold = False
+        return True
+
+    def rewrite_content_paragraph(paragraph) -> bool:
+        full_text = "".join(run.text for run in paragraph.runs) if paragraph.runs else paragraph.text
+        cmp = _strip_accents_for_compare(full_text or "").lower()
+        if (
+            "copia da(s) peca(s) dos autos" not in cmp
+            and not re.search(r"copia\s+d(?:a|as)\s+peca(?:s)?\s+\d{2}", cmp)
+        ):
+            return False
+        if not paragraph.runs:
+            paragraph.text = encaminha_text
+            for run in paragraph.runs:
+                run.bold = False
+            return True
+        paragraph.runs[0].text = encaminha_text
+        paragraph.runs[0].bold = False
+        for run in paragraph.runs[1:]:
+            run.text = ""
+            run.bold = False
+        return True
+
+    def process_paragraphs(paragraphs) -> bool:
+        changed = False
+        for idx, paragraph in enumerate(paragraphs):
+            if rewrite_same_paragraph(paragraph):
+                changed = True
+                continue
+            text_cmp = _strip_accents_for_compare(paragraph.text or "").strip().lower()
+            if text_cmp == "encaminha" and idx + 1 < len(paragraphs):
+                if rewrite_content_paragraph(paragraphs[idx + 1]):
+                    changed = True
+        return changed
+
+    def process_tables(tables) -> bool:
+        changed = False
+        for table in tables or []:
+            for row in table.rows:
+                for cell in row.cells:
+                    changed = process_paragraphs(cell.paragraphs) or changed
+                    changed = process_tables(getattr(cell, "tables", []) or []) or changed
+        return changed
+
+    changed = process_paragraphs(getattr(doc, "paragraphs", []))
+    changed = process_tables(getattr(doc, "tables", []) or []) or changed
+    for section in getattr(doc, "sections", []) or []:
+        try:
+            changed = process_paragraphs(section.header.paragraphs) or changed
+            changed = process_tables(getattr(section.header, "tables", []) or []) or changed
+            changed = process_paragraphs(section.footer.paragraphs) or changed
+            changed = process_tables(getattr(section.footer, "tables", []) or []) or changed
+        except Exception:
+            continue
+    if changed:
+        doc.save(str(path))
+
+
+def assert_encaminha_text_not_bold(docx_path: Path | str) -> None:
+    """Falha se o conteúdo numerado de Encaminha estiver em negrito direto."""
+    try:
+        from docx import Document  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(f"python-docx ausente; não foi possível validar Encaminha: {e}") from e
+
+    doc = Document(str(docx_path))
+    found = False
+
+    def check_paragraph(paragraph) -> None:
+        nonlocal found
+        full = "".join(run.text for run in paragraph.runs) if paragraph.runs else paragraph.text
+        cmp = _strip_accents_for_compare(full or "").lower()
+        if not re.search(r"copia\s+d(?:a|as)\s+peca(?:s)?\s+\d{2}", cmp):
+            return
+        found = True
+        after_label = cmp
+        if "encaminha" in after_label:
+            after_label = after_label.split("encaminha", 1)[1]
+        for run in paragraph.runs:
+            run_cmp = _strip_accents_for_compare(run.text or "").lower()
+            if not run_cmp.strip():
+                continue
+            # O rótulo pode ser negrito; o conteúdo da cópia não pode.
+            if "copia" in run_cmp or "peca" in run_cmp or re.search(r"\b\d{2}\b", run_cmp):
+                if run.bold is True:
+                    raise DocxValidationError(
+                        f"Conteúdo de Encaminha está em negrito em {Path(docx_path).name}."
+                    )
+
+    def walk(paragraphs, tables) -> None:
+        for paragraph in paragraphs or []:
+            check_paragraph(paragraph)
+        for table in tables or []:
+            for row in table.rows:
+                for cell in row.cells:
+                    walk(cell.paragraphs, getattr(cell, "tables", []) or [])
+
+    walk(getattr(doc, "paragraphs", []), getattr(doc, "tables", []) or [])
+    for section in getattr(doc, "sections", []) or []:
+        try:
+            walk(section.header.paragraphs, getattr(section.header, "tables", []) or [])
+            walk(section.footer.paragraphs, getattr(section.footer, "tables", []) or [])
+        except Exception:
+            continue
+    if not found:
+        raise DocxValidationError(
+            f"Conteúdo numerado de Encaminha não encontrado em {Path(docx_path).name}."
+        )
+
+
+def add_euclides_marker_to_docx(docx_path: Path | str, marker: str = DEFAULT_EUCLIDES_MARKER) -> None:
+    """Insere o marcador literal no fim do corpo do DOCX, sem duplicar."""
+    marker = marker or DEFAULT_EUCLIDES_MARKER
+    path = Path(docx_path)
+    count = _marker_count_in_docx(path, marker)
+    if count == 1:
+        return
+    if count > 1:
+        raise DocxValidationError(
+            f"Marcador {marker!r} duplicado em {path.name}: {count} ocorrências."
+        )
+
+    try:
+        from docx import Document  # type: ignore
+    except Exception as e:  # pragma: no cover - dependencia obrigatoria
+        raise RuntimeError(f"python-docx ausente; não foi possível inserir {marker!r}: {e}") from e
+
+    doc = Document(str(path))
+    paragraphs = list(getattr(doc, "paragraphs", []) or [])
+    last_visible = None
+    for paragraph in reversed(paragraphs):
+        if (paragraph.text or "").strip():
+            last_visible = paragraph
+            break
+
+    if last_visible is not None and (last_visible.text or "").strip() == "/":
+        if last_visible.runs:
+            last_visible.runs[0].text = marker
+            for run in last_visible.runs[1:]:
+                run.text = ""
+        else:
+            last_visible.text = marker
+    else:
+        doc.add_paragraph(marker)
+
+    doc.save(str(path))
+
+
+def assert_euclides_marker_present_once(
+    docx_path: Path | str,
+    marker: str = DEFAULT_EUCLIDES_MARKER,
+) -> None:
+    """Falha se o marcador estiver ausente ou duplicado."""
+    marker = marker or DEFAULT_EUCLIDES_MARKER
+    count = _marker_count_in_docx(docx_path, marker)
+    if count != 1:
+        raise DocxValidationError(
+            f"Marcador {marker!r} deve aparecer exatamente uma vez em "
+            f"{Path(docx_path).name}; encontrado={count}."
+        )
 
 
 def assert_at_tokens_preserved(template_path: Path | str,

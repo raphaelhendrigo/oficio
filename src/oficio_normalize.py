@@ -45,6 +45,26 @@ def _tokens(s: str) -> set[str]:
     return set(_norm_compare(s).split())
 
 
+def decode_zip_unicode_escape_name(name: str) -> str:
+    """Converte escapes de nomes vindos de ZIP no formato ``#U00e7``.
+
+    Alguns modelos chegaram do ZIP com nomes como ``Sa#U00fade`` e
+    ``Educa#U00e7#U00e3o``. A comparacao por secretaria deve operar sobre o
+    nome humano real, sem depender de os arquivos ja terem sido renomeados.
+    """
+    if not name:
+        return ""
+
+    def repl(match: re.Match[str]) -> str:
+        codepoint = match.group(1)
+        try:
+            return chr(int(codepoint, 16))
+        except ValueError:
+            return match.group(0)
+
+    return re.sub(r"#U([0-9A-Fa-f]{4})", repl, str(name))
+
+
 # --------------------------- Descricao da comunicacao -----------------------
 
 # Saidas oficiais aceitas pelo e-TCM e exigidas pelo brief.

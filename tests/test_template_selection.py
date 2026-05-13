@@ -64,6 +64,7 @@ def test_select_saude_template(project_root: Path) -> None:
     path = _select(txt)
     assert path is not None
     assert "Sa" in path.name, f"Esperava modelo Saude, veio: {path.name}"
+    assert "Educa" not in path.name, f"Modelo Saúde nunca deve retornar Educação: {path.name}"
 
 
 def test_select_geral_template_when_no_secretaria(project_root: Path) -> None:

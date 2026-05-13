@@ -57,7 +57,7 @@ Possíveis causas (em ordem de probabilidade):
 
 ## Pendências e riscos abertos
 
-1. **Senha `rhg#1004` queimada (PROD)** — segue exposta no chat e nos orphan refs do GitHub (~30 dias até GC). Usuário optou explicitamente por não trocar em 2026-05-13. Risco residual aceito.
+1. **Credencial de PROD exposta anteriormente** — a senha literal foi removida deste relatório e não deve constar em arquivos, logs ou commits. Se houver suspeita de exposição externa, a troca da senha deve ser tratada fora do repositório.
 2. **Localização real dos 5 processos hoje** — não confirmada. Pode ser que estejam:
    - já em "Em assinatura" (caso de TC/008084/2023, comprovado)
    - em fila diferente após tramitação manual feita por outro operador

@@ -18,11 +18,8 @@
 #   - Se desconfiar que a senha vazou, troque-a imediatamente no e-TCM.
 
 # --- Usuario -----------------------------------------------------------------
-$Username = Read-Host "Login do e-TCM (matricula)"
-if ([string]::IsNullOrWhiteSpace($Username)) {
-    Write-Host "Login nao pode ser vazio. Abortando." -ForegroundColor Red
-    exit 1
-}
+$Username = "20386"
+[Environment]::SetEnvironmentVariable("ETCM_USERNAME", $Username, "User")
 
 # --- Senha (lida mascarada) --------------------------------------------------
 $secure = Read-Host "Senha do e-TCM" -AsSecureString
@@ -39,7 +36,7 @@ try {
         exit 1
     }
 
-    # Nomes oficiais lidos pelo config.py
+    # Nomes oficiais lidos pelo robo
     [Environment]::SetEnvironmentVariable("ETCM_USERNAME", $Username, "User")
     [Environment]::SetEnvironmentVariable("ETCM_PASSWORD", $plain,    "User")
 
@@ -49,11 +46,9 @@ try {
     [Environment]::SetEnvironmentVariable("ETCM_PASS",  $plain,    "User")
     [Environment]::SetEnvironmentVariable("ETCM_SENHA", $plain,    "User")
 
-    # Sanidade: nunca imprimir a senha, so confirmar tamanho.
-    $checkPass = [Environment]::GetEnvironmentVariable("ETCM_PASSWORD", "User")
     Write-Host ""
     Write-Host "[OK] ETCM_USERNAME configurado: $Username" -ForegroundColor Green
-    Write-Host "[OK] ETCM_PASSWORD configurado (length=$($checkPass.Length))" -ForegroundColor Green
+    Write-Host "[OK] ETCM_PASSWORD configurado." -ForegroundColor Green
     Write-Host "[OK] Aliases ETCM_USER, ETCM_LOGIN, ETCM_PASS, ETCM_SENHA configurados." -ForegroundColor Green
     Write-Host ""
     Write-Host "IMPORTANTE: reabra o PowerShell / VS Code antes de rodar o robo." -ForegroundColor Yellow

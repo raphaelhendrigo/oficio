@@ -15,7 +15,13 @@ import pytest
 # main.py depende de pacotes do projeto (.dotenv, playwright) — importamos
 # tardio para que conftest.py ja tenha inserido src/ em sys.path.
 import main as fluxo_atos  # type: ignore  # noqa: E402
-from docx_utils import extract_at_tokens_from_docx  # type: ignore  # noqa: E402
+from docx_utils import (  # type: ignore  # noqa: E402
+    assert_encaminha_has_piece_number,
+    assert_encaminha_text_not_bold,
+    assert_euclides_marker_present_once,
+    extract_at_tokens_from_docx,
+    extract_visible_text_from_docx,
+)
 
 
 def _gen_into(tmp_path: Path, template: Path, extra: dict | None = None) -> Path | None:
@@ -25,6 +31,13 @@ def _gen_into(tmp_path: Path, template: Path, extra: dict | None = None) -> Path
         extra=extra,
         template_path=template,
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_production_docx_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OFICIO_REQUIRE_PIECE_NUMBER_IN_ENCAMINHA", raising=False)
+    monkeypatch.delenv("OFICIO_ADD_EUCLIDES_MARKER", raising=False)
+    monkeypatch.delenv("OFICIO_EUCLIDES_MARKER", raising=False)
 
 
 def test_generate_from_utap_geral_preserves_at_tokens(modelo_utap_geral: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -97,3 +110,32 @@ def test_generate_blocks_when_violation_detected(modelo_utap_geral: Path, tmp_pa
     monkeypatch.setenv("OFICIO_PRESERVE_AT_TOKENS", "false")
     out2 = _gen_into(tmp_path, modelo_utap_geral, extra=None)
     assert out2 is not None
+
+
+def test_generate_final_docx_replaces_encaminha_and_adds_euclides(
+    modelo_utap_geral: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    template_text = "\n".join(extract_visible_text_from_docx(modelo_utap_geral))
+    if "Cópia da(s) peça(s) dos autos" not in template_text:
+        pytest.skip("Modelo de teste não contém a linha genérica de Encaminha")
+
+    monkeypatch.setenv("OFICIO_PRESERVE_AT_TOKENS", "true")
+    monkeypatch.setenv("OFICIO_REQUIRE_PIECE_NUMBER_IN_ENCAMINHA", "true")
+    monkeypatch.setenv("OFICIO_ADD_EUCLIDES_MARKER", "true")
+    monkeypatch.setenv("OFICIO_EUCLIDES_MARKER", r"\euclides")
+    out = _gen_into(
+        tmp_path,
+        modelo_utap_geral,
+        extra={
+            "Cópia da(s) peça(s) dos autos.": "Cópia da peça 03 dos autos.",
+            "{{ENCAMINHA}}": "Cópia da peça 03 dos autos.",
+        },
+    )
+    assert out is not None
+    assert_encaminha_has_piece_number(out)
+    assert_encaminha_text_not_bold(out)
+    assert_euclides_marker_present_once(out)
+    final_text = "\n".join(extract_visible_text_from_docx(out))
+    assert "Cópia da(s) peça(s) dos autos" not in final_text

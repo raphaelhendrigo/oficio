@@ -1,6 +1,7 @@
 # Python / venv
 .venv/
 __pycache__/
+.pytest_cache/
 *.pyc
 
 # Outputs e artefatos
@@ -29,6 +30,7 @@ _snippet.txt
 _tmp.txt
 _all.txt
 _zip_analysis/
+downloads/
 
 # Backup do filter-repo (contem historico antigo, pode conter segredos)
 backup_pre_filter_repo/
@@ -36,3 +38,4 @@ backup_pre_filter_repo/
 # Outros
 docs/video_frames/
 video_silvana.mp4
+.claude/

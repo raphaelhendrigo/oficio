@@ -45,7 +45,27 @@ Requer Tesseract instalado e no PATH.
 
 Edite `docs/steps.yaml` para ajustar seletores e confirmar campos antes de rodar em producao.
 
-## D) Rodar o bot
+## D) Entrypoint oficial APO-PEN / Ofícios SSG
+
+O fluxo oficial para geração, comunicação processual, anexação, conclusão,
+assinatura e tramitação de Ofícios SSG é `src/main.py`.
+
+Para a rodada controlada dos cinco processos em produção, use:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_5_processos_PROD_RECREATE.ps1
+```
+
+Antes disso, configure credenciais fora do repositório:
+```powershell
+Copy-Item scripts\set_local_user_env.template.ps1 scripts\set_local_user_env.ps1
+powershell -ExecutionPolicy Bypass -File scripts\set_local_user_env.ps1
+```
+
+Nunca coloque senha em `.env`, README, logs, scripts versionados ou commits.
+O robô lê `ETCM_USERNAME`/`ETCM_PASSWORD` e também aceita os aliases
+`ETCM_LOGIN`, `ETCM_SENHA`, `ETCM_USER`, `ETCM_PASS`.
+
+## E) Fluxo declarativo antigo (`src/bot.py`)
 ```powershell
 # Execucao normal
 .\.venv\Scripts\python src\bot.py --mode run
@@ -57,8 +77,8 @@ Edite `docs/steps.yaml` para ajustar seletores e confirmar campos antes de rodar
 .\.venv\Scripts\python src\bot.py --mode dry-run
 ```
 
-### Variaveis de ambiente (.env)
-Veja `.env.example` para um modelo completo. Principais:
+### Variaveis de ambiente
+Veja `.env.example` para um modelo sem segredos. Principais:
 - `ETCM_USER`, `ETCM_PASS`
 - `BASE_URL`
 - `DOWNLOAD_DIR`
@@ -71,13 +91,13 @@ Veja `.env.example` para um modelo completo. Principais:
 - `artifacts/html/`: HTML da pagina em caso de erro
 - `logs/`: logs da execucao
 
-## Scripts legados
-Existe automacao anterior em `src/main.py` e `src/etcm_oficios_apo_pen.py`.
-O fluxo atual usa `src/bot.py` + `docs/steps.yaml`.
+## Scripts auxiliares
+`src/bot.py` + `docs/steps.yaml` permanecem como fluxo declarativo antigo.
+`src/etcm_oficios_apo_pen.py` permanece para compatibilidade/histórico.
 
-## Automacao legada (src/main.py)
+## Automacao APO-PEN (`src/main.py`)
 Fluxo Playwright que faz login no e-TCM, abre processos, baixa PDF, gera DOCX e tenta anexar no portal.
-Observacao de credenciais: use `.env` (modelo em `.env.example`) ou variaveis de ambiente. Nunca versione senhas.
+Observacao de credenciais: use variaveis de ambiente de usuário. Nunca versione senhas.
 
 ### Instalar e executar (legado)
 ```powershell
@@ -86,10 +106,10 @@ python -m venv .venv
 .\.venv\Scripts\pip install -r requirements.txt
 # 2) Instalar os navegadores do Playwright
 .\.venv\Scripts\python -m playwright install
-# 3) Opcional: crie seu .env a partir do modelo
-Copy-Item .env.example .env
-# 4) Edite .env com usuario e senha (ou defina por variavel de ambiente)
-# 5) Rodar
+# 3) Configure credenciais fora do repo
+Copy-Item scripts\set_local_user_env.template.ps1 scripts\set_local_user_env.ps1
+powershell -ExecutionPolicy Bypass -File scripts\set_local_user_env.ps1
+# 4) Reabra o PowerShell/VS Code e rode
 .\.venv\Scripts\python .\src\main.py
 ```
 
@@ -98,7 +118,6 @@ Copy-Item .env.example .env
 python -m venv .venv; `
 .\.venv\Scripts\pip install -r requirements.txt; `
 .\.venv\Scripts\python -m playwright install; `
-$env:ETCM_USERNAME="<seu_usuario>"; $env:ETCM_PASSWORD="<sua_senha>"; `
 .\.venv\Scripts\python .\src\main.py
 ```
 
@@ -114,7 +133,10 @@ $env:ETCM_USERNAME="<seu_usuario>"; $env:ETCM_PASSWORD="<sua_senha>"; `
 - `PROCESS_ALL` (true) usa todos os processos exportados da planilha do grid
 - `MAX_PROCESSOS` limita a quantidade em lote
 
-Observacao sobre modelos: python-docx nao abre arquivos .dotx (template do Word). Se seus modelos estao em "Modelos Oficios" como .dotx, salve uma copia em .docx e aponte via `OFICIO_TEMPLATES_DIR`/`OFICIO_TEMPLATE`. Quando nenhum .docx for encontrado, o script gera um oficio simples (fallback) preenchendo os campos extraidos do PDF.
+Observacao sobre modelos: modelos `.dotx` sao convertidos para `.docx` por cópia
+OOXML, preservando layout e todos os campos `@@`. Com
+`OFICIO_TEMPLATE_MODE=auto`, a seleção usa tipo x secretaria nas pastas
+`modelos_utap`, `modelos_dilacao`, `modelos_reiteracao`, `modelos_juizo`.
 
 ### Caminho de modelos (exemplo)
 `C:\Users\20386\OneDrive - tcm.sp.gov.br\Oficios\oficio_automation\Modelos Oficios`

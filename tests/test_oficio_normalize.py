@@ -12,6 +12,7 @@ from oficio_normalize import (  # type: ignore  # noqa: E402
     SECRETARIA_GERAL,
     SECRETARIA_SAUDE,
     SIGNER_REQUIRED_TOKENS,
+    decode_zip_unicode_escape_name,
     find_signer_in_list,
     normalize_descricao_comunicacao,
     normalize_secretaria_label,
@@ -68,6 +69,20 @@ def test_normalize_descricao_rejects_empty() -> None:
         normalize_descricao_comunicacao("")
     with pytest.raises(ValueError):
         normalize_descricao_comunicacao("   ")
+
+
+@pytest.mark.parametrize(
+    "entrada,saida",
+    [
+        ("Sa#U00fade", "Saúde"),
+        ("Educa#U00e7#U00e3o", "Educação"),
+        ("Provid#U00eancias", "Providências"),
+        ("Dila#U00e7#U00e3o", "Dilação"),
+        ("Reitera#U00e7#U00e3o", "Reiteração"),
+    ],
+)
+def test_decode_zip_unicode_escape_name(entrada: str, saida: str) -> None:
+    assert decode_zip_unicode_escape_name(entrada) == saida
 
 
 def test_normalize_descricao_outputs_have_proper_diacritics() -> None:
