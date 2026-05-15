@@ -4,7 +4,7 @@ import sys
 import time
 import unicodedata
 from datetime import date, datetime
-from typing import Optional
+from typing import Optional, Tuple
 from pathlib import Path
 from urllib.parse import quote, urljoin
 
@@ -1486,16 +1486,39 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
         form_container = exact_target
     if exact_form:
         destinatario = (dados.get("destinatario") or secretaria or "").strip()
-        referencia = (dados.get("referencia") or desc_custom or processo).strip()
-        # Marcador do robo Euclides na propria Referencia da Comunicacao
-        # Processual. Critico para o cleanup conseguir identificar as
-        # comunicacoes que ele proprio criou em rodadas anteriores (sem
-        # marcador o cleanup deixa intacto, para nao excluir comunicacao
-        # humana). 'euclides' e o token monitorado por
-        # _is_robot_created_comunicacao_text.
-        if "euclides" not in referencia.lower():
+        # Referência: por brief, deve ser "gerado automaticamente" (ou em branco,
+        # se o operador escolher esse padrão). NUNCA pode ser
+        # "conhecimento/providências" — esse é o valor da DESCRIÇÃO. Mantemos
+        # "gerado automaticamente" como default porque também funciona como
+        # marcador para o cleanup conseguir identificar comunicações do robo.
+        env_ref = (os.getenv("COMUNICACAO_REFERENCIA") or "").strip()
+        ref_default = "gerado automaticamente"
+        if dados.get("referencia") is not None:
+            referencia = str(dados.get("referencia") or "").strip()
+        elif env_ref:
+            referencia = env_ref
+        else:
+            referencia = ref_default
+        # Defesa: se alguém setar referencia="conhecimento/providências" via
+        # env ou dados, sobrescrevemos para o padrão seguro — o brief proibe
+        # esse valor no campo Referência.
+        ref_cmp = normalize(referencia).lower().replace(" ", "")
+        if "conhecimento" in ref_cmp and "providencia" in ref_cmp:
+            print(
+                f"AVISO: referência inválida {referencia!r} (= descrição) "
+                f"foi sobrescrita por {ref_default!r}."
+            )
+            referencia = ref_default
+        # Sinalização do robo Euclides para o cleanup futuro identificar com
+        # segurança as comunicações que ele criou (sem isso, o cleanup deixa
+        # intacto para não apagar trabalho humano). Mantemos a string visual
+        # limpa: "gerado automaticamente" já é marcador suficiente, mas, se
+        # alguém customizar a referência, anexamos o sufixo do Euclides.
+        if referencia and "gerado automaticamente" not in normalize(referencia).lower() and "euclides" not in referencia.lower():
             referencia = f"{referencia} - euclides".strip(" -")
-        status_entrega = (dados.get("status") or os.getenv("STATUS_ENTREGA") or "Urgente").strip()
+        # Status de entrega: brief exige NORMAL (não URGENTE). Mantém env
+        # STATUS_ENTREGA como override controlado pelo operador.
+        status_entrega = (dados.get("status") or os.getenv("STATUS_ENTREGA") or "Normal").strip()
         try:
             # Aguarda Loading Panel do popup sumir antes de tentar preencher.
             _wait_dx_loading_panel_done(form_container, "ppcNoificacao", timeout_ms=90000)
@@ -2073,6 +2096,130 @@ def open_gerenciador_atos_from_grid(context, page, processo: str):
         except Exception:
             continue
     return popup_page
+
+
+def _get_robot_comm_ntf_key(context, page, processo: str) -> Optional[Tuple[str, str, str]]:
+    """Le os parametros (cod_notificacao, pt, ar) necessarios para abrir o
+    Gerenciador de Atos VINCULADO a comunicacao processual recem-criada.
+
+    Brief 2026-05-15: o ato precisa ser anexado dentro da tela de comunicacao
+    processual (coluna 'Anexar Atos' do grid gvNotificacao). Em vez de clicar
+    o icone (que abre popUpOtherWindow iframe), construimos diretamente a URL
+    `/paginas/ato/GerenciaAto.aspx?ntf=<cod_notif>&pt=<pt>&ar=<ar>&pc=` —
+    eh exatamente o que o `doShowPopup` faria. Com o parametro `ntf` na URL,
+    o e-TCM vincula o ato criado a comunicacao no banco de dados.
+
+    Retorna (cod_notificacao, pt, ar) ou None se nao conseguiu localizar.
+    """
+    try:
+        caixa = open_caixa_correio_from_grid(context, page, processo)
+    except Exception:
+        caixa = None
+    if not caixa:
+        return None
+    try:
+        # Extrai pt e ar da URL da caixa de correio
+        caixa_url = caixa.url or ""
+        pt_match = re.search(r"[?&]pt=([^&]+)", caixa_url)
+        ar_match = re.search(r"[?&]a=([^&]+)", caixa_url)
+        if not pt_match or not ar_match:
+            print(f"  [anexo-comm] URL da caixa nao tem pt/a: {caixa_url[:120]}")
+            return None
+        pt = pt_match.group(1)
+        ar = ar_match.group(1)
+
+        time.sleep(1)
+        rows_sel = (
+            "#gvNotificacoes_DXMainTable tr[id*='DXDataRow'], "
+            "table[id*='gvNotif'] tr[id*='DXDataRow']"
+        )
+        rows = caixa.locator(rows_sel)
+        try:
+            n = rows.count()
+        except Exception:
+            n = 0
+        for i in range(n):
+            try:
+                row_text = rows.nth(i).inner_text(timeout=1500)
+            except Exception:
+                row_text = ""
+            if not _is_robot_created_comunicacao_text(row_text):
+                continue
+            try:
+                key = caixa.evaluate(
+                    r"""(idx) => {
+                        try {
+                            const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+                            const grid = (coll && coll.GetByName) ? coll.GetByName('gvNotificacao') : window.gvNotificacao;
+                            if (grid && grid.GetRowKey) {
+                                const k = grid.GetRowKey(idx);
+                                return (k == null) ? null : String(k);
+                            }
+                        } catch(e) {}
+                        return null;
+                    }""",
+                    i,
+                )
+            except Exception:
+                key = None
+            if key:
+                print(f"  [anexo-comm] cod_notificacao={key} (linha {i+1}) -> usaremos ntf={key}")
+                return (str(key), pt, ar)
+        print("  [anexo-comm] nenhuma row robot-created localizada para obter ntf")
+        return None
+    finally:
+        try:
+            if not caixa.is_closed():
+                caixa.close()
+        except Exception:
+            pass
+
+
+def attach_docx_inside_comunicacao(context, page, processo: str, docx_path: Path) -> bool:
+    """Anexa o DOCX como Of'icio SSG VINCULADO a comunicacao processual.
+
+    Difere de `attach_docx_via_gerenciador_atos` porque abre o Gerenciador
+    de Atos com o parametro `?ntf=<cod_notificacao>` — exatamente como faz
+    o icone 'Anexar Atos' (coluna do grid gvNotificacao). Resultado: o ato
+    criado fica vinculado a comm no banco e aparece na coluna 'Atos' da
+    mesma linha do grid.
+
+    Se nao conseguir obter o cod_notificacao (cleanup falhou em deixar uma
+    comm robot-marker para esse processo), cai para o fluxo classico
+    `attach_docx_via_gerenciador_atos` (ato standalone, sem ntf).
+    """
+    info = _get_robot_comm_ntf_key(context, page, processo)
+    if not info:
+        print(f"Aviso: {processo}: sem cod_notificacao identificavel; fallback para anexo standalone.")
+        return attach_docx_via_gerenciador_atos(context, page, processo, docx_path)
+
+    ntf, pt, ar = info
+    base_root = page.url.split("/paginas/")[0] if "/paginas/" in (page.url or "") else "https://etcm.tcm.sp.gov.br"
+    gerencia_url = f"{base_root}/paginas/ato/GerenciaAto.aspx?ntf={ntf}&pt={pt}&ar={ar}&pc="
+
+    print(f"Processo {processo}: anexando DOCX VINCULADO a comm ntf={ntf} -> {gerencia_url}")
+    try:
+        new_page = context.new_page()
+        try:
+            new_page.goto(gerencia_url, wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            print(f"  [anexo-comm] falha ao navegar GerenciaAto?ntf=: {e}; fallback standalone.")
+            try:
+                if not new_page.is_closed():
+                    new_page.close()
+            except Exception:
+                pass
+            return attach_docx_via_gerenciador_atos(context, page, processo, docx_path)
+        try:
+            new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        attached = attach_docx_via_gerenciador_atos(context, new_page, processo, docx_path)
+        print(f"  [anexo-comm] resultado anexo vinculado: {'OK' if attached else 'falhou'}")
+        return attached
+    except Exception as e:
+        print(f"Aviso: falha no anexo vinculado em {processo}: {e}; fallback standalone.")
+        return attach_docx_via_gerenciador_atos(context, page, processo, docx_path)
 
 
 def attach_docx_via_gerenciador_atos(context, page, processo: str, docx_path: Path) -> bool:
@@ -3339,7 +3486,16 @@ def _validate_oficio_at_tokens(template: Optional[Path], generated: Path) -> Opt
     preserve = env_bool("OFICIO_PRESERVE_AT_TOKENS", True)
     marker_enabled = env_bool("OFICIO_ADD_EUCLIDES_MARKER", False)
     require_piece = env_bool("OFICIO_REQUIRE_PIECE_NUMBER_IN_ENCAMINHA", False)
-    marker = os.getenv("OFICIO_EUCLIDES_MARKER", r"\euclides")
+    # A barra correta é "/" (default sincronizado com docx_utils.DEFAULT_EUCLIDES_MARKER).
+    # Coerção defensiva: rodadas antigas usaram "\euclides" — se o env vier com
+    # esse valor herdado, convertemos para "/euclides" e logamos o aviso.
+    marker = (os.getenv("OFICIO_EUCLIDES_MARKER") or "/euclides").strip() or "/euclides"
+    if marker.lower() in (r"\euclides", "\\euclides"):
+        print(
+            f"AVISO: OFICIO_EUCLIDES_MARKER recebeu valor antigo {marker!r}; "
+            "corrigindo para '/euclides' conforme brief."
+        )
+        marker = "/euclides"
 
     try:
         if marker_enabled:
@@ -4679,8 +4835,26 @@ def is_pending_signature_status(status_text: str) -> bool:
 
 
 def _is_robot_created_comunicacao_text(row_text: str) -> bool:
-    """Heurística conservadora para comunicação criada pelo robô Euclides."""
+    """Heurística conservadora para comunicação criada pelo robô Euclides.
+
+    A identificação ocorre por dois caminhos disjuntos:
+
+    1) Marcadores explícitos modernos ('euclides', 'gerado automaticamente',
+       'oficio <tipo> - modelo'): qualquer um destes em qualquer coluna basta.
+
+    2) Fingerprint da rodada bugada de 2026-05-13 (commit pré-`18e6177`):
+       a Referência ficou idêntica à Descrição ('conhecimento/providências')
+       E o status veio 'Urgente' E o prazo veio '30 dias'. Esse conjunto não
+       é produzido manualmente — um servidor que monta a comunicação à mão
+       NÃO duplica 'conhecimento/providências' na Referência e raramente
+       combina Urgente+30 ao mesmo tempo no fluxo UTAP. Por isso usamos como
+       assinatura defensiva para limpar comunicações antigas sem marcador.
+
+    Critério de segurança: na dúvida, retorna False (caller mantém intacto).
+    """
     text = normalize(row_text or "").lower()
+    if not text:
+        return False
     robot_markers = (
         "euclides",
         "gerado automaticamente",
@@ -4690,7 +4864,23 @@ def _is_robot_created_comunicacao_text(row_text: str) -> bool:
         "oficio reiteracao - modelo",
         "oficio juizo - modelo",
     )
-    return any(marker in text for marker in robot_markers)
+    if any(marker in text for marker in robot_markers):
+        return True
+
+    # Fingerprint da rodada bugada: conhecimento/providencias aparece >=2x
+    # (descricao + referencia repetidas) e o status veio Urgente.
+    occorrencias_conhecimento = text.count("conhecimento") + text.count("conhec/")
+    occorrencias_providencias = text.count("providencia")
+    has_urgente = "urgente" in text
+    has_30_dias = bool(re.search(r"\b30\s*dias\b", text)) or bool(re.search(r"\b30\b.*?prazo", text))
+    if (
+        occorrencias_conhecimento >= 2
+        and occorrencias_providencias >= 2
+        and has_urgente
+        and has_30_dias
+    ):
+        return True
+    return False
 
 
 def destructive_cleanup_authorized(
@@ -4931,13 +5121,36 @@ def delete_comunicacao_processual(context, page, processo: str) -> tuple[bool, l
     Pre-condicao: _can_safe_delete_drafts() autoriza.
     Nao toca em comunicacao cuja linha mostre status terminal ja respondido.
 
+    Modo agressivo (`FORCE_DELETE_ALL_COMUNICACOES_AUTHORIZED=true`):
+      Para processos listados em `ONLY_PROCESSOS_AUTHORIZED` em ambiente PROD,
+      deleta TODAS as linhas (exceto status terminal/respondida) sem exigir
+      marcador de robô. Necessário porque o `inner_text` do grid não inclui
+      as colunas Descrição/Referência/Prazo, então o fingerprint fica cego
+      às comunicações antigas do Euclides. O brief de 2026-05-14 autoriza
+      explicitamente: "PRECISA EXISTIR APENAS UMA COMUNICACAO PROCESSUAL EM
+      CADA UM DESSES CINCO PROCESSOS".
+
     Retorna (alguma_exclusao_feita, lista_de_acoes_tomadas).
     """
     ok, reason = _cleanup_guard_for_process(processo, "FORCE_RECREATE_COMUNICACAO")
     if not ok:
         return False, [f"bloqueado: {reason}"]
 
+    # Decide o modo: agressivo (todas) vs. conservador (só robot-marker).
+    aggressive = False
+    if env_bool("FORCE_DELETE_ALL_COMUNICACOES_AUTHORIZED", False):
+        authorized = _parse_processos_env(os.getenv("ONLY_PROCESSOS_AUTHORIZED"))
+        env_norm = normalize((os.getenv("ENVIRONMENT") or "").strip()).lower()
+        if (processo or "").strip().upper() in authorized and env_norm in _PROD_ENVIRONMENTS:
+            aggressive = True
+
     acoes: list[str] = []
+    if aggressive:
+        acoes.append(
+            "modo AGRESSIVO ativo (FORCE_DELETE_ALL_COMUNICACOES_AUTHORIZED=true + "
+            "processo autorizado): vai tentar deletar TODAS as comunicacoes nao-terminais."
+        )
+
     try:
         caixa = open_caixa_correio_from_grid(context, page, processo)
     except Exception:
@@ -4963,26 +5176,76 @@ def delete_comunicacao_processual(context, page, processo: str) -> tuple[bool, l
             return False, acoes
 
         any_deleted = False
-        # Loop ate nao haver mais linhas; sempre pega a primeira porque o
-        # grid re-renderiza apos cada exclusao.
-        for it in range(1, count + 2):
+        skipped_indices: set[int] = set()
+        # No-progress detection: se a contagem total nao diminuir apos N
+        # tentativas seguidas, abortamos. Isso protege contra o caso em que o
+        # e-TCM aceita o click em Excluir mas rejeita silenciosamente a acao
+        # (ex.: comms em status 'Enviado' que requerem permissao admin).
+        last_count = -1
+        same_count_streak = 0
+        NO_PROGRESS_LIMIT = 3
+        # Loop ate nao haver mais linhas; em modo conservador, pega a primeira;
+        # em modo agressivo, varre todas e pula as que ja foram marcadas como
+        # "sem acao possivel" para nao entrar em loop infinito.
+        max_iter = max(count + 2, 20)
+        for it in range(1, max_iter):
             try:
                 cur_count = rows.count()
             except Exception:
                 cur_count = 0
             if cur_count == 0:
                 break
-            row = rows.nth(0)
+            # No-progress: se a contagem nao muda apos NO_PROGRESS_LIMIT clicks
+            # de Excluir, o e-TCM esta rejeitando silenciosamente. Aborta para
+            # nao entrar em loop infinito (200+ clicks na mesma linha).
+            if cur_count == last_count:
+                same_count_streak += 1
+            else:
+                same_count_streak = 0
+            last_count = cur_count
+            if same_count_streak >= NO_PROGRESS_LIMIT:
+                acoes.append(
+                    f"t{it}: ABORTANDO - {same_count_streak} tentativas seguidas sem "
+                    f"diminuir contagem ({cur_count} linhas). e-TCM provavelmente "
+                    "rejeita Excluir em status 'Enviado'. Necessario apagar manualmente."
+                )
+                break
+            target_idx = None
+            for idx in range(cur_count):
+                if idx in skipped_indices:
+                    continue
+                target_idx = idx
+                break
+            if target_idx is None:
+                acoes.append(f"t{it}: todas as {cur_count} linhas restantes ja marcadas como sem acao")
+                break
+            row = rows.nth(target_idx)
             try:
                 row_text = normalize(row.inner_text(timeout=1500)).lower()
             except Exception:
                 row_text = ""
             if re.search(r"\brespondid[oa]\b", row_text) or is_terminal_final_status(row_text):
-                acoes.append(f"linha {it}: status terminal '{row_text[:80]}' — NAO TOCAR")
-                break
-            if not _is_robot_created_comunicacao_text(row_text):
-                acoes.append(f"linha {it}: sem marcador de robô; NAO TOCAR (row='{row_text[:80]}')")
-                break
+                acoes.append(f"t{it} linha idx={target_idx}: status terminal '{row_text[:80]}' — NAO TOCAR")
+                skipped_indices.add(target_idx)
+                # Sempre pula linhas terminais e continua procurando outras.
+                # (Antes: em modo conservador parava — quebrava o cleanup quando
+                # a comm robot-created estava em uma linha posterior.)
+                continue
+            if not aggressive and not _is_robot_created_comunicacao_text(row_text):
+                acoes.append(f"linha t{it} idx={target_idx}: sem marcador de robô; NAO TOCAR (row='{row_text[:80]}')")
+                skipped_indices.add(target_idx)
+                # Brief 2026-05-14: comunicacoes humanas podem coexistir com a do
+                # robo. Pulamos a linha humana e continuamos procurando uma
+                # linha com marcador robot-created mais adiante no grid.
+                continue
+            if aggressive:
+                acoes.append(
+                    f"t{it} linha idx={target_idx}: aggressive delete -> '{row_text[:120]}'"
+                )
+            else:
+                acoes.append(
+                    f"t{it} linha idx={target_idx}: robot-marker -> delete '{row_text[:120]}'"
+                )
 
             action_selectors = [
                 "img[title*='Cancelar' i]",
@@ -5019,9 +5282,16 @@ def delete_comunicacao_processual(context, page, processo: str) -> tuple[bool, l
                 except Exception:
                     continue
             if not acted:
-                acoes.append(f"linha {it}: acao cancelar/excluir nao encontrada")
+                acoes.append(f"linha {it} idx={target_idx}: acao cancelar/excluir nao encontrada")
+                if aggressive:
+                    # Em modo agressivo, marca a linha como "sem ação" e tenta outras.
+                    skipped_indices.add(target_idx)
+                    continue
                 break
             time.sleep(2)
+            # Apos delete bem-sucedido, o grid re-renderiza; limpa skipped_indices
+            # porque os indices das linhas restantes podem ter mudado.
+            skipped_indices = set()
 
         return any_deleted, acoes
     finally:
@@ -5117,22 +5387,106 @@ def delete_all_old_oficio_ssg_for_process(context, page, processo: str) -> tuple
 
 
 def delete_all_comunicacoes_processuais_for_process(context, page, processo: str) -> tuple[bool, list[str]]:
-    """Exclui/cancela comunicações processuais abertas antes da nova correta."""
+    """Exclui/cancela comunicações processuais abertas antes da nova correta.
+
+    Em modo agressivo (FORCE_DELETE_ALL_COMUNICACOES_AUTHORIZED=true), uma
+    linha em status terminal NÃO bloqueia o ciclo — apenas é pulada. O loop
+    para naturalmente quando `deleted=False` em um ciclo, indicando que não
+    há mais linhas deletáveis.
+    """
     ok, reason = _cleanup_guard_for_process(processo, "FORCE_RECREATE_COMUNICACAO")
     if not ok:
         return False, [f"bloqueado: {reason}"]
+
+    aggressive = (
+        env_bool("FORCE_DELETE_ALL_COMUNICACOES_AUTHORIZED", False)
+        and (processo or "").strip().upper() in _parse_processos_env(os.getenv("ONLY_PROCESSOS_AUTHORIZED"))
+        and normalize((os.getenv("ENVIRONMENT") or "").strip()).lower() in _PROD_ENVIRONMENTS
+    )
 
     all_actions: list[str] = []
     for cycle in range(1, 11):
         deleted, actions = delete_comunicacao_processual(context, page, processo)
         all_actions.extend([f"ciclo {cycle}: {line}" for line in actions])
-        if any("status terminal" in line for line in actions):
-            return False, all_actions
+        # Linhas terminais NUNCA mais bloqueiam o ciclo (brief 2026-05-15):
+        # cada delete_comunicacao_processual já pula terminais individualmente.
         if not deleted:
+            # Nada foi deletado neste ciclo. Ou nao havia robot-marker
+            # (caminho feliz), ou todas as linhas restantes ja foram pulado
+            # (terminais/humanas). Retorna sucesso.
             return True, all_actions
         time.sleep(1)
     all_actions.append("excedeu 10 ciclos removendo comunicações processuais")
     return False, all_actions
+
+
+def _count_robot_comms_remaining(context, page, processo: str) -> tuple[int, list[str]]:
+    """Conta comunicações robot-created remanescentes na Caixa de Correio.
+
+    Pos-cleanup é a verificação de idempotência: se sobrou >0 robot-created,
+    a recriação criaria duplicata. O caller deve abortar antes do create.
+
+    Em modo `FORCE_DELETE_ALL_COMUNICACOES_AUTHORIZED=true` + processo
+    autorizado + PROD, conta TODAS as comunicações nao-terminais (porque
+    nesse modo nenhuma comunicacao pre-existente deveria ter sobrado). Isso
+    permite que o pipeline aborte se algum cleanup nao conseguiu derrubar
+    uma comunicacao "Enviado" antiga.
+
+    Retorna (qtd, lista_de_resumos) — a lista entra no log/relatorio.
+    """
+    aggressive = (
+        env_bool("FORCE_DELETE_ALL_COMUNICACOES_AUTHORIZED", False)
+        and (processo or "").strip().upper() in _parse_processos_env(os.getenv("ONLY_PROCESSOS_AUTHORIZED"))
+        and normalize((os.getenv("ENVIRONMENT") or "").strip()).lower() in _PROD_ENVIRONMENTS
+    )
+    try:
+        caixa = open_caixa_correio_from_grid(context, page, processo)
+    except Exception:
+        caixa = None
+    if not caixa:
+        return 0, ["caixa nao abriu para auditoria pos-cleanup"]
+
+    try:
+        time.sleep(1)
+        comm_selectors = (
+            "#gvNotificacoes_DXMainTable tr[id*='DXDataRow'], "
+            "table[id*='gvNotif'] tr[id*='DXDataRow'], "
+            "tr[id*='gvNotificacoes_DXDataRow']"
+        )
+        rows = caixa.locator(comm_selectors)
+        try:
+            n = rows.count()
+        except Exception:
+            n = 0
+        robot_count = 0
+        non_terminal_count = 0
+        notes: list[str] = []
+        for i in range(n):
+            try:
+                row_text = rows.nth(i).inner_text(timeout=1500)
+            except Exception:
+                row_text = ""
+            row_norm = normalize(row_text or "").lower()
+            terminal = bool(re.search(r"\brespondid[oa]\b", row_norm)) or is_terminal_final_status(row_norm)
+            if not terminal:
+                non_terminal_count += 1
+            if _is_robot_created_comunicacao_text(row_text):
+                robot_count += 1
+                notes.append(f"linha {i+1}: robot-created -> '{row_text[:80]}'")
+            elif aggressive and not terminal:
+                notes.append(f"linha {i+1}: nao-terminal (modo agressivo conta) -> '{row_text[:80]}'")
+        if not notes:
+            notes.append(f"{n} linha(s); nenhuma identificada como robot-created")
+        if aggressive:
+            notes.append(f"modo agressivo: retornando count nao-terminal={non_terminal_count}")
+            return non_terminal_count, notes
+        return robot_count, notes
+    finally:
+        try:
+            if not caixa.is_closed():
+                caixa.close()
+        except Exception:
+            pass
 
 
 def cleanup_robot_created_comunicacao_and_oficio(context, page, processo: str) -> tuple[bool, list[str]]:
@@ -5142,6 +5496,18 @@ def cleanup_robot_created_comunicacao_and_oficio(context, page, processo: str) -
     permitir recriação. Comunicação processual só é excluída quando a linha
     contém marcador/descrição legada do robô; na dúvida, registra pendência e
     não exclui.
+
+    Idempotência: após excluir, conta quantas comunicações robot-created
+    ainda restam. Se >0, retorna False — isso impede que o pipeline crie uma
+    nova comunicação enquanto sobra alguma anterior, evitando duplicatas.
+
+    Modo regen-only (`SKIP_COMUNICACAO_CLEANUP=true`): NÃO tenta excluir
+    comunicações existentes. Útil quando o objetivo é só regerar o Ofício SSG
+    (font do Encaminha, por exemplo) reusando a comunicação já criada — as
+    comms em status "Enviado" não podem ser apagadas pela UI, então tentar
+    deletá-las gera ruído de log. Quando esse modo está ligado, o pipeline
+    também precisa estar com `USE_CAIXA_CORREIO=false` para nao criar uma
+    nova comm em cima da existente.
     """
     actions: list[str] = []
     oficio_ok, oficio_actions = delete_all_old_oficio_ssg_for_process(context, page, processo)
@@ -5149,13 +5515,39 @@ def cleanup_robot_created_comunicacao_and_oficio(context, page, processo: str) -
     if not oficio_ok:
         return False, actions
 
+    if env_bool("SKIP_COMUNICACAO_CLEANUP", False):
+        actions.append(
+            "[comunicacao] SKIP_COMUNICACAO_CLEANUP=true: pulando exclusao de "
+            "comunicacoes existentes (modo regen-only de Oficio SSG)."
+        )
+        return True, actions
+
     comm_ok, comm_actions = delete_all_comunicacoes_processuais_for_process(context, page, processo)
     actions.extend([f"[comunicacao] {line}" for line in comm_actions])
-    # Se a comunicação existente não é identificável como robô, não é erro
-    # destrutivo: é um bloqueio seguro para não apagar trabalho humano.
-    if any("sem marcador de robô" in line for line in comm_actions):
+
+    # Audit pos-cleanup: contamos as comms robot-created que ainda restam.
+    remaining, notes = _count_robot_comms_remaining(context, page, processo)
+    actions.extend([f"[audit] {line}" for line in notes])
+
+    # Politica do brief 2026-05-15:
+    #   * 0 remanescentes -> caminho feliz, pode criar nova comm.
+    #   * 1 remanescente  -> o e-TCM rejeitou silenciosamente a exclusao
+    #                        (comm em status 'Enviado' nao deletavel). NAO
+    #                        e erro: o pipeline deve REUSAR essa comm como
+    #                        a unica do robo neste processo.
+    #   * >1 remanescentes -> duplicidade real (estado corrompido). Aborta.
+    if remaining <= 1:
+        if remaining == 1:
+            actions.append(
+                "[audit] 1 comunicacao robot-created remanescente (e-TCM rejeitou a "
+                "exclusao). Pipeline vai REUSAR esta comm em vez de criar nova."
+            )
         return True, actions
-    return comm_ok, actions
+    actions.append(
+        f"[audit] {remaining} comunicacao(oes) robot-created remanescente(s) apos cleanup; "
+        "abortando — estado corrompido (multiplas comms do robo no mesmo processo)."
+    )
+    return False, actions
 
 
 def cancel_oficio_ssg_rascunho(context, page, processo: str) -> tuple[bool, str]:
@@ -5663,41 +6055,58 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
             return
         grid_page = open_process_action_context_anywhere(context, main_page, processo_num) or main_page
 
-        # --- Cleanup pre-fluxo (apenas quando SAFE_DELETE_OWN_DRAFTS=true) ---
-        # Conforme decisao do operador, derrubamos ato Oficio SSG e comunicacao
-        # processual existentes antes de recriar do zero. Cada acao e logada
-        # para entrar no RELATORIO_EXECUCAO_5_PROCESSOS.md.
+        # --- Cleanup ordering (brief 2026-05-14 21:00) ---
+        # ANTES: cleanup destrutivo rodava ANTES do visualizador. Se o
+        # visualizador depois falhasse (e-TCM as vezes retorna "Nenhuma peca
+        # encontrada" apos o processo trocar de fila), o processo ficava
+        # orfao: comunicacao criada + Of'icio SSG deletado pelo cleanup +
+        # nenhum ato novo. Aconteceu com TC/007902/2022 na rodada 20:12.
+        #
+        # AGORA: por padrao, o cleanup do ato e adiado para depois do PDF
+        # ser obtido com sucesso. Se o visualizador falhar, nada e deletado.
+        # Para manter comportamento antigo (cleanup antes), defina
+        # CLEANUP_BEFORE_PDF=true. Util para depuracao ou quando se sabe que
+        # o visualizador esta confiavel.
+        cleanup_before_pdf = env_bool("CLEANUP_BEFORE_PDF", False)
+        cleanup_pending = False
         _safe_ok, _safe_reason = _cleanup_guard_for_process(processo_num)
         if _safe_ok:
-            print(f"Processo {processo_num}: CLEANUP autorizado ({_safe_reason}).")
-            try:
-                cleanup_ok, cleanup_log = cleanup_robot_created_comunicacao_and_oficio(context, grid_page, processo_num)
-                for line in cleanup_log:
-                    print(f"  [cleanup-robo] {line}")
-                print(f"Processo {processo_num}: cleanup robô -> {'OK' if cleanup_ok else 'pendente/parcial'}")
-                if not cleanup_ok:
-                    print(f"ERRO bloqueante: cleanup de Ofício/comunicação do robô não concluído em {processo_num}.")
+            if cleanup_before_pdf:
+                print(f"Processo {processo_num}: CLEANUP autorizado ({_safe_reason}) — modo legacy antes do PDF.")
+                try:
+                    cleanup_ok, cleanup_log = cleanup_robot_created_comunicacao_and_oficio(context, grid_page, processo_num)
+                    for line in cleanup_log:
+                        print(f"  [cleanup-robo] {line}")
+                    print(f"Processo {processo_num}: cleanup robô -> {'OK' if cleanup_ok else 'pendente/parcial'}")
+                    if not cleanup_ok:
+                        print(f"ERRO bloqueante: cleanup de Ofício/comunicação do robô não concluído em {processo_num}.")
+                        return
+                except Exception as e:
+                    print(f"Processo {processo_num}: falha no cleanup robô: {e}")
                     return
-            except Exception as e:
-                print(f"Processo {processo_num}: falha no cleanup robô: {e}")
-                return
-            # Fecha as abas extras criadas pelo cleanup (Gerenciador de Atos,
-            # Cadastro de Comunicacao, popups). Sem isso, filter_and_open_processo
-            # pode operar na pagina errada na sequencia.
-            try:
-                n_closed = _close_extra_pages(context, [main_page, grid_page])
-                if n_closed > 0:
-                    print(f"  [cleanup] fechadas {n_closed} abas extras apos cleanup")
-            except Exception:
-                pass
-            # Reabre a grid limpa antes do fluxo normal.
-            grid_page = _open_fresh_apo_pen_page(context) or grid_page
-            try:
-                n_closed = _close_extra_pages(context, [main_page, grid_page])
-                if n_closed > 0:
-                    print(f"  [cleanup] fechadas {n_closed} abas residuais apos reopen")
-            except Exception:
-                pass
+                # Fecha as abas extras criadas pelo cleanup (Gerenciador de Atos,
+                # Cadastro de Comunicacao, popups). Sem isso, filter_and_open_processo
+                # pode operar na pagina errada na sequencia.
+                try:
+                    n_closed = _close_extra_pages(context, [main_page, grid_page])
+                    if n_closed > 0:
+                        print(f"  [cleanup] fechadas {n_closed} abas extras apos cleanup")
+                except Exception:
+                    pass
+                # Reabre a grid limpa antes do fluxo normal.
+                grid_page = _open_fresh_apo_pen_page(context) or grid_page
+                try:
+                    n_closed = _close_extra_pages(context, [main_page, grid_page])
+                    if n_closed > 0:
+                        print(f"  [cleanup] fechadas {n_closed} abas residuais apos reopen")
+                except Exception:
+                    pass
+            else:
+                print(
+                    f"Processo {processo_num}: CLEANUP autorizado ({_safe_reason}) — "
+                    "ADIADO para apos baixar PDF (evita orfao se visualizador falhar)."
+                )
+                cleanup_pending = True
         else:
             print(f"Processo {processo_num}: cleanup nao autorizado ({_safe_reason}).")
 
@@ -5741,6 +6150,31 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
             f"Processo {processo_num}: PDF capturado em {pdf_path.name}; "
             f"peça={piece_number or 'indeterminada'}; título={piece_title or '-'}."
         )
+
+        # --- Cleanup adiado: roda APOS o PDF ter sido baixado com sucesso ---
+        # Garante que nunca derrubaremos o Of'icio SSG existente sem ter os
+        # dados necessarios para recriar.
+        if cleanup_pending:
+            print(f"Processo {processo_num}: rodando cleanup ADIADO agora que PDF foi capturado.")
+            try:
+                cleanup_ok, cleanup_log = cleanup_robot_created_comunicacao_and_oficio(context, grid_page, processo_num)
+                for line in cleanup_log:
+                    print(f"  [cleanup-robo] {line}")
+                print(f"Processo {processo_num}: cleanup robô -> {'OK' if cleanup_ok else 'pendente/parcial'}")
+                if not cleanup_ok:
+                    print(f"ERRO bloqueante: cleanup de Ofício/comunicação do robô não concluído em {processo_num}.")
+                    return
+            except Exception as e:
+                print(f"Processo {processo_num}: falha no cleanup robô: {e}")
+                return
+            try:
+                n_closed = _close_extra_pages(context, [main_page, grid_page, active_page])
+                if n_closed > 0:
+                    print(f"  [cleanup] fechadas {n_closed} abas extras apos cleanup adiado")
+            except Exception:
+                pass
+            cleanup_pending = False
+
         pdf_text = extract_text_from_pdf(pdf_path)
         cover_text = _extract_cover_text(context, active_page, output_dir, processo_num)
         fields = parse_fields_from_pdf_text(pdf_text, processo_num)
@@ -5776,6 +6210,21 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
 
         data_decadencia = extract_data_decadencia(pdf_text)
         prazo = calcular_prazo_res_22_21(data_decadencia, date.today())
+        # Override por env COMUNICACAO_PRAZO_DIAS (brief atual exige 60 dias
+        # para os 5 processos UTAP/Providências). Quando definido, prevalece
+        # sobre o cálculo da Res. 22/21 — esse cálculo era origem do bug que
+        # fixava o prazo em 30 dias quando data_decadencia não era encontrada.
+        try:
+            prazo_override = int((os.getenv("COMUNICACAO_PRAZO_DIAS") or "").strip() or 0)
+        except ValueError:
+            prazo_override = 0
+        if prazo_override > 0:
+            if prazo_override != prazo:
+                print(
+                    f"  [prazo] override por COMUNICACAO_PRAZO_DIAS: "
+                    f"{prazo} -> {prazo_override} dias."
+                )
+            prazo = prazo_override
         # _meta_nome_relator e preenchido por parse_fields_from_pdf_text com
         # o conselheiro extraido do PDF (uso interno; nunca vai para o DOCX).
         relator = fields.get("_meta_nome_relator") or fields.get("{{RELATOR}}") or fields.get("{{RELATOR_PROCESSO}}") or ""
@@ -5793,20 +6242,75 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
 
         if use_caixa_correio:
             try:
-                print(f"Processo {processo_num}: criando comunicacao processual.")
-                action_page = _open_fresh_apo_pen_page(context) or grid_page or main_page
-                caixa_target = open_caixa_correio_from_grid(context, action_page, processo_num)
-                comunicacao_ok = criar_comunicacao_processual(context, caixa_target, {
-                    "processo": processo_num,
-                    "secretaria": secretaria,
-                    "relator": relator,
-                    "tipo": tipo,
-                    "prazo": prazo,
-                    "descricao": descricao,
-                })
-                if not comunicacao_ok:
-                    print(f"ERRO bloqueante: comunicação processual não foi confirmada para {processo_num}; DOCX não será anexado.")
+                # IDEMPOTENCIA pre-create:
+                #  - 0 robot comms -> cria nova (caminho feliz).
+                #  - 1 robot comm  -> REUSA (cleanup nao conseguiu deletar
+                #                     porque e-TCM rejeita comm em "Enviado").
+                #                     Brief 2026-05-15: "deve existir apenas
+                #                     uma comunicação processual gerada por
+                #                     você". Reusar atende isso.
+                #  - >1 robot comms -> ABORT (estado corrompido).
+                remaining, audit_notes = _count_robot_comms_remaining(
+                    context, grid_page or main_page, processo_num
+                )
+                for line in audit_notes:
+                    print(f"  [pre-create audit] {line}")
+                if remaining > 1:
+                    print(
+                        f"ERRO bloqueante: {remaining} comunicacao(oes) robot-created "
+                        f"remanescente(s) em {processo_num} antes do create; abortando "
+                        "(estado corrompido — multiplas comms do robo)."
+                    )
                     return
+                if remaining == 1:
+                    print(
+                        f"Processo {processo_num}: REUSANDO comunicacao robot-created existente "
+                        "(e-TCM nao permite deletar comm em 'Enviado')."
+                    )
+                    # Pula a criacao da nova comm e segue para anexar o DOCX.
+                    # caixa_target e comunicacao_ok ficam None/implicitos; o
+                    # bloco de anexo nao depende deles diretamente.
+                else:
+                    print(f"Processo {processo_num}: criando comunicacao processual.")
+                    action_page = _open_fresh_apo_pen_page(context) or grid_page or main_page
+                    caixa_target = open_caixa_correio_from_grid(context, action_page, processo_num)
+                    comunicacao_ok = criar_comunicacao_processual(context, caixa_target, {
+                        "processo": processo_num,
+                        "secretaria": secretaria,
+                        "relator": relator,
+                        "tipo": tipo,
+                        "prazo": prazo,
+                        "descricao": descricao,
+                    })
+                    if not comunicacao_ok:
+                        print(f"ERRO bloqueante: comunicação processual não foi confirmada para {processo_num}; DOCX não será anexado.")
+                        return
+                # POS-create audit: a comunicacao recem-criada deve aparecer na
+                # grid com o marcador esperado. Se nao aparecer, o upload do
+                # DOCX nao acontece — protecao contra anexar of'icio "fora da
+                # comunicacao" (Issue 3 do brief).
+                post_count, post_notes = _count_robot_comms_remaining(
+                    context, grid_page or main_page, processo_num
+                )
+                for line in post_notes:
+                    print(f"  [post-create audit] {line}")
+                if post_count == 0:
+                    print(
+                        f"ERRO bloqueante: comunicacao recem-criada NAO foi localizada com "
+                        f"marcador esperado em {processo_num}. O DOCX nao sera anexado "
+                        "para evitar associar a contexto errado."
+                    )
+                    return
+                if post_count > 1:
+                    print(
+                        f"ERRO bloqueante: {post_count} comunicacoes robot-created em "
+                        f"{processo_num} apos o create (duplicidade detectada); abortando."
+                    )
+                    return
+                print(
+                    f"  [post-create audit] OK: 1 comunicacao robot-created localizada "
+                    f"para {processo_num}; vai anexar Of'icio SSG ao mesmo processo."
+                )
             except Exception as e:
                 print(f"Aviso: falha ao criar comunicacao processual para {processo_num}: {e}")
                 return
@@ -5840,7 +6344,14 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
                     print(f"Processo {processo_num}: Ofício SSG existente localizado; anexo novo ignorado por REUSE_EXISTING_OFICIO.")
                 else:
                     print(f"Processo {processo_num}: anexando DOCX {docx_path.name}.")
-                    attached = attach_docx_via_gerenciador_atos(context, action_page, processo_num, docx_path)
+                    # Brief 2026-05-15: se use_caixa_correio=true, anexar DENTRO
+                    # da comunicacao processual (via GerenciaAto?ntf=<cod_notif>)
+                    # — o ato fica vinculado a comm no banco e aparece na coluna
+                    # 'Atos' da grid gvNotificacao.
+                    if use_caixa_correio:
+                        attached = attach_docx_inside_comunicacao(context, action_page, processo_num, docx_path)
+                    else:
+                        attached = attach_docx_via_gerenciador_atos(context, action_page, processo_num, docx_path)
                     if not attached:
                         attached = attach_docx_to_portal(context, active_page, docx_path)
                 if attached:

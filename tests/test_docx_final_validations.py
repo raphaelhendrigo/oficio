@@ -85,7 +85,8 @@ def test_add_euclides_marker_to_docx_once_preserves_at_tokens(modelo_utap_geral:
     add_euclides_marker_to_docx(out)
 
     text = "\n".join(extract_visible_text_from_docx(out))
-    assert text.count(r"\euclides") == 1
+    # Brief 2026-05-14: a barra correta é "/" (default DEFAULT_EUCLIDES_MARKER).
+    assert text.count("/euclides") == 1
     assert_euclides_marker_present_once(out)
     assert_at_tokens_preserved(modelo_utap_geral, out)
 
@@ -95,6 +96,6 @@ def test_assert_euclides_marker_present_once_rejects_missing_and_duplicate(tmp_p
     with pytest.raises(DocxValidationError):
         assert_euclides_marker_present_once(missing)
 
-    duplicate = _make_docx(tmp_path / "duplicate.docx", [r"\euclides", r"\euclides"])
+    duplicate = _make_docx(tmp_path / "duplicate.docx", ["/euclides", "/euclides"])
     with pytest.raises(DocxValidationError):
         assert_euclides_marker_present_once(duplicate)

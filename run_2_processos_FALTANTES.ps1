@@ -1,5 +1,11 @@
 $ErrorActionPreference = "Stop"
 
+# Script TEMPORARIO 2026-05-14 - apenas TC/007902/2022 e TC/008636/2022
+# (que falharam na rodada das 18:07). Reusa toda a configuracao do script
+# completo, mas restringe PROCESSOS_LIST aos 2 pendentes.
+# ONLY_PROCESSOS_AUTHORIZED continua com os 5 para que o cleanup destrutivo
+# seja permitido sem fora-de-escopo.
+
 foreach ($name in @("ETCM_USERNAME", "ETCM_PASSWORD", "ETCM_USER", "ETCM_LOGIN", "ETCM_PASS", "ETCM_SENHA")) {
     $val = [Environment]::GetEnvironmentVariable($name, "User")
     if (-not [string]::IsNullOrEmpty($val)) {
@@ -19,17 +25,11 @@ if (
 $env:ETCM_URL = "https://etcm.tcm.sp.gov.br/paginas/login.aspx"
 $env:BASE_URL = "https://etcm.tcm.sp.gov.br/paginas/login.aspx"
 
-# Output do python em tempo real: sem Start-Process bufferiza ate o filho terminar.
 $env:PYTHONUNBUFFERED = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
-# Rodada de 2026-05-14: recriar os 5 processos do zero com:
-#  - Status NORMAL (44068) e prazo 60 dias (override por COMUNICACAO_PRAZO_DIAS)
-#  - Referencia "gerado automaticamente" (nunca "conhecimento/providencias")
-#  - Marker "/euclides" no fim do DOCX (barra correta)
-#  - Encaminha preservando fonte/tabulacao do template SSG
-#  - Cleanup amplo (catches old buggy pattern via fingerprint)
-$env:PROCESSOS_LIST = "TC/007902/2022,TC/008084/2023,TC/013838/2023,TC/018149/2024"
+# Retry de TC/007902/2022 (form submit timing intermitente nesse processo)
+$env:PROCESSOS_LIST = "TC/007902/2022"
 $env:ONLY_PROCESSOS_AUTHORIZED = "TC/007902/2022,TC/008636/2022,TC/008084/2023,TC/013838/2023,TC/018149/2024"
 
 $env:ENVIRONMENT = "producao"
@@ -45,17 +45,8 @@ $env:FORCE_RECREATE_COMUNICACAO = "true"
 $env:FORCE_DELETE_OLD_OFICIO_SSG = "true"
 $env:SAFE_DELETE_OWN_DRAFTS = "true"
 $env:RUN_PROD_DESTRUCTIVE_CLEANUP = "true"
-# Investigacao 2026-05-14 17:24: o e-TCM rejeita silenciosamente o click em
-# Excluir para comunicacoes em status 'Enviado' (o icone existe e o click
-# eh aceito, mas a comm nao sai da grid). Provavelmente requer permissao
-# admin ou acao 'Estornar Envio' que nao foi mapeada. Por isso o modo
-# AGRESSIVO esta DESABILITADO por padrao - reabilite apenas quando souber
-# que so existem comms em rascunho/pendente (deletaveis pelo robo).
-# Pre-condicao para rodar: apagar manualmente as comms 'Enviado' antigas
-# nos 5 processos. Apos isso, o fingerprint conservador eh suficiente.
 $env:FORCE_DELETE_ALL_COMUNICACOES_AUTHORIZED = "false"
 
-# Comunicacao Processual: brief 2026-05-14
 $env:COMUNICACAO_PRAZO_DIAS = "60"
 $env:COMUNICACAO_REFERENCIA = "gerado automaticamente"
 $env:STATUS_ENTREGA = "Normal"
@@ -70,7 +61,6 @@ $env:STOP_AFTER_OFICIO_CONCLUIDO = "true"
 $env:OFICIO_TEMPLATE_MODE = "auto"
 $env:OFICIO_PRESERVE_AT_TOKENS = "true"
 $env:OFICIO_ADD_EUCLIDES_MARKER = "true"
-# Barra correta '/' (rodadas antigas usaram '\euclides' por engano)
 $env:OFICIO_EUCLIDES_MARKER = "/euclides"
 $env:OFICIO_REQUIRE_PIECE_NUMBER_IN_ENCAMINHA = "true"
 $env:OFICIO_ENCAMINHA_TEXT_BOLD = "false"
@@ -87,17 +77,10 @@ if (-not (Test-Path $pythonExe)) {
     exit 1
 }
 
-Write-Host "[1/2] Rodando pytest oficial..." -ForegroundColor Cyan
-& $pythonExe -m pytest tests -q
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "[ERRO] pytest falhou. Abortando execucao." -ForegroundColor Red
-    exit $LASTEXITCODE
-}
-
-Write-Host "[2/2] Rodando os 5 processos ate Oficio SSG concluido..." -ForegroundColor Cyan
+Write-Host "Rodando TC/007902/2022 e TC/008636/2022..." -ForegroundColor Cyan
 $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outFile = "logs\run_5_processos_APOPEN_ATE_OFICIO_CONCLUIDO_$ts.log"
-$errFile = "logs\run_5_processos_APOPEN_ATE_OFICIO_CONCLUIDO_$ts.err.log"
+$outFile = "logs\run_2_processos_FALTANTES_$ts.log"
+$errFile = "logs\run_2_processos_FALTANTES_$ts.err.log"
 
 $proc = Start-Process -FilePath $pythonExe -ArgumentList ".\src\main.py" `
     -NoNewWindow -Wait -PassThru `

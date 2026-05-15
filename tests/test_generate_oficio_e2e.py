@@ -124,7 +124,8 @@ def test_generate_final_docx_replaces_encaminha_and_adds_euclides(
     monkeypatch.setenv("OFICIO_PRESERVE_AT_TOKENS", "true")
     monkeypatch.setenv("OFICIO_REQUIRE_PIECE_NUMBER_IN_ENCAMINHA", "true")
     monkeypatch.setenv("OFICIO_ADD_EUCLIDES_MARKER", "true")
-    monkeypatch.setenv("OFICIO_EUCLIDES_MARKER", r"\euclides")
+    # Brief 2026-05-14: barra correta é "/", nunca "\".
+    monkeypatch.setenv("OFICIO_EUCLIDES_MARKER", "/euclides")
     out = _gen_into(
         tmp_path,
         modelo_utap_geral,

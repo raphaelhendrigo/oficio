@@ -41,7 +41,10 @@ OOXML_TEXT_PARTS: Tuple[str, ...] = (
 )
 
 GENERIC_ENCAMINHA_TEXT = "Cópia da(s) peça(s) dos autos."
-DEFAULT_EUCLIDES_MARKER = r"\euclides"
+# A barra correta no marcador final é "/" (nunca "\"). Histórico: a primeira
+# versão usou r"\euclides" e gerou ofícios com a barra invertida em PROD;
+# o brief exige "/euclides".
+DEFAULT_EUCLIDES_MARKER = "/euclides"
 
 
 # ------------------------------ Excecoes ------------------------------------
@@ -259,15 +262,31 @@ def set_encaminha_text_without_bold(docx_path: Path | str, encaminha_text: str) 
     O rótulo "Encaminha" pode manter a formatação original. O texto depois do
     rótulo, por exemplo "Cópia da peça 03 dos autos.", recebe `bold=False`
     explicitamente para não herdar negrito do rótulo no Word.
+
+    Brief 2026-05-14: o conteúdo (após "Encaminha") DEVE ser Times New Roman
+    12pt sem negrito. O template tinha o run com fonte/tamanho diferente do
+    corpo do ofício, e a cópia 1:1 de `rPr` preservava esse erro. Agora
+    aplicamos explicitamente font name/size APÓS o `_copy_run_format`, para
+    sobrescrever só essas duas propriedades sem perder cor/estilo de
+    sublinhado/itálico que possam vir do template.
     """
+    import os as _os
+
     encaminha_text = (encaminha_text or "").strip()
     if not encaminha_text:
         raise ValueError("encaminha_text não pode ser vazio")
 
     try:
         from docx import Document  # type: ignore
+        from docx.shared import Pt  # type: ignore
     except Exception as e:  # pragma: no cover - dependencia obrigatoria
         raise RuntimeError(f"python-docx ausente; não foi possível editar Encaminha: {e}") from e
+
+    forced_font_name = (_os.getenv("OFICIO_ENCAMINHA_FONT_NAME") or "Times New Roman").strip() or "Times New Roman"
+    try:
+        forced_font_size_pt = int((_os.getenv("OFICIO_ENCAMINHA_FONT_SIZE_PT") or "12").strip() or "12")
+    except ValueError:
+        forced_font_size_pt = 12
 
     path = Path(docx_path)
     doc = Document(str(path))
@@ -350,7 +369,17 @@ def set_encaminha_text_without_bold(docx_path: Path | str, encaminha_text: str) 
         ):
             return False
 
-        label_text = full_text[:m.end()].rstrip()
+        # Captura o separador (tab/espaços) que originalmente existia entre o
+        # rótulo "Encaminha" e o conteúdo. Em PROD o modelo usa um TAB para
+        # alinhar a coluna; rstrip() apagava esse \t e substituía por " ",
+        # quebrando a tabulação visual.
+        sep_match = re.match(r"[ \t\xa0]*", tail)
+        original_separator = sep_match.group(0) if sep_match else ""
+        if not original_separator:
+            # Sem espaços no original (raro): força um TAB para preservar o
+            # layout tabulado do template SSG-Aposentadoria.
+            original_separator = "\t"
+        label_text = full_text[:m.end()]
         label_bold = None
         label_run_ref = None
         if paragraph.runs:
@@ -367,7 +396,7 @@ def set_encaminha_text_without_bold(docx_path: Path | str, encaminha_text: str) 
             for run in paragraph.runs:
                 run.text = ""
         label_run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
-        label_run.text = f"{label_text} "
+        label_run.text = f"{label_text}{original_separator}"
         if label_bold is not None:
             label_run.bold = label_bold
         if label_run_ref is not None:
@@ -375,11 +404,33 @@ def set_encaminha_text_without_bold(docx_path: Path | str, encaminha_text: str) 
         content_run = paragraph.add_run(encaminha_text)
         content_run.bold = False
         # IMPORTANTE: copia fonte/tamanho/cor do run de conteudo original
-        # para nao cair no default do python-docx (Calibri 11pt).
+        # para nao cair no default do python-docx (Calibri 11pt). Logo apos,
+        # sobrescrevemos font name/size explicitamente para o padrao do brief
+        # (Times New Roman 12pt) — o template tinha um run com font/size que
+        # nao batia com o corpo do oficio, e a copia 1:1 propagava o erro.
         if content_style_ref is not None:
             _copy_run_format(content_style_ref, content_run)
-            # Bold do conteudo sempre False, mesmo que o estilo trouxesse True.
             content_run.bold = False
+        try:
+            content_run.font.name = forced_font_name
+            content_run.font.size = Pt(forced_font_size_pt)
+            # Tambem ajusta os atributos eastAsia/cs no rPr para garantir
+            # que o Word renderize Times New Roman mesmo em paragrafos com
+            # script complex / CJK; senao alguns motoradores caem no default.
+            try:
+                from docx.oxml.ns import qn  # type: ignore
+                rPr = content_run._element.get_or_add_rPr()
+                rFonts = rPr.find(qn("w:rFonts"))
+                if rFonts is None:
+                    from docx.oxml import OxmlElement  # type: ignore
+                    rFonts = OxmlElement("w:rFonts")
+                    rPr.insert(0, rFonts)
+                for attr in ("ascii", "hAnsi", "cs", "eastAsia"):
+                    rFonts.set(qn(f"w:{attr}"), forced_font_name)
+            except Exception:
+                pass
+        except Exception:
+            pass
         return True
 
     def rewrite_content_paragraph(paragraph) -> bool:
@@ -394,12 +445,34 @@ def set_encaminha_text_without_bold(docx_path: Path | str, encaminha_text: str) 
             paragraph.text = encaminha_text
             for run in paragraph.runs:
                 run.bold = False
+                try:
+                    run.font.name = forced_font_name
+                    run.font.size = Pt(forced_font_size_pt)
+                except Exception:
+                    pass
             return True
         # Preserva o estilo do primeiro run com texto util como referencia
-        # e edita apenas o texto.
+        # e edita apenas o texto. Forca TNR 12pt sem negrito conforme brief.
         first_run = paragraph.runs[0]
         first_run.text = encaminha_text
         first_run.bold = False
+        try:
+            first_run.font.name = forced_font_name
+            first_run.font.size = Pt(forced_font_size_pt)
+            try:
+                from docx.oxml.ns import qn  # type: ignore
+                rPr = first_run._element.get_or_add_rPr()
+                rFonts = rPr.find(qn("w:rFonts"))
+                if rFonts is None:
+                    from docx.oxml import OxmlElement  # type: ignore
+                    rFonts = OxmlElement("w:rFonts")
+                    rPr.insert(0, rFonts)
+                for attr in ("ascii", "hAnsi", "cs", "eastAsia"):
+                    rFonts.set(qn(f"w:{attr}"), forced_font_name)
+            except Exception:
+                pass
+        except Exception:
+            pass
         for run in paragraph.runs[1:]:
             run.text = ""
             run.bold = False

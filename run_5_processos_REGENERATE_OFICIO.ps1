@@ -1,5 +1,17 @@
 $ErrorActionPreference = "Stop"
 
+# Script 2026-05-14 (Regen-only): regenera apenas o DOCX + Ofício SSG ato
+# nos 5 processos, REUSANDO as comunicacoes processuais ja criadas (5953,
+# 5954, 5955, 5956). Objetivo: corrigir a fonte do Encaminha para
+# Times New Roman 12pt sem negrito.
+#
+# Diferencas em relacao ao script principal:
+#   - USE_CAIXA_CORREIO=false  -> nao cria nova comm
+#   - SKIP_COMUNICACAO_CLEANUP=true -> cleanup nao tenta apagar comm
+#   - Cleanup do Ofício SSG continua ligado (estorna conclusao + delete)
+#   - Nova geracao do DOCX usa o set_encaminha_text_without_bold atualizado
+#     (forca Times New Roman 12pt). Override por env disponivel se precisar.
+
 foreach ($name in @("ETCM_USERNAME", "ETCM_PASSWORD", "ETCM_USER", "ETCM_LOGIN", "ETCM_PASS", "ETCM_SENHA")) {
     $val = [Environment]::GetEnvironmentVariable($name, "User")
     if (-not [string]::IsNullOrEmpty($val)) {
@@ -19,17 +31,10 @@ if (
 $env:ETCM_URL = "https://etcm.tcm.sp.gov.br/paginas/login.aspx"
 $env:BASE_URL = "https://etcm.tcm.sp.gov.br/paginas/login.aspx"
 
-# Output do python em tempo real: sem Start-Process bufferiza ate o filho terminar.
 $env:PYTHONUNBUFFERED = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
-# Rodada de 2026-05-14: recriar os 5 processos do zero com:
-#  - Status NORMAL (44068) e prazo 60 dias (override por COMUNICACAO_PRAZO_DIAS)
-#  - Referencia "gerado automaticamente" (nunca "conhecimento/providencias")
-#  - Marker "/euclides" no fim do DOCX (barra correta)
-#  - Encaminha preservando fonte/tabulacao do template SSG
-#  - Cleanup amplo (catches old buggy pattern via fingerprint)
-$env:PROCESSOS_LIST = "TC/007902/2022,TC/008084/2023,TC/013838/2023,TC/018149/2024"
+$env:PROCESSOS_LIST = "TC/007902/2022,TC/008636/2022,TC/008084/2023,TC/013838/2023,TC/018149/2024"
 $env:ONLY_PROCESSOS_AUTHORIZED = "TC/007902/2022,TC/008636/2022,TC/008084/2023,TC/013838/2023,TC/018149/2024"
 
 $env:ENVIRONMENT = "producao"
@@ -40,22 +45,18 @@ $env:SLOWMO_MS = "200"
 $env:LOGIN_MANUAL_WAIT_MS = "60000"
 $env:PAUSE_AFTER_LOGIN_MS = "5000"
 
-$env:USE_CAIXA_CORREIO = "true"
-$env:FORCE_RECREATE_COMUNICACAO = "true"
+# Regen-only: nao mexer em comm (reusar existente)
+$env:USE_CAIXA_CORREIO = "false"
+$env:SKIP_COMUNICACAO_CLEANUP = "true"
+
+# Cleanup do Ofício SSG fica ligado (estornar conclusao + delete + recriar)
 $env:FORCE_DELETE_OLD_OFICIO_SSG = "true"
 $env:SAFE_DELETE_OWN_DRAFTS = "true"
 $env:RUN_PROD_DESTRUCTIVE_CLEANUP = "true"
-# Investigacao 2026-05-14 17:24: o e-TCM rejeita silenciosamente o click em
-# Excluir para comunicacoes em status 'Enviado' (o icone existe e o click
-# eh aceito, mas a comm nao sai da grid). Provavelmente requer permissao
-# admin ou acao 'Estornar Envio' que nao foi mapeada. Por isso o modo
-# AGRESSIVO esta DESABILITADO por padrao - reabilite apenas quando souber
-# que so existem comms em rascunho/pendente (deletaveis pelo robo).
-# Pre-condicao para rodar: apagar manualmente as comms 'Enviado' antigas
-# nos 5 processos. Apos isso, o fingerprint conservador eh suficiente.
 $env:FORCE_DELETE_ALL_COMUNICACOES_AUTHORIZED = "false"
 
-# Comunicacao Processual: brief 2026-05-14
+# Esses params sao ignorados quando USE_CAIXA_CORREIO=false, mas mantidos
+# para coerencia.
 $env:COMUNICACAO_PRAZO_DIAS = "60"
 $env:COMUNICACAO_REFERENCIA = "gerado automaticamente"
 $env:STATUS_ENTREGA = "Normal"
@@ -70,10 +71,14 @@ $env:STOP_AFTER_OFICIO_CONCLUIDO = "true"
 $env:OFICIO_TEMPLATE_MODE = "auto"
 $env:OFICIO_PRESERVE_AT_TOKENS = "true"
 $env:OFICIO_ADD_EUCLIDES_MARKER = "true"
-# Barra correta '/' (rodadas antigas usaram '\euclides' por engano)
 $env:OFICIO_EUCLIDES_MARKER = "/euclides"
 $env:OFICIO_REQUIRE_PIECE_NUMBER_IN_ENCAMINHA = "true"
 $env:OFICIO_ENCAMINHA_TEXT_BOLD = "false"
+
+# Brief 2026-05-14: forca Times New Roman 12pt sem negrito no conteudo de
+# Encaminha (default ja eh esse no codigo; aqui apenas explicito para log).
+$env:OFICIO_ENCAMINHA_FONT_NAME = "Times New Roman"
+$env:OFICIO_ENCAMINHA_FONT_SIZE_PT = "12"
 
 $env:MAX_PROCESSOS = "0"
 
@@ -94,10 +99,10 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-Write-Host "[2/2] Rodando os 5 processos ate Oficio SSG concluido..." -ForegroundColor Cyan
+Write-Host "[2/2] Regenerando Oficio SSG nos 5 processos (font Encaminha = Times New Roman 12pt)..." -ForegroundColor Cyan
 $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outFile = "logs\run_5_processos_APOPEN_ATE_OFICIO_CONCLUIDO_$ts.log"
-$errFile = "logs\run_5_processos_APOPEN_ATE_OFICIO_CONCLUIDO_$ts.err.log"
+$outFile = "logs\run_5_processos_REGENERATE_OFICIO_$ts.log"
+$errFile = "logs\run_5_processos_REGENERATE_OFICIO_$ts.err.log"
 
 $proc = Start-Process -FilePath $pythonExe -ArgumentList ".\src\main.py" `
     -NoNewWindow -Wait -PassThru `
