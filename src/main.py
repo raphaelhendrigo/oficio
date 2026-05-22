@@ -918,13 +918,52 @@ def _extract_notificacao_args_from_row(row) -> tuple[str, str]:
     return "", ""
 
 
-def open_caixa_correio_from_grid(context, page, processo: str):
-    """Abre a Caixa de Correio / Comunicacao Processual a partir da grid Em confeccao APO-PEN."""
-    row = _filter_process_grid_row(page, processo)
-    if row is None:
-        return page
+def comunicacao_form_loaded(target) -> bool:
+    """True se o cadastro de Comunicacao Processual realmente carregou em `target`.
 
-    pages_before = list(context.pages)
+    Verifica a presenca de qualquer marcador inequivoco do formulario (o campo
+    do popup ppcNoificacao, o botao 'Nova Comunicacao' ou a grid gvNotificacao),
+    inclusive em frames filhos. Usado para NUNCA aceitar a Mesa de Trabalho como
+    se fosse o cadastro — o que antes fazia o fluxo desperdicar ~8 min tentando
+    preencher um form inexistente antes de falhar.
+    """
+    if target is None:
+        return False
+    contexts = [target]
+    try:
+        contexts.extend(list(getattr(target, "frames", [])))
+    except Exception:
+        pass
+    css = [
+        "#ppcNoificacao_txtDescricao_I",
+        "[id*='btnAdicionarNotificacao']",
+        "[id*='gvNotificacao']",
+    ]
+    for c in contexts:
+        for sel in css:
+            try:
+                if c.locator(sel).count() > 0:
+                    return True
+            except Exception:
+                continue
+    for c in contexts:
+        try:
+            if c.get_by_role("button", name=re.compile(r"Nova\s+Comunic", re.I)).count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _open_comunicacao_once(context, page, processo: str, row, pages_before):
+    """Uma passada de navegacao ate o cadastro de Comunicacao Processual.
+
+    Tenta, em ordem: clicar o icone de notificacao da linha (popup), detectar
+    nova aba, abrir por URL direta (cadastronotificacao.aspx) e, por fim, achar
+    o frame 'Comunica'. Retorna o `target` encontrado (Page/Frame) ou None.
+    NAO faz fallback para a Mesa de Trabalho — quem chama valida com
+    comunicacao_form_loaded() e decide se re-tenta.
+    """
     icon_selectors = [
         "img[src*='img_notificacao' i]",
         "img[src*='notificacao' i]",
@@ -955,7 +994,6 @@ def open_caixa_correio_from_grid(context, page, processo: str):
             continue
 
     if target is None:
-        # Detecta nova pagina
         for _ in range(10):
             pages_now = list(context.pages)
             if len(pages_now) > len(pages_before):
@@ -991,11 +1029,62 @@ def open_caixa_correio_from_grid(context, page, processo: str):
 
     if target is None:
         try:
-            fr = find_frame_with_text(page, "Comunica", timeout_ms=8000)
-            target = fr
+            target = find_frame_with_text(page, "Comunica", timeout_ms=8000)
         except Exception:
-            target = page
+            target = None
     return target
+
+
+def open_caixa_correio_from_grid(context, page, processo: str, max_attempts: int = 3):
+    """Abre a Caixa de Correio / Comunicacao Processual a partir da grid Em confeccao APO-PEN.
+
+    Faz ate `max_attempts` passadas de navegacao e SO retorna quando o cadastro
+    de fato carregou (validado por comunicacao_form_loaded). Antes, uma unica
+    falha de navegacao (ex.: URL direta redireciona para a Mesa de Trabalho,
+    como acontece com processos em determinado estado/fila) fazia a funcao
+    devolver a propria Mesa, e o chamador gastava ~8 min num form inexistente.
+    """
+    last_target = None
+    for attempt in range(1, max_attempts + 1):
+        row = _filter_process_grid_row(page, processo)
+        if row is None:
+            if attempt < max_attempts:
+                time.sleep(1.0)
+                continue
+            return page
+
+        pages_before = list(context.pages)
+        target = _open_comunicacao_once(context, page, processo, row, pages_before)
+        if comunicacao_form_loaded(target):
+            return target
+
+        # Nao carregou o cadastro nesta passada. Fecha eventual aba aberta
+        # (URL direta / popup que caiu na pagina errada) para nao vazar abas,
+        # e re-tenta a navegacao do zero.
+        try:
+            if (
+                target is not None
+                and target is not page
+                and hasattr(target, "close")
+                and target in context.pages
+                and target not in pages_before
+            ):
+                target.close()
+        except Exception:
+            pass
+        last_target = target
+        if attempt < max_attempts:
+            print(
+                f"Aviso: cadastro de Comunicacao Processual nao carregou para {processo} "
+                f"(tentativa {attempt}/{max_attempts}); re-tentando navegacao."
+            )
+            time.sleep(1.0)
+
+    print(
+        f"Aviso: nao foi possivel abrir o cadastro de Comunicacao Processual para {processo} "
+        f"apos {max_attempts} tentativas (navegacao sempre caiu fora do formulario)."
+    )
+    return last_target if last_target is not None else page
 
 
 def _read_ppcnoificacao_state(container) -> dict:
@@ -1486,6 +1575,36 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
         form_container = exact_target
     if exact_form:
         destinatario = (dados.get("destinatario") or secretaria or "").strip()
+        # O destinatario (cbbUsuarios) precisa ser a Unidade Gestora REAL do
+        # processo, nao o rotulo do bucket de template. Para Saude/Educacao o
+        # rotulo ("Saude"/"Educacao") casa por substring com uma opcao do
+        # dropdown por coincidencia; para Urbanismo (sem template dedicado) o
+        # bucket vira "Geral", que NAO existe na lista de destinatarios ->
+        # no-match -> save rejeitado em silencio (grid fica em 0 linhas).
+        # A pagina expoe a UG em ucTabInfo_pgcInfoProc_lblUG (ex.: "Secretaria
+        # Municipal de Urbanismo e Licenciamento (*)"); preferimos esse valor.
+        try:
+            ug_real = target.evaluate(
+                r"""() => {
+                    const ids = ['ucTabInfo_pgcInfoProc_lblUG', 'lblUG'];
+                    for (const id of ids) {
+                        const el = document.getElementById(id);
+                        if (el) {
+                            const t = (el.innerText || el.textContent || '').trim();
+                            if (t) return t;
+                        }
+                    }
+                    return '';
+                }"""
+            )
+        except Exception as e_ug:
+            print(f"  Aviso: nao foi possivel ler Unidade Gestora (lblUG): {e_ug}")
+            ug_real = ""
+        if ug_real:
+            ug_real = str(ug_real).strip()
+            if normalize(ug_real).lower() != normalize(destinatario).lower():
+                print(f"  [destinatario] usando Unidade Gestora real da pagina: {ug_real!r} (bucket era {destinatario!r})")
+            destinatario = ug_real
         # Referência: por brief, deve ser "gerado automaticamente" (ou em branco,
         # se o operador escolher esse padrão). NUNCA pode ser
         # "conhecimento/providências" — esse é o valor da DESCRIÇÃO. Mantemos
@@ -1662,13 +1781,17 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
                     }""",
                     destinatario,
                 )
-                # Reduz a lista de items no print pra nao poluir.
+                # Reduz a lista de items no print pra nao poluir — MAS, em
+                # no-match, loga as opcoes reais do dropdown: sem isso fica
+                # impossivel diagnosticar destinatario errado (vide Urbanismo).
                 if isinstance(dest_fix, dict) and "items" in dest_fix:
                     dest_fix_print = {k: v for k, v in dest_fix.items() if k != "items"}
                     dest_fix_print["items_count"] = len(dest_fix.get("items") or [])
                 else:
                     dest_fix_print = dest_fix
                 print(f"  [destinatario-fix] {dest_fix_print}")
+                if isinstance(dest_fix, dict) and dest_fix.get("reason") == "no-match":
+                    print(f"  [destinatario-fix] alvo={destinatario!r} opcoes={dest_fix.get('items')!r}")
             except Exception as e:
                 print(f"  Aviso: falha ao ajustar cbbUsuarios via dropdown: {e}")
 
@@ -3531,6 +3654,122 @@ def _validate_oficio_at_tokens(template: Optional[Path], generated: Path) -> Opt
     return generated
 
 
+def set_referencia_text(docx_path: Path | str, referencia_text: str) -> bool:
+    """Preenche o valor do campo 'Referência' do cabeçalho do ofício.
+
+    O modelo traz a linha 'Referência\\t' com o valor vazio (a ser preenchido).
+    Localiza o parágrafo cujo rótulo é 'Referência' e acrescenta o valor após o
+    rótulo (sem negrito, Times New Roman 12). Retorna True se preencheu.
+    """
+    referencia_text = (referencia_text or "").strip()
+    if not referencia_text:
+        return False
+    try:
+        from docx import Document  # type: ignore
+        from docx.shared import Pt  # type: ignore
+    except Exception:
+        return False
+    doc = Document(str(docx_path))
+    for p in doc.paragraphs:
+        label = normalize(p.text or "").strip().lower()
+        # rótulo é exatamente "referencia" (eventualmente seguido de tab/espacos vazios)
+        if label == "referencia" or label.startswith("referencia\t") or label.replace("\t", "").strip() == "referencia":
+            # Garante um TAB separando rótulo e valor se ainda não houver.
+            if "\t" not in (p.text or ""):
+                p.add_run("\t")
+            run = p.add_run(referencia_text)
+            run.bold = False
+            try:
+                run.font.name = "Times New Roman"
+                run.font.size = Pt(12)
+            except Exception:
+                pass
+            doc.save(str(docx_path))
+            return True
+    return False
+
+
+def _replace_span_preserving_runs(paragraph, pattern: str, new_text: str) -> bool:
+    """Substitui a 1ª ocorrência de `pattern` num parágrafo SEM colapsar runs.
+
+    O substituto é injetado no primeiro run que faz interseção com o trecho
+    casado (herdando a formatação desse run); os demais runs do trecho têm
+    apenas a parte casada removida. Runs que NÃO fazem parte do trecho ficam
+    intactos — preservando, por exemplo, o negrito de '60 (sessenta) dias
+    corridos' no mesmo parágrafo onde fica o 'Ofício SSG XXXX/2025'.
+    """
+    runs = paragraph.runs
+    if not runs:
+        return False
+    full = "".join(r.text for r in runs)
+    m = re.search(pattern, full)
+    if not m:
+        return False
+    start, end = m.start(), m.end()
+    pos = 0
+    inserted = False
+    for r in runs:
+        r_start = pos
+        r_end = pos + len(r.text)
+        pos = r_end
+        ov_s = max(r_start, start)
+        ov_e = min(r_end, end)
+        if ov_s >= ov_e:
+            continue  # run não intersecta o trecho casado
+        before = r.text[: ov_s - r_start]
+        after = r.text[ov_e - r_start:]
+        insert = ""
+        if not inserted:
+            insert = new_text
+            inserted = True
+        r.text = before + insert + after
+    return inserted
+
+
+def set_oficio_ssg_ref(docx_path: Path | str, ssg_ref: str) -> bool:
+    """Substitui o placeholder 'Ofício SSG XXXX/AAAA' do corpo pelo nº real.
+
+    No modelo de dilação o número vem como 'XXXX/2025' partido em mais de um
+    run ('XXXX/202' + '5'); por isso a substituição precisa olhar o texto
+    concatenado do parágrafo. Usa replace run-preservante para NÃO destruir o
+    negrito de '60 (sessenta) dias corridos' que vive no mesmo parágrafo.
+    Retorna True se substituiu.
+    """
+    ssg_ref = (ssg_ref or "").strip()
+    if not ssg_ref:
+        return False
+    try:
+        from docx import Document  # type: ignore
+    except Exception:
+        return False
+    doc = Document(str(docx_path))
+    # Casa o placeholder literal 'XXXX/AAAA' (ano com 4 dígitos), preservando
+    # o prefixo 'Ofício SSG ' que já está correto no modelo.
+    pattern = r"XXXX/\d{4}"
+
+    def _walk(paragraphs) -> bool:
+        for p in paragraphs:
+            if "XXXX/" in (p.text or "") and _replace_span_preserving_runs(p, pattern, ssg_ref):
+                return True
+        return False
+
+    changed = _walk(doc.paragraphs)
+    if not changed:
+        for table in getattr(doc, "tables", []) or []:
+            for row in table.rows:
+                for cell in row.cells:
+                    if _walk(cell.paragraphs):
+                        changed = True
+                        break
+                if changed:
+                    break
+            if changed:
+                break
+    if changed:
+        doc.save(str(docx_path))
+    return changed
+
+
 def generate_oficio_from_template(processo: str, output_dir: Path, extra: dict | None = None, template_path: Optional[Path] = None) -> Path | None:
     """Generate a DOCX response using a template when available; fallback to a simple layout.
 
@@ -3596,6 +3835,7 @@ def generate_oficio_from_template(processo: str, output_dir: Path, extra: dict |
                     or effective_mapping.get("{ENCAMINHA}")
                     or effective_mapping.get("Cópia da(s) peça(s) dos autos.")
                     or effective_mapping.get("Cópia da(s) peça(s) dos autos")
+                    or (os.getenv("OFICIO_ENCAMINHA_TEXT") or "").strip() or None
                 )
                 if encaminha_value and not env_bool("OFICIO_ENCAMINHA_TEXT_BOLD", False):
                     set_encaminha_text_without_bold(out_path, encaminha_value)
@@ -3603,6 +3843,22 @@ def generate_oficio_from_template(processo: str, output_dir: Path, extra: dict |
                 print(f"Oficio gerado por cópia/conversão + substituições seguras: {out_path.resolve()}")
             else:
                 print(f"Oficio gerado por cópia/conversão sem reserialização: {out_path.resolve()}")
+            referencia_text = (os.getenv("OFICIO_REFERENCIA_TEXT") or "").strip()
+            if referencia_text:
+                if set_referencia_text(out_path, referencia_text):
+                    print(f"Referência preenchida: '{referencia_text}'")
+                    assert_at_tokens_preserved(template_path, out_path)
+                else:
+                    print("Aviso: campo 'Referência' não encontrado no template para preencher.")
+            # SSG do corpo (dilação): substituição run-preservante para NÃO
+            # colapsar o negrito de '60 (sessenta) dias corridos' do parágrafo.
+            ssg_ref = (os.getenv("OFICIO_SSG_REF") or "").strip()
+            if ssg_ref:
+                if set_oficio_ssg_ref(out_path, ssg_ref):
+                    print(f"Referência SSG no corpo preenchida: 'SSG {ssg_ref}'")
+                    assert_at_tokens_preserved(template_path, out_path)
+                else:
+                    print("Aviso: placeholder 'SSG XXXX/AAAA' não encontrado no corpo para preencher.")
             return _validate_oficio_at_tokens(template_path, out_path)
         except Exception as e:
             print(f"Aviso: falha ao gerar pelo template '{template_path.name}' ({e}). Usando modelo simples.")
@@ -3907,7 +4163,17 @@ def _classify_tipo_from_text_and_piece(text: str, last_piece_name: Optional[str]
 
     Regras inspiradas nas palavras-chave fornecidas e no nome da última peça,
     considerando tanto o texto do último PDF quanto o da capa (primeiro PDF).
+
+    Override: se FORCE_TIPO estiver definido (UTAP|DILACAO|REITERACAO|JUIZO),
+    ele tem prioridade máxima — usado quando o operador já sabe o tipo do lote
+    e o classificador automático poderia errar (ex.: dilação sem as palavras-
+    chave esperadas no PDF). Garante template E descrição da comunicação
+    coerentes com o tipo informado.
     """
+    forced = normalize(os.getenv("FORCE_TIPO") or "").upper().strip()
+    if forced in {"UTAP", "DILACAO", "REITERACAO", "JUIZO"}:
+        return forced
+
     # Alta prioridade: nome da peça
     piece = normalize(last_piece_name or "").lower()
     if "juizo singular" in piece:
@@ -6041,6 +6307,101 @@ def tramitar_processo_para_destino(context, page, processo: str, destino: str) -
     return confirmed
 
 
+def _enumerate_piece_names(page) -> list[tuple[int, str]]:
+    """Lista (index_ato, nome) das peças do visualizador, ordenadas por index_ato.
+
+    Reaproveita os mesmos seletores de click_last_piece_and_open_pdf. Usado pela
+    auto-extração de dilação (nº do Ofício SSG da peça após o último MANUTAP-OF).
+    """
+    viewer_frame = None
+    try:
+        viewer_frame = find_frame_with_selector(page, "#splLeitorDocumentos_pgcPecas_trePecas", timeout_ms=30000)
+    except Exception:
+        viewer_frame = page
+    if not viewer_frame:
+        viewer_frame = page
+    piece_selector = (
+        "a[onclick*='LerPDF'], "
+        "a[onclick*='setCodArquivoDigital'], "
+        "a[index_ato], "
+        "a[cod_arquivo_digital_criptografado], "
+        "a[index]"
+    )
+    loc = viewer_frame.locator(piece_selector)
+    count = 0
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            count = loc.count()
+            if count > 0:
+                break
+        except Exception:
+            count = 0
+        time.sleep(0.5)
+    pieces: list[tuple[int, str]] = []
+    for i in range(count):
+        item = loc.nth(i)
+        val = item.get_attribute("index_ato") or item.get_attribute("index") or ""
+        try:
+            iv = int(re.findall(r"\d+", val)[0]) if val else i
+        except Exception:
+            iv = i
+        try:
+            name = (item.inner_text(timeout=500) or item.text_content(timeout=500) or "").strip()
+        except Exception:
+            name = ""
+        if name:
+            pieces.append((iv, name))
+    pieces.sort(key=lambda x: x[0])
+    return pieces
+
+
+def _extract_ssg_ref_after_manutap(pieces: list[tuple[int, str]]) -> str:
+    """nº do Ofício SSG a partir do NOME da peça logo após o último MANUTAP-OF.
+
+    Ex.: peça '3. MANUTAP-OF ...' seguida de '4. OF SSG - 19547/2025 - ...'
+    devolve '19547/2025'.
+    """
+    manutap_idx = None
+    for iv, name in pieces:
+        if "manutap-of" in normalize(name).lower():
+            manutap_idx = iv
+    if manutap_idx is None:
+        return ""
+    nxt_name = next((name for iv, name in pieces if iv == manutap_idx + 1), "")
+    if not nxt_name:
+        return ""
+    m = re.search(r"SSG\s*[-–:]?\s*(\d{2,6}\s*/\s*\d{4})", nxt_name, re.I)
+    if not m:
+        return ""
+    return re.sub(r"\s+", "", m.group(1))
+
+
+def _extract_referencia_from_requerimento(context, page, output_dir: Path, processo: str) -> str:
+    """Texto da Referência a partir da última peça REQUERIMENTO.
+
+    Abre a peça REQUERIMENTO, lê o PDF e captura a 1ª linha do tipo
+    'Ofício nº 818/2026 - SME / COGEP / DITEM' (o nº do ofício de origem que
+    encabeça o requerimento). Devolve a linha normalizada ou "".
+    """
+    try:
+        pdf_path, _title, _num = click_last_piece_and_open_pdf(
+            context, page, output_dir, processo,
+            position="match:REQUERIMENTO", return_piece_number=True,
+        )
+    except Exception:
+        pdf_path = None
+    if not pdf_path:
+        return ""
+    text = extract_text_from_pdf(pdf_path) or ""
+    # 1ª ocorrência de 'Ofício nº <num>/<ano>' (o marcador 'nº' evita casar com
+    # 'ofício SSG nº 13808/2026' citado no corpo do requerimento).
+    m = re.search(r"Of[ií]cio\s+n[º°\.º°]+\s*\d+\s*/\s*\d{4}[^\n\r]*", text, re.I)
+    if not m:
+        return ""
+    return re.sub(r"\s+", " ", m.group(0)).strip()
+
+
 def process_processo_pipeline(context, main_page, output_dir: Path, processo_num: str, use_caixa_correio: bool):
     """Fluxo completo: abre o processo, baixa PDF, gera oficio, cria comunicacao e anexa DOCX."""
     active_page = None
@@ -6151,6 +6512,49 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
             f"peça={piece_number or 'indeterminada'}; título={piece_title or '-'}."
         )
 
+        # --- Auto-extração de dados de DILAÇÃO (referência + nº do Ofício SSG) ---
+        # Feita AQUI, com o visualizador recém-carregado e ANTES do cleanup, para
+        # ler com segurança as peças oficiais (que o cleanup não toca). Preenche
+        # OFICIO_SSG_REF e OFICIO_REFERENCIA_TEXT (sobrepondo eventual valor de
+        # ambiente), que são consumidos por generate_oficio_from_template.
+        try:
+            _pieces = _enumerate_piece_names(active_page)
+        except Exception as _e:
+            _pieces = []
+            print(f"Processo {processo_num}: aviso — falha ao enumerar peças p/ auto-extração: {_e}")
+        _forced_tipo = normalize(os.getenv("FORCE_TIPO") or "").upper().strip()
+        _is_dilacao = _forced_tipo == "DILACAO" or any(
+            ("requerimento" in normalize(n).lower() and "dila" in normalize(n).lower())
+            for _, n in _pieces
+        )
+        if _is_dilacao:
+            try:
+                _auto_ssg = _extract_ssg_ref_after_manutap(_pieces)
+            except Exception as _e:
+                _auto_ssg = ""
+                print(f"Processo {processo_num}: aviso — falha ao auto-extrair nº SSG: {_e}")
+            if _auto_ssg:
+                os.environ["OFICIO_SSG_REF"] = _auto_ssg
+                print(f"Processo {processo_num}: [dilação] nº Ofício SSG (peça após MANUTAP-OF) = {_auto_ssg}")
+            else:
+                print(
+                    f"Processo {processo_num}: [dilação] AVISO — não auto-extraí o nº do Ofício SSG; "
+                    f"mantendo OFICIO_SSG_REF='{os.getenv('OFICIO_SSG_REF','')}'."
+                )
+            try:
+                _auto_ref = _extract_referencia_from_requerimento(context, active_page, output_dir, processo_num)
+            except Exception as _e:
+                _auto_ref = ""
+                print(f"Processo {processo_num}: aviso — falha ao auto-extrair Referência: {_e}")
+            if _auto_ref:
+                os.environ["OFICIO_REFERENCIA_TEXT"] = _auto_ref
+                print(f"Processo {processo_num}: [dilação] Referência (peça REQUERIMENTO) = '{_auto_ref}'")
+            else:
+                print(
+                    f"Processo {processo_num}: [dilação] AVISO — não auto-extraí a Referência; "
+                    f"mantendo OFICIO_REFERENCIA_TEXT='{os.getenv('OFICIO_REFERENCIA_TEXT','')}'."
+                )
+
         # --- Cleanup adiado: roda APOS o PDF ter sido baixado com sucesso ---
         # Garante que nunca derrubaremos o Of'icio SSG existente sem ter os
         # dados necessarios para recriar.
@@ -6188,8 +6592,21 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
                 f"para preencher Encaminha em {processo_num}."
             )
             return
+        # Override do texto do Encaminha (ex.: dilação usa a referência ao
+        # ofício da Origem em vez de "Cópia da peça X"). Quando OFICIO_ENCAMINHA_TEXT
+        # esta definido, ele prevalece sobre o texto derivado do numero da peca.
+        encaminha_override = (os.getenv("OFICIO_ENCAMINHA_TEXT") or "").strip()
         encaminha_text = ""
-        if piece_number:
+        if encaminha_override:
+            encaminha_text = encaminha_override
+            fields.update({
+                "Cópia da(s) peça(s) dos autos.": encaminha_text,
+                "Cópia da(s) peça(s) dos autos": encaminha_text,
+                "{{ENCAMINHA}}": encaminha_text,
+                "{ENCAMINHA}": encaminha_text,
+            })
+            print(f"Processo {processo_num}: Encaminha definido por OFICIO_ENCAMINHA_TEXT = '{encaminha_text}'")
+        elif piece_number:
             try:
                 encaminha_text = format_encaminha_from_piece_numbers([piece_number])
                 fields.update({
@@ -6202,6 +6619,12 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
             except Exception as e:
                 print(f"ERRO bloqueante ao formatar Encaminha em {processo_num}: {e}")
                 return
+
+        # NB: a referência "Ofício SSG XXXX/AAAA" do CORPO NÃO entra mais em
+        # `fields` (que segue o caminho de replace colapsa-runs e destruiria o
+        # negrito de "60 (sessenta) dias corridos" do mesmo parágrafo). Ela é
+        # aplicada por set_oficio_ssg_ref() dentro de generate_oficio_from_template,
+        # lendo OFICIO_SSG_REF (preenchido por auto-extração logo acima).
         forced_tpl = _resolve_oficio_template() if os.getenv("OFICIO_TEMPLATE") else None
         tpl_path = forced_tpl or classify_and_select_template_path(pdf_text, piece_title, cover_text=cover_text)
         if forced_tpl:
@@ -6274,6 +6697,13 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
                     print(f"Processo {processo_num}: criando comunicacao processual.")
                     action_page = _open_fresh_apo_pen_page(context) or grid_page or main_page
                     caixa_target = open_caixa_correio_from_grid(context, action_page, processo_num)
+                    if not comunicacao_form_loaded(caixa_target):
+                        print(
+                            f"ERRO bloqueante: cadastro de Comunicacao Processual nao carregou para "
+                            f"{processo_num} (navegacao caiu fora do formulario — provavel redirect por "
+                            f"estado/fila do processo); abortando sem tentar preencher form inexistente."
+                        )
+                        return
                     comunicacao_ok = criar_comunicacao_processual(context, caixa_target, {
                         "processo": processo_num,
                         "secretaria": secretaria,
