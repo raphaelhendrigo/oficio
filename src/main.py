@@ -1750,8 +1750,27 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
                         } catch(e) {}
                     }"""
                 )
-                # 2) Aguarda lista popular (callback assincrono)
-                time.sleep(2)
+                # 2) Aguarda lista popular (callback assincrono).
+                # Wait-loop polling em vez de sleep fixo de 2s: enquete
+                # GetItemCount a cada 300ms ate items > 0 ou timeout de 10s.
+                # Sem isso, sob carga/latencia o callback nao termina nos 2s e
+                # a lista vem vazia (items_count=0) -> destinatario nao casa ->
+                # save da comm falha. Observado em 2026-05-25 no TC/009208/2023.
+                _items_wait_deadline = time.time() + 10.0
+                while time.time() < _items_wait_deadline:
+                    try:
+                        _items_now = form_container.evaluate(
+                            r"""() => {
+                                const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+                                const ctl = coll && coll.GetByName ? (coll.GetByName('cbbUsuarios') || coll.GetByName('ppcNoificacao_cbbUsuarios')) : window.cbbUsuarios;
+                                return (ctl && ctl.GetItemCount) ? ctl.GetItemCount() : 0;
+                            }"""
+                        )
+                        if _items_now and int(_items_now) > 0:
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.3)
                 dest_fix = form_container.evaluate(
                     r"""(target) => {
                         const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
@@ -1845,14 +1864,19 @@ def criar_comunicacao_processual(context, page_like, dados: dict) -> bool:
                 raise RuntimeError("botao Salvar/Nova comunicacao nao localizado no formulario ppcNoificacao")
 
             # Verificacao REAL: linha apareceu na grid + popup fechou.
-            saved_ok = _wait_for_comunicacao_saved(form_container, target, rows_before, timeout_ms=45000)
+            # Timeout aumentado de 45s -> 120s em 2026-05-25 apos observacao
+            # de que TC/008918/2022 e TC/011771/2022 (grids com 7+ linhas
+            # pre-existentes) falhavam consistentemente 4/4 com popup ja
+            # fechado no momento da deteccao — confirmacao server-side
+            # demorava alem da janela de 45s.
+            saved_ok = _wait_for_comunicacao_saved(form_container, target, rows_before, timeout_ms=120000)
             if not saved_ok:
                 dump = _dump_form_state_html(form_container, processo, "comunicacao_save_falhou")
                 if dump:
                     print(f"  HTML pos-save salvo em: {dump}")
                 raise RuntimeError(
                     f"comunicacao processual NAO foi confirmada na grid para {processo} "
-                    f"(rows_before={rows_before}; popup nao fechou OR grid nao avancou em 45s)"
+                    f"(rows_before={rows_before}; popup nao fechou OR grid nao avancou em 120s)"
                 )
 
             print(f"Comunicacao processual CRIADA E CONFIRMADA na grid para o processo {processo} "
@@ -6377,6 +6401,72 @@ def _extract_ssg_ref_after_manutap(pieces: list[tuple[int, str]]) -> str:
     return re.sub(r"\s+", "", m.group(1))
 
 
+def _extract_reiteracao_data_from_pieces(pieces: list[tuple[int, str]]) -> dict:
+    """Dados de REITERAÇÃO a partir do NOME das peças (sem baixar PDFs extras).
+
+    Regras (briefing Gilson Nóbrega, 2026-05-25):
+      - Referência (cabeçalho): "Ofício SSG <num/ano>, encaminhado eletronicamente em <DD/MM/AAAA>."
+        — num/ano e data são da peça SSG logo APÓS o último MANUTAP-OF (o ofício
+        que está sendo reiterado).
+      - Encaminha: "Cópia das peças <MANUTAP> e <DES> dos autos." — números de
+        display (não index_ato) da última peça MANUTAP-OF e da última peça
+        DESPACHO (DES) do conselheiro.
+      - Corpo do ofício (SSG): mesmo nº/ano da Referência.
+
+    Cada título de peça segue o padrão:
+        "<seq>. <TIPO> - <num/ano> - <DD/MM/AAAA> - <UNIDADE>"
+    Ex.: "14. MANUTAP-OF - 3957/2025 - 05/11/2025 - UNIDADE TÉCNICA..."
+
+    Retorna dict com ssg_ref, ssg_date, manutap_seq, des_seq, ssg_seq. Strings
+    vazias quando não conseguir extrair; não dispara exceção.
+    """
+    out = {"ssg_ref": "", "ssg_date": "", "manutap_seq": "", "des_seq": "", "ssg_seq": ""}
+    if not pieces:
+        return out
+
+    seq_re = re.compile(r"^\s*(\d+)\.\s*")
+
+    # 1) Última peça MANUTAP-OF (a de maior idx_ato).
+    manutap_idx = None
+    manutap_name = ""
+    for iv, name in pieces:
+        if "manutap-of" in normalize(name).lower():
+            manutap_idx = iv
+            manutap_name = name
+    if manutap_idx is None:
+        return out
+    m_seq = seq_re.search(manutap_name)
+    if m_seq:
+        out["manutap_seq"] = m_seq.group(1)
+
+    # 2) Peça SSG logo após o MANUTAP-OF: é a que está sendo reiterada.
+    ssg_name = next((name for iv, name in pieces if iv == manutap_idx + 1), "")
+    if ssg_name:
+        m_ssg = re.search(r"SSG\s*[-–:]?\s*(\d{2,6}\s*/\s*\d{4})", ssg_name, re.I)
+        if m_ssg:
+            out["ssg_ref"] = re.sub(r"\s+", "", m_ssg.group(1))
+        m_date = re.search(r"(\d{2}/\d{2}/\d{4})", ssg_name)
+        if m_date:
+            out["ssg_date"] = m_date.group(1)
+        m_ssg_seq = seq_re.search(ssg_name)
+        if m_ssg_seq:
+            out["ssg_seq"] = m_ssg_seq.group(1)
+
+    # 3) Última peça DES (despacho do conselheiro pedindo reiteração).
+    # Match estrito "DES - <num>/<ano>" para evitar falsos positivos.
+    des_re = re.compile(r"\bDES\s*[-–]\s*\d+\s*/\s*\d{4}", re.I)
+    des_name = ""
+    for iv, name in pieces:
+        if des_re.search(name):
+            des_name = name  # itera em ordem, ultima atribuicao = mais recente
+    if des_name:
+        m_des_seq = seq_re.search(des_name)
+        if m_des_seq:
+            out["des_seq"] = m_des_seq.group(1)
+
+    return out
+
+
 def _extract_referencia_from_requerimento(context, page, output_dir: Path, processo: str) -> str:
     """Texto da Referência a partir da última peça REQUERIMENTO.
 
@@ -6408,6 +6498,10 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
     grid_page = None
     action_page = None
     caixa_target = None
+    processo_env_overrides = {
+        "OFICIO_SSG_REF": os.environ.get("OFICIO_SSG_REF"),
+        "OFICIO_REFERENCIA_TEXT": os.environ.get("OFICIO_REFERENCIA_TEXT"),
+    }
     try:
         print(f"Iniciando pipeline do processo {processo_num}.")
         authorized_processos = _parse_processos_env(os.getenv("ONLY_PROCESSOS_AUTHORIZED"))
@@ -6554,6 +6648,78 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
                     f"Processo {processo_num}: [dilação] AVISO — não auto-extraí a Referência; "
                     f"mantendo OFICIO_REFERENCIA_TEXT='{os.getenv('OFICIO_REFERENCIA_TEXT','')}'."
                 )
+            if env_bool("DILACAO_REQUIRE_AUTO_EXTRACT", False):
+                missing = []
+                if not (os.getenv("OFICIO_SSG_REF") or "").strip():
+                    missing.append("nº Ofício SSG")
+                if not (os.getenv("OFICIO_REFERENCIA_TEXT") or "").strip():
+                    missing.append("Referência")
+                if missing:
+                    print(
+                        f"ERRO bloqueante: dilação de {processo_num} sem autoextração de "
+                        f"{', '.join(missing)}; DOCX/comunicação não serão criados."
+                    )
+                    return
+
+        # --- Auto-extração de dados de REITERAÇÃO (briefing Gilson, 2026-05-25) ---
+        # Pega tudo do NOME das peças (não baixa PDFs extras):
+        #   - Referência:  Ofício SSG <num/ano>, encaminhado eletronicamente em <data>.
+        #     (a peça SSG logo APÓS o último MANUTAP-OF)
+        #   - Encaminha:   peças MANUTAP-OF (ultima) + DES (ultima), via env var
+        #     OFICIO_ENCAMINHA_PIECE_NUMBERS consumida pelo bloco de Encaminha
+        #     mais abaixo.
+        #   - Corpo SSG:   mesmo nº/ano da Referência.
+        # Acionada por FORCE_TIPO=REITERACAO. Coexiste com dilação (são mutuamente
+        # exclusivas via _forced_tipo).
+        _is_reiteracao = _forced_tipo == "REITERACAO"
+        if _is_reiteracao:
+            try:
+                _r = _extract_reiteracao_data_from_pieces(_pieces)
+            except Exception as _e:
+                _r = {}
+                print(f"Processo {processo_num}: aviso — falha em _extract_reiteracao_data_from_pieces: {_e}")
+            if _r.get("ssg_ref"):
+                os.environ["OFICIO_SSG_REF"] = _r["ssg_ref"]
+                print(f"Processo {processo_num}: [reiteração] nº Ofício SSG (peça após MANUTAP-OF) = {_r['ssg_ref']}")
+            else:
+                print(
+                    f"Processo {processo_num}: [reiteração] AVISO — não auto-extraí o nº do Ofício SSG; "
+                    f"mantendo OFICIO_SSG_REF='{os.getenv('OFICIO_SSG_REF','')}'."
+                )
+            if _r.get("ssg_ref") and _r.get("ssg_date"):
+                _ref_txt = f"Ofício SSG {_r['ssg_ref']}, encaminhado eletronicamente em {_r['ssg_date']}."
+                os.environ["OFICIO_REFERENCIA_TEXT"] = _ref_txt
+                print(f"Processo {processo_num}: [reiteração] Referência = '{_ref_txt}'")
+            else:
+                print(
+                    f"Processo {processo_num}: [reiteração] AVISO — não auto-extraí a Referência; "
+                    f"mantendo OFICIO_REFERENCIA_TEXT='{os.getenv('OFICIO_REFERENCIA_TEXT','')}'."
+                )
+            if _r.get("manutap_seq") and _r.get("des_seq"):
+                os.environ["OFICIO_ENCAMINHA_PIECE_NUMBERS"] = f"{_r['manutap_seq']},{_r['des_seq']}"
+                print(
+                    f"Processo {processo_num}: [reiteração] Encaminha vai usar peças "
+                    f"{_r['manutap_seq']} (MANUTAP) e {_r['des_seq']} (DES)."
+                )
+            else:
+                print(
+                    f"Processo {processo_num}: [reiteração] AVISO — não auto-extraí as peças do Encaminha "
+                    f"(MANUTAP/DES); fallback será a peça preferida."
+                )
+            if env_bool("REITERACAO_REQUIRE_AUTO_EXTRACT", False):
+                missing = []
+                if not (os.getenv("OFICIO_SSG_REF") or "").strip():
+                    missing.append("nº Ofício SSG")
+                if not (os.getenv("OFICIO_REFERENCIA_TEXT") or "").strip():
+                    missing.append("Referência")
+                if not (os.getenv("OFICIO_ENCAMINHA_PIECE_NUMBERS") or "").strip():
+                    missing.append("peças Encaminha (MANUTAP+DES)")
+                if missing:
+                    print(
+                        f"ERRO bloqueante: reiteração de {processo_num} sem autoextração de "
+                        f"{', '.join(missing)}; DOCX/comunicação não serão criados."
+                    )
+                    return
 
         # --- Cleanup adiado: roda APOS o PDF ter sido baixado com sucesso ---
         # Garante que nunca derrubaremos o Of'icio SSG existente sem ter os
@@ -6597,21 +6763,58 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
         # esta definido, ele prevalece sobre o texto derivado do numero da peca.
         encaminha_override = (os.getenv("OFICIO_ENCAMINHA_TEXT") or "").strip()
         encaminha_text = ""
+        # Lista explicita de peças para o Encaminha (ex.: REITERACAO usa
+        # [MANUTAP, DESPACHO], setado pela auto-extração mais acima). Tem
+        # prioridade SOBRE piece_number (single), mas perde para
+        # OFICIO_ENCAMINHA_TEXT (override total).
+        encaminha_piece_nums_env = (os.getenv("OFICIO_ENCAMINHA_PIECE_NUMBERS") or "").strip()
         if encaminha_override:
             encaminha_text = encaminha_override
             fields.update({
                 "Cópia da(s) peça(s) dos autos.": encaminha_text,
                 "Cópia da(s) peça(s) dos autos": encaminha_text,
+                # Templates de REITERACAO tem "Cópia da(s) peça(s) XX dos autos"
+                # com 'XX' literal (placeholder). Sem essas entradas, o XX nao
+                # e substituido -> validacao do DOCX falha em Encaminha. (added 2026-05-25)
+                "Cópia da(s) peça(s) XX dos autos.": encaminha_text,
+                "Cópia da(s) peça(s) XX dos autos": encaminha_text.rstrip("."),
                 "{{ENCAMINHA}}": encaminha_text,
                 "{ENCAMINHA}": encaminha_text,
             })
             print(f"Processo {processo_num}: Encaminha definido por OFICIO_ENCAMINHA_TEXT = '{encaminha_text}'")
+        elif encaminha_piece_nums_env:
+            try:
+                nums = [n.strip() for n in encaminha_piece_nums_env.split(",") if n.strip()]
+                if not nums:
+                    raise ValueError("OFICIO_ENCAMINHA_PIECE_NUMBERS vazio apos parse")
+                encaminha_text = format_encaminha_from_piece_numbers(nums)
+                fields.update({
+                    "Cópia da(s) peça(s) dos autos.": encaminha_text,
+                    "Cópia da(s) peça(s) dos autos": encaminha_text.rstrip("."),
+                    "Cópia da(s) peça(s) XX dos autos.": encaminha_text,
+                    "Cópia da(s) peça(s) XX dos autos": encaminha_text.rstrip("."),
+                    "{{ENCAMINHA}}": encaminha_text,
+                    "{ENCAMINHA}": encaminha_text,
+                })
+                # Importante: tambem propaga para OFICIO_ENCAMINHA_TEXT para
+                # que generate_oficio_from_template chame
+                # set_encaminha_text_without_bold() e force bold=False no
+                # conteudo apos a substituicao do "XX". Sem isso, o texto
+                # herda negrito do placeholder e o validador rejeita.
+                os.environ["OFICIO_ENCAMINHA_TEXT"] = encaminha_text
+                print(f"Processo {processo_num}: Encaminha (lista {nums}) = '{encaminha_text}'")
+            except Exception as e:
+                print(f"ERRO bloqueante ao formatar Encaminha (lista) em {processo_num}: {e}")
+                return
         elif piece_number:
             try:
                 encaminha_text = format_encaminha_from_piece_numbers([piece_number])
                 fields.update({
                     "Cópia da(s) peça(s) dos autos.": encaminha_text,
                     "Cópia da(s) peça(s) dos autos": encaminha_text.rstrip("."),
+                    # idem para o template de REITERACAO. Ver comentario acima.
+                    "Cópia da(s) peça(s) XX dos autos.": encaminha_text,
+                    "Cópia da(s) peça(s) XX dos autos": encaminha_text.rstrip("."),
                     "{{ENCAMINHA}}": encaminha_text,
                     "{ENCAMINHA}": encaminha_text,
                 })
@@ -6821,6 +7024,11 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
             except Exception as e:
                 print(f"Aviso: falha ao anexar DOCX: {e}")
     finally:
+        for name, value in processo_env_overrides.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         seen_pages = set()
         for p in [caixa_target, active_page, action_page, grid_page]:
             try:

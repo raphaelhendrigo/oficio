@@ -1,0 +1,108 @@
+$ErrorActionPreference = "Stop"
+
+# Retry isolado 2026-05-25 (TC/008918/2022 - Educacao, DILACAO):
+# Falhou nas 3 tentativas do lote run_32_processos_DILACAO_2026_05_25 no mesmo
+# ponto (comunicacao processual nao confirmada na grid - bug intermitente do
+# form DevExpress). Auto-extracao funcionou no batch:
+#   Referencia = "Ofício nº 847/2026 - SME / COGEP / DITEM"
+#   Oficio SSG = 13249/2025
+# Mesmo fluxo: cleanup destrutivo + comm + Oficio SSG (DILACAO Educacao) +
+# concluido + assinatura Roseli Chaves, SEM tramitar. Data 25/05/2026.
+
+foreach ($name in @("ETCM_USERNAME","ETCM_PASSWORD","ETCM_USER","ETCM_LOGIN","ETCM_PASS","ETCM_SENHA")) {
+    $val = [Environment]::GetEnvironmentVariable($name, "User")
+    if (-not [string]::IsNullOrEmpty($val)) { Set-Item -Path "Env:$name" -Value $val }
+}
+if (
+    [string]::IsNullOrWhiteSpace($env:ETCM_USERNAME) -and
+    [string]::IsNullOrWhiteSpace($env:ETCM_USER) -and
+    [string]::IsNullOrWhiteSpace($env:ETCM_LOGIN)
+) {
+    Write-Host "[ERRO] Usuario do e-TCM nao configurado em variavel de ambiente." -ForegroundColor Red
+    exit 1
+}
+
+$env:ETCM_URL = "https://etcm.tcm.sp.gov.br/paginas/login.aspx"
+$env:BASE_URL = "https://etcm.tcm.sp.gov.br/paginas/login.aspx"
+$env:PYTHONUNBUFFERED = "1"
+$env:PYTHONIOENCODING = "utf-8"
+
+$env:PROCESSOS_LIST = "TC/008918/2022"
+$env:ONLY_PROCESSOS_AUTHORIZED = "TC/008918/2022"
+
+$env:ENVIRONMENT = "producao"
+$env:HEADLESS = "false"
+$env:SHOW_BROWSER = "true"
+$env:WATCH_MODE = "true"
+$env:SLOWMO_MS = "200"
+$env:LOGIN_MANUAL_WAIT_MS = "60000"
+$env:PAUSE_AFTER_LOGIN_MS = "5000"
+
+$env:USE_CAIXA_CORREIO = "true"
+$env:SAFE_DELETE_OWN_DRAFTS = "true"
+$env:RUN_PROD_DESTRUCTIVE_CLEANUP = "true"
+$env:FORCE_DELETE_OLD_OFICIO_SSG = "true"
+$env:FORCE_RECREATE_COMUNICACAO = "true"
+$env:FORCE_REVOKE_PENDING_ROSELI_SIGNATURE = "true"
+$env:FORCE_DELETE_ALL_COMUNICACOES_AUTHORIZED = "false"
+$env:SKIP_COMUNICACAO_CLEANUP = "false"
+$env:REUSE_EXISTING_OFICIO = "false"
+
+$env:STOP_AFTER_OFICIO_CONCLUIDO = "false"
+$env:SKIP_SIGNATURE = "false"
+$env:REQUEST_SIGNATURE = "true"
+$env:ASSINANTE_NOME = "Roseli Chaves"
+$env:SIGNER_NAME = "Roseli Chaves"
+$env:SKIP_TRAMITACAO = "true"
+$env:TRAMITAR_DESTINO = ""
+$env:DISTRIBUIR_PARA = ""
+
+$env:COMUNICACAO_PRAZO_DIAS = "60"
+$env:COMUNICACAO_REFERENCIA = "gerado automaticamente"
+$env:STATUS_ENTREGA = "Normal"
+
+$env:OFICIO_TEMPLATE_MODE = "auto"
+$env:OFICIO_PRESERVE_AT_TOKENS = "true"
+$env:OFICIO_ADD_EUCLIDES_MARKER = "true"
+$env:OFICIO_EUCLIDES_MARKER = "/euclides"
+$env:OFICIO_REQUIRE_PIECE_NUMBER_IN_ENCAMINHA = "false"
+$env:OFICIO_ENCAMINHA_TEXT_BOLD = "false"
+$env:DATA_OFICIO = "25/05/2026"
+$env:OFICIO_DATA = "25/05/2026"
+
+$env:MAX_PROCESSOS = "0"
+
+Set-Location -Path $PSScriptRoot
+
+if (-not (Test-Path "output")) { New-Item -ItemType Directory -Path "output" | Out-Null }
+if (-not (Test-Path "logs")) { New-Item -ItemType Directory -Path "logs" | Out-Null }
+if (-not (Test-Path "artifacts\evidence")) { New-Item -ItemType Directory -Path "artifacts\evidence" -Force | Out-Null }
+
+$pythonExe = Join-Path ".venv\Scripts" "python.exe"
+if (-not (Test-Path $pythonExe)) { Write-Host "[ERRO] .venv nao encontrado." -ForegroundColor Red; exit 1 }
+
+Write-Host "[1/2] Rodando pytest oficial..." -ForegroundColor Cyan
+& $pythonExe -m pytest tests -q
+if ($LASTEXITCODE -ne 0) { Write-Host "[ERRO] pytest falhou. Abortando." -ForegroundColor Red; exit $LASTEXITCODE }
+
+# Override de DILACAO apos pytest (igual run_dilacao_TC_006237_2023.ps1)
+$env:FORCE_TIPO = "DILACAO"
+# Referencia e nº do Oficio SSG sao AUTO-EXTRAIDOS por processo. Fallbacks:
+$env:OFICIO_REFERENCIA_TEXT = "Ofício nº 847/2026 - SME / COGEP / DITEM"
+$env:OFICIO_SSG_REF = "13249/2025"
+
+Write-Host "[2/2] Retry isolado TC/008918/2022 (DILACAO Educacao, data 25/05/2026)..." -ForegroundColor Cyan
+$ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+$logPath = "logs\run_retry_TC_008918_2022_$ts.log"
+$sw = [System.IO.StreamWriter]::new($logPath, $false, [System.Text.UTF8Encoding]::new($false))
+try {
+    & $pythonExe ".\src\main.py" 2>&1 | ForEach-Object {
+        $line = "{0}`t{1}" -f (Get-Date).ToString("o"), $_
+        Write-Host $line
+        $sw.WriteLine($line); $sw.Flush()
+    }
+} finally { $sw.Close() }
+
+$ok = Select-String -Path $logPath -Pattern "Assinatura solicitada para .* no processo TC/008918/2022" -Quiet
+if ($ok) { Write-Host "RESULTADO: TC/008918/2022 -> OK" -ForegroundColor Green; exit 0 }
+else { Write-Host "RESULTADO: TC/008918/2022 -> FALHA (ver $logPath)" -ForegroundColor Red; exit 1 }
