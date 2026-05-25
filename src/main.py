@@ -3681,35 +3681,81 @@ def _validate_oficio_at_tokens(template: Optional[Path], generated: Path) -> Opt
 def set_referencia_text(docx_path: Path | str, referencia_text: str) -> bool:
     """Preenche o valor do campo 'Referência' do cabeçalho do ofício.
 
-    O modelo traz a linha 'Referência\\t' com o valor vazio (a ser preenchido).
-    Localiza o parágrafo cujo rótulo é 'Referência' e acrescenta o valor após o
-    rótulo (sem negrito, Times New Roman 12). Retorna True se preencheu.
+    Para templates onde o campo Referência tem conteúdo placeholder
+    pré-existente (ex.: 'Ofício SSG , [Escolher um item.] DATA' no template de
+    REITERAÇÃO), REMOVE todo o conteúdo após o rótulo 'Referência' antes de
+    inserir o valor novo. Sem isso, a auto-extração resulta em concatenação:
+    'Referência\tOfício SSG , Escolher um item.DATAOfício SSG 13464/2026...'.
+
+    Templates de UTAP/dilação têm valor vazio (ou 's/n'): a remoção é no-op.
+    JUÍZO não tem campo Referência (a função retorna False).
+
+    Retorna True se preencheu.
     """
     referencia_text = (referencia_text or "").strip()
     if not referencia_text:
         return False
     try:
         from docx import Document  # type: ignore
+        from docx.oxml.ns import qn  # type: ignore
         from docx.shared import Pt  # type: ignore
     except Exception:
         return False
     doc = Document(str(docx_path))
     for p in doc.paragraphs:
         label = normalize(p.text or "").strip().lower()
-        # rótulo é exatamente "referencia" (eventualmente seguido de tab/espacos vazios)
-        if label == "referencia" or label.startswith("referencia\t") or label.replace("\t", "").strip() == "referencia":
-            # Garante um TAB separando rótulo e valor se ainda não houver.
-            if "\t" not in (p.text or ""):
-                p.add_run("\t")
-            run = p.add_run(referencia_text)
-            run.bold = False
-            try:
-                run.font.name = "Times New Roman"
-                run.font.size = Pt(12)
-            except Exception:
-                pass
-            doc.save(str(docx_path))
-            return True
+        # rótulo é "referencia"/"referencias", podendo ter conteúdo após
+        # (tab + placeholder/SDT/garbage do template).
+        if not (
+            label == "referencia"
+            or label == "referencias"
+            or label.startswith("referencia\t")
+            or label.startswith("referencias\t")
+            or label.startswith("referencia ")
+            or label.startswith("referencias ")
+            or label.replace("\t", "").strip() == "referencia"
+            or label.replace("\t", "").strip() == "referencias"
+        ):
+            continue
+
+        # Limpa todo conteúdo APÓS o run do rótulo "Referência(s)" no
+        # parágrafo, incluindo runs com placeholder ('Ofício SSG ', 'DATA') e
+        # w:sdt (content controls 'Escolher um item.' no template de REITERAÇÃO).
+        # Sem isso, p.add_run abaixo APENDARIA o valor após o lixo do template,
+        # gerando texto duplicado visível no ofício final.
+        p_xml = p._p
+        children = list(p_xml)
+        last_label_idx = -1
+        accumulated_letters = ""
+        for i, child in enumerate(children):
+            if child.tag == qn("w:r"):
+                run_text = "".join((t.text or "") for t in child.findall(qn("w:t")))
+                # Junta só letras (sem acento/tab/espaco/pontuacao) para
+                # detectar quando o nome do rótulo completa.
+                accumulated_letters += normalize(run_text).replace(" ", "").replace("\t", "").lower()
+                if accumulated_letters.endswith("referencia") or accumulated_letters.endswith("referencias"):
+                    last_label_idx = i
+                    break
+        if last_label_idx < 0:
+            # Nao conseguiu identificar o final do rótulo; segue para o
+            # comportamento antigo (apenas adicionar) como fallback.
+            pass
+        else:
+            for child in children[last_label_idx + 1:]:
+                p_xml.remove(child)
+
+        # Garante um TAB separando rótulo e valor se ainda não houver.
+        if "\t" not in (p.text or ""):
+            p.add_run("\t")
+        run = p.add_run(referencia_text)
+        run.bold = False
+        try:
+            run.font.name = "Times New Roman"
+            run.font.size = Pt(12)
+        except Exception:
+            pass
+        doc.save(str(docx_path))
+        return True
     return False
 
 
