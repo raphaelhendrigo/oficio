@@ -226,6 +226,45 @@ A planilha `Processos_*.pdf` é exportada do e-TCM. **Coluna "N° Processo"
 (página 2)** é a única fonte autoritativa — não a primeira página (que tem
 agrupamentos visuais). Veja `MEMORY.md → reference-planilha-processos`.
 
+### 6.8 Scripts `.ps1` DEVEM ser 100% ASCII (sem acentos, sem em-dash)
+PowerShell 5.1 (`powershell.exe`, o que o Task Scheduler usa) lê arquivos
+`.ps1` SEM BOM com o codepage do sistema — Windows-1252 em pt-BR. Caracteres
+multi-byte UTF-8 (acentos, em-dash `—` U+2014, aspas tipográficas) decodificam
+para bytes que incluem U+201D (`"` aspas direitas) e outros chars que o lexer
+trata como delimitador de string. Resultado: parse error 7+ linhas depois do
+caractere ofensor, mesmo se ele estiver dentro de uma string ou comentário.
+
+**Sintoma operacional:** task agendada dispara mas `powershell.exe` sai em
+**<1s com exit code 2147942401 (=0x80070001)** sem escrever nenhum log. Event
+Viewer (Microsoft-Windows-TaskScheduler/Operational) registra o `código de
+retorno 2147942401` na action. Aconteceu com o `run_LOTE_2026_05_26_*.ps1`
+em 26/05/2026: em-dash dentro de `Log-Both "WRAPPER ... — INICIO ..."` quebrou
+o parse; nenhum dos 13 processos do lote foi tocado.
+
+**Regra:** todo `.ps1` neste repo é escrito em ASCII puro — `dilacao` (não
+`dilação`), `--` (não `—`), `Saude` (não `Saúde`). Strings que serão impressas
+em logs/relatórios podem ter acentos APENAS se gravadas com BOM UTF-8 explícito
+(raro; geralmente ASCII serve).
+
+**Diagnóstico rápido** (rodar quando uma task agendada sair em <1s):
+
+```powershell
+$errors = $null
+[void][System.Management.Automation.Language.Parser]::ParseFile(
+    "<caminho.ps1>", [ref]$null, [ref]$errors
+)
+$errors | ForEach-Object {
+    "  L{0}:{1}  {2}" -f $_.Extent.StartLineNumber, $_.Extent.StartColumnNumber, $_.Message
+}
+```
+
+Se aparecer erro de "string sem terminador" ou "token X inesperado" em uma
+linha que parece OK, suspeitar de não-ASCII em alguma linha acima. Caçar com:
+
+```powershell
+Select-String -Path "<caminho.ps1>" -Pattern '[^\x00-\x7F]' -AllMatches
+```
+
 ## 7. Agendamento (Windows Task Scheduler, não scheduler remoto)
 
 O fluxo é headful local com credenciais locais — **scheduler remoto na nuvem
