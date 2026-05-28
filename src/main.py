@@ -6505,6 +6505,18 @@ def _extract_reiteracao_data_from_pieces(pieces: list[tuple[int, str]]) -> dict:
     for iv, name in pieces:
         if des_re.search(name):
             des_name = name  # itera em ordem, ultima atribuicao = mais recente
+
+    # 3b) Fallback: quando o gabinete devolveu via ENC em vez de DES (caso
+    # observado em 2026-05-28 nos processos TC/004770/2023 e TC/004038/2024),
+    # usa a última peça ENC originada do "GABINETE ... CONSELHEIRO". A
+    # restrição pela unidade evita pegar ENC de UTOF/UTAP, que são internos
+    # do trâmite e não representam manifestação do relator.
+    if not des_name:
+        enc_re = re.compile(r"\bENC\s*[-–]\s*\d+\s*/\s*\d{4}", re.I)
+        for iv, name in pieces:
+            if enc_re.search(name) and "GABINETE" in normalize(name).upper() and "CONSELHEIRO" in normalize(name).upper():
+                des_name = name
+
     if des_name:
         m_des_seq = seq_re.search(des_name)
         if m_des_seq:
@@ -6547,6 +6559,17 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
     processo_env_overrides = {
         "OFICIO_SSG_REF": os.environ.get("OFICIO_SSG_REF"),
         "OFICIO_REFERENCIA_TEXT": os.environ.get("OFICIO_REFERENCIA_TEXT"),
+        # OFICIO_ENCAMINHA_TEXT e OFICIO_ENCAMINHA_PIECE_NUMBERS adicionados em
+        # 2026-05-26: a auto-extração de REITERAÇÃO (e o caminho de lista de
+        # peças que propaga p/ OFICIO_ENCAMINHA_TEXT para de-bolding) escreve
+        # nessas env vars POR PROCESSO. Sem save/restore aqui, o valor do 1º
+        # processo do batch vazava para os subsequentes (encaminha_override
+        # ganha em prioridade sobre encaminha_piece_nums_env), fazendo 6 dos
+        # 9 oficios de reiteração do batch 26/05 saírem com Encaminha errado
+        # "Cópia das peças 04 e 14 dos autos." (valor do 1º processo) em vez
+        # do número correto de cada um.
+        "OFICIO_ENCAMINHA_TEXT": os.environ.get("OFICIO_ENCAMINHA_TEXT"),
+        "OFICIO_ENCAMINHA_PIECE_NUMBERS": os.environ.get("OFICIO_ENCAMINHA_PIECE_NUMBERS"),
     }
     try:
         print(f"Iniciando pipeline do processo {processo_num}.")

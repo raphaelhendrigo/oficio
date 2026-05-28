@@ -18,6 +18,18 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
+@pytest.fixture(autouse=True)
+def _clear_operator_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Garante que overrides de operador (definidos no ambiente para execucoes
+    de producao) NAO vazem para os testes, que verificam a logica padrao.
+
+    Ex.: FORCE_TIPO=DILACAO setado num shell faria o classificador retornar
+    sempre DILACAO e quebraria os testes de classificacao/selecao de modelo.
+    """
+    for var in ("FORCE_TIPO", "OFICIO_REFERENCIA_TEXT", "OFICIO_SSG_REF", "OFICIO_ENCAMINHA_TEXT"):
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture(scope="session")
 def project_root() -> Path:
     return ROOT
