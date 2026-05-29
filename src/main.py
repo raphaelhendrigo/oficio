@@ -6409,6 +6409,12 @@ def _enumerate_piece_names(page) -> list[tuple[int, str]]:
             count = 0
         time.sleep(0.5)
     pieces: list[tuple[int, str]] = []
+    # Filtra "peças" de verdade. O seletor casa tambem com botoes de
+    # navegacao do visualizador (">> Proximo Ato", "<< Ato Anterior")
+    # observados em 29/05/2026 no TC/016488/2024 — eles inflavam a
+    # contagem de pieces em 2 e quebravam o cálculo de des_seq do
+    # Encaminha. Peça real começa com "<num>. <TIPO>".
+    real_piece_re = re.compile(r"^\s*\d+\s*\.")
     for i in range(count):
         item = loc.nth(i)
         val = item.get_attribute("index_ato") or item.get_attribute("index") or ""
@@ -6420,7 +6426,7 @@ def _enumerate_piece_names(page) -> list[tuple[int, str]]:
             name = (item.inner_text(timeout=500) or item.text_content(timeout=500) or "").strip()
         except Exception:
             name = ""
-        if name:
+        if name and real_piece_re.match(name):
             pieces.append((iv, name))
     pieces.sort(key=lambda x: x[0])
     return pieces
@@ -6470,57 +6476,47 @@ def _extract_reiteracao_data_from_pieces(pieces: list[tuple[int, str]]) -> dict:
     if not pieces:
         return out
 
-    seq_re = re.compile(r"^\s*(\d+)\.\s*")
+    # IMPORTANTE: o "numero da peça" usado no Encaminha ("Copia das pecas X
+    # e Y dos autos.") corresponde a POSIÇÃO da peça na árvore visível do
+    # processo (display), NAO ao atributo HTML index_ato.
+    #
+    # Em processos onde atos antigos foram excluídos (cleanup destrutivo ou
+    # cancelamento de Oficio SSG em rascunho), index_ato fica esparso — ex.:
+    # arvore mostra 0..14 mas a peça 14 internamente tem index_ato=16. O
+    # operador vê "14. ENC ..." e essa é a referência correta no oficio.
+    #
+    # Bug observado em 29/05/2026 com TC/016628/2024: extraido des_seq=16
+    # gerou "Copia das pecas 03 e 16 dos autos." quando o correto era "03
+    # e 14". O fix passa a usar a posicao em pieces[] (que ja vem ordenada
+    # por iv em _enumerate_piece_names), garantindo que seja o número de
+    # display da arvore.
+    n = len(pieces)
 
-    # 1) Última peça MANUTAP-OF (a de maior idx_ato).
-    manutap_idx = None
-    manutap_name = ""
-    for iv, name in pieces:
+    # 1) Última peça MANUTAP-OF.
+    manutap_pos = None
+    for pos, (iv, name) in enumerate(pieces):
         if "manutap-of" in normalize(name).lower():
-            manutap_idx = iv
-            manutap_name = name
-    if manutap_idx is None:
+            manutap_pos = pos
+    if manutap_pos is None:
         return out
-    m_seq = seq_re.search(manutap_name)
-    if m_seq:
-        out["manutap_seq"] = m_seq.group(1)
+    out["manutap_seq"] = str(manutap_pos)
 
     # 2) Peça SSG logo após o MANUTAP-OF: é a que está sendo reiterada.
-    ssg_name = next((name for iv, name in pieces if iv == manutap_idx + 1), "")
-    if ssg_name:
+    if manutap_pos + 1 < n:
+        ssg_name = pieces[manutap_pos + 1][1]
         m_ssg = re.search(r"SSG\s*[-–:]?\s*(\d{2,6}\s*/\s*\d{4})", ssg_name, re.I)
         if m_ssg:
             out["ssg_ref"] = re.sub(r"\s+", "", m_ssg.group(1))
         m_date = re.search(r"(\d{2}/\d{2}/\d{4})", ssg_name)
         if m_date:
             out["ssg_date"] = m_date.group(1)
-        m_ssg_seq = seq_re.search(ssg_name)
-        if m_ssg_seq:
-            out["ssg_seq"] = m_ssg_seq.group(1)
+        out["ssg_seq"] = str(manutap_pos + 1)
 
-    # 3) Última peça DES (despacho do conselheiro pedindo reiteração).
-    # Match estrito "DES - <num>/<ano>" para evitar falsos positivos.
-    des_re = re.compile(r"\bDES\s*[-–]\s*\d+\s*/\s*\d{4}", re.I)
-    des_name = ""
-    for iv, name in pieces:
-        if des_re.search(name):
-            des_name = name  # itera em ordem, ultima atribuicao = mais recente
-
-    # 3b) Fallback: quando o gabinete devolveu via ENC em vez de DES (caso
-    # observado em 2026-05-28 nos processos TC/004770/2023 e TC/004038/2024),
-    # usa a última peça ENC originada do "GABINETE ... CONSELHEIRO". A
-    # restrição pela unidade evita pegar ENC de UTOF/UTAP, que são internos
-    # do trâmite e não representam manifestação do relator.
-    if not des_name:
-        enc_re = re.compile(r"\bENC\s*[-–]\s*\d+\s*/\s*\d{4}", re.I)
-        for iv, name in pieces:
-            if enc_re.search(name) and "GABINETE" in normalize(name).upper() and "CONSELHEIRO" in normalize(name).upper():
-                des_name = name
-
-    if des_name:
-        m_des_seq = seq_re.search(des_name)
-        if m_des_seq:
-            out["des_seq"] = m_des_seq.group(1)
+    # 3) Última peça anexada ao processo (qualquer tipo).
+    # Briefing Raphael 29/05: sempre a última peça da árvore, sem inspeção
+    # de tipo. Cobre DES, ENC do Gabinete, ou qualquer peça que o relator
+    # tenha anexado por ultimo.
+    out["des_seq"] = str(n - 1)
 
     return out
 

@@ -42,46 +42,105 @@ def test_referencia_regex_picks_header_oficio_not_body():
     assert re.sub(r"\s+", " ", m.group(0)).strip() == "Ofício nº 818/2026 - SME / COGEP / DITEM"
 
 
-def test_reiteracao_uses_des_when_present():
-    """Quando há DES, deve usar DES (comportamento anterior intacto)."""
-    pieces = [
-        (4, "4. MANUTAP-OF - 886/2026 - 05/03/2026 - UNIDADE TÉCNICA DE APOSENTADORIA E PENSÕES"),
-        (5, "5. OF SSG - 14354/2026 - 17/03/2026 - UNIDADE TÉCNICA DE OFÍCIOS"),
-        (8, "8. DES - 764/2026 - 26/05/2026 - GABINETE CONSELHEIRO JOAO ANTONIO"),
-        (9, "9. ENC - 828/2026 - 26/05/2026 - GABINETE DO CONSELHEIRO"),
+# pieces[] vinda de _enumerate_piece_names() ja vem ordenada pela árvore
+# visível do processo. Os testes abaixo passam pieces como se fossem o
+# espelho fiel da arvore: o numero a esquerda do . no name reflete a
+# posicao na lista — porque eh isso que o operador vê e usa como
+# "Cópia das peças X e Y dos autos.". O iv (1o membro da tupla) eh o
+# atributo HTML index_ato, que pode estar esparso por exclusoes anteriores
+# e NAO deve mais ser usado como numero de display.
+
+def _build_pieces(*titles_after_manutap) -> list[tuple[int, str]]:
+    """Constroi pieces[] simulando uma árvore tipica:
+    0..3 = CAPA/TITULO/PLAAN/MANUTAP-OF
+    4 = OF SSG da reiteracao (e os parametros sao as peças seguintes).
+    Os iv pulam 100 a cada peça apos a MANUTAP, simulando o cenario real
+    de exclusoes (display position != iv)."""
+    base = [
+        (0, "0. CAPA"),
+        (1, "1. TÍTULO DE APOSENTADORIA"),
+        (2, "2. PLAAN - 2495/2026 - 05/03/2026 - UNIDADE TÉCNICA DE APOSENTADORIA E PENSÕES"),
+        (3, "3. MANUTAP-OF - 886/2026 - 05/03/2026 - UNIDADE TÉCNICA DE APOSENTADORIA E PENSÕES"),
+        (4, "4. OF SSG - 14354/2026 - 17/03/2026 - UNIDADE TÉCNICA DE OFÍCIOS"),
     ]
+    out = list(base)
+    iv = 100  # iv esparso de proposito para validar que nao usamos mais iv
+    for t in titles_after_manutap:
+        out.append((iv, t))
+        iv += 100
+    return out
+
+
+def test_reiteracao_usa_posicao_quando_ultima_peca_e_des():
+    """Última peça é um DES (despacho do conselheiro). des_seq deve ser a
+    POSIÇÃO na árvore (display), não o iv."""
+    pieces = _build_pieces(
+        "5. PTC - 100/2026 - 10/04/2026 - UNIDADE TÉCNICA DE OFÍCIOS",
+        "6. ENC - 200/2026 - 10/04/2026 - UNIDADE TÉCNICA DE OFÍCIOS",
+        "7. INF - 300/2026 - 15/05/2026 - UNIDADE TÉCNICA DE CARTÓRIO",
+        "8. DES - 764/2026 - 26/05/2026 - GABINETE CONSELHEIRO JOAO ANTONIO",
+    )
     r = main._extract_reiteracao_data_from_pieces(pieces)
-    assert r["manutap_seq"] == "4"
-    assert r["des_seq"] == "8", "DES deve ter prioridade sobre ENC do gabinete"
+    assert r["manutap_seq"] == "3"
+    assert r["ssg_seq"] == "4"
+    assert r["des_seq"] == "8", "DES esta na posicao 8 da arvore (display), nao no iv"
     assert r["ssg_ref"] == "14354/2026"
 
 
-def test_reiteracao_fallback_enc_gabinete_when_no_des():
-    """Quando não há DES mas há ENC do GABINETE DO CONSELHEIRO, usa o ENC.
-    Caso observado em 2026-05-28: TC/004770/2023 e TC/004038/2024."""
-    pieces = [
-        (4, "4. MANUTAP-OF - 886/2026 - 05/03/2026 - UNIDADE TÉCNICA DE APOSENTADORIA E PENSÕES"),
-        (5, "5. OF SSG - 14354/2026 - 17/03/2026 - UNIDADE TÉCNICA DE OFÍCIOS"),
-        (7, "7. ENC - 2200/2026 - 23/03/2026 - UNIDADE TÉCNICA DE OFÍCIOS"),
-        (9, "9. ENC - 828/2026 - 26/05/2026 - GABINETE DO CONSELHEIRO"),
-    ]
+def test_reiteracao_usa_posicao_quando_ultima_peca_e_enc():
+    """Última peça é um ENC (qualquer unidade — sem inspeção de tipo)."""
+    pieces = _build_pieces(
+        "5. PTC - 100/2026 - 10/04/2026 - UNIDADE TÉCNICA DE OFÍCIOS",
+        "6. ENC - 200/2026 - 10/04/2026 - UNIDADE TÉCNICA DE OFÍCIOS",
+        "7. ENC - 828/2026 - 26/05/2026 - GABINETE DO CONSELHEIRO",
+    )
     r = main._extract_reiteracao_data_from_pieces(pieces)
-    assert r["manutap_seq"] == "4"
-    assert r["des_seq"] == "9", "ENC do GABINETE DO CONSELHEIRO deve servir de fallback do DES"
-    assert r["ssg_ref"] == "14354/2026"
+    assert r["manutap_seq"] == "3"
+    assert r["des_seq"] == "7"
 
 
-def test_reiteracao_fallback_ignora_enc_de_outras_unidades():
-    """ENC que não venha do gabinete do conselheiro NÃO deve servir de fallback
-    (ex.: ENC da UTOF/UTAP é trâmite interno, não manifestação do relator)."""
+def test_reiteracao_usa_posicao_quando_ultima_peca_e_qualquer_outro_tipo():
+    """A nova regra ignora o tipo — INF, PTC ou qualquer outro pode ser a
+    "2a peça do Encaminha" se for a ultima da arvore."""
+    pieces = _build_pieces(
+        "5. INF - 3922/2026 - 25/05/2026 - UNIDADE TÉCNICA DE CARTÓRIO",
+    )
+    r = main._extract_reiteracao_data_from_pieces(pieces)
+    assert r["manutap_seq"] == "3"
+    assert r["des_seq"] == "5", "ultima peça (INF) vai pro Encaminha de qualquer jeito"
+
+
+def test_reiteracao_simula_arvore_com_iv_esparso_de_tc_016628_2024():
+    """Caso real observado em 29/05/2026 com TC/016628/2024:
+       - arvore visivel mostra 15 peças (0..14)
+       - mas iv da ultima peça eh 16 (atos antigos excluidos)
+       - operador ve "14. ENC - 451/2026 - GABINETE RICARDO TORRES"
+       - oficio deve dizer "Cópia das peças 03 e 14 dos autos."
+    Antes do fix dava "03 e 16". Apos o fix da pos-based: "03 e 14"."""
     pieces = [
-        (4, "4. MANUTAP-OF - 886/2026 - 05/03/2026 - UNIDADE TÉCNICA DE APOSENTADORIA E PENSÕES"),
-        (5, "5. OF SSG - 14354/2026 - 17/03/2026 - UNIDADE TÉCNICA DE OFÍCIOS"),
-        (7, "7. ENC - 2200/2026 - 23/03/2026 - UNIDADE TÉCNICA DE OFÍCIOS"),
+        (0, "0. CAPA"),
+        (1, "1. TÍTULO DE APOSENTADORIA"),
+        (2, "2. PLAAN - 14553/2025 - 28/11/2025"),
+        (3, "3. MANUTAP-OF - 5027/2025 - 28/11/2025"),
+        (4, "4. OF SSG - 12046/2026 - 08/01/2026 - UNIDADE TÉCNICA DE OFÍCIOS"),
+        (5, "5. PTC - 134/2026 - 14/01/2026"),
+        (6, "6. ENC - 45/2026 - 14/01/2026"),
+        (7, "7. REQUERIMENTO - DILAÇÃO DE PRAZO - 002659/2026"),
+        (8, "8. INF - 1642/2026 - 25/03/2026"),
+        (9, "9. DES - 552/2026 - 26/03/2026 - GABINETE DO CONSELHEIRO RICARDO TORRES"),
+        (10, "10. OF SSG - 15088/2026 - 06/04/2026"),
+        (11, "11. PTC - 3577/2026 - 10/04/2026"),
+        (12, "12. ENC - 2921/2026 - 10/04/2026"),
+        (13, "13. INF - 3520/2026 - 14/05/2026"),
+        (16, "14. ENC - 451/2026 - 29/05/2026 - GABINETE DO CONSELHEIRO RICARDO TORRES"),
     ]
     r = main._extract_reiteracao_data_from_pieces(pieces)
-    assert r["manutap_seq"] == "4"
-    assert r["des_seq"] == "", "sem DES nem ENC do gabinete -> des_seq vazio (forca erro bloqueante)"
+    assert r["manutap_seq"] == "3"
+    assert r["ssg_seq"] == "4"
+    assert r["ssg_ref"] == "12046/2026"
+    assert r["des_seq"] == "14", (
+        "ultima peça da arvore esta na posicao 14, mesmo que seu iv seja 16"
+    )
 
 
 @pytest.mark.skipif(not TEMPLATE.exists(), reason="modelo de dilação ausente")
