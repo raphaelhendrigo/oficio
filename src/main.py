@@ -6409,6 +6409,12 @@ def _enumerate_piece_names(page) -> list[tuple[int, str]]:
             count = 0
         time.sleep(0.5)
     pieces: list[tuple[int, str]] = []
+    # Filtra "peças" de verdade. O seletor casa tambem com botoes de
+    # navegacao do visualizador (">> Proximo Ato", "<< Ato Anterior")
+    # observados em 29/05/2026 no TC/016488/2024 — eles inflavam a
+    # contagem de pieces em 2 e quebravam o cálculo de des_seq do
+    # Encaminha. Peça real começa com "<num>. <TIPO>".
+    real_piece_re = re.compile(r"^\s*\d+\s*\.")
     for i in range(count):
         item = loc.nth(i)
         val = item.get_attribute("index_ato") or item.get_attribute("index") or ""
@@ -6420,7 +6426,7 @@ def _enumerate_piece_names(page) -> list[tuple[int, str]]:
             name = (item.inner_text(timeout=500) or item.text_content(timeout=500) or "").strip()
         except Exception:
             name = ""
-        if name:
+        if name and real_piece_re.match(name):
             pieces.append((iv, name))
     pieces.sort(key=lambda x: x[0])
     return pieces
@@ -6450,74 +6456,67 @@ def _extract_ssg_ref_after_manutap(pieces: list[tuple[int, str]]) -> str:
 def _extract_reiteracao_data_from_pieces(pieces: list[tuple[int, str]]) -> dict:
     """Dados de REITERAÇÃO a partir do NOME das peças (sem baixar PDFs extras).
 
-    Regras:
+    Regras (briefing Gilson Nóbrega, 2026-05-25):
       - Referência (cabeçalho): "Ofício SSG <num/ano>, encaminhado eletronicamente em <DD/MM/AAAA>."
         — num/ano e data são da peça SSG logo APÓS o último MANUTAP-OF (o ofício
         que está sendo reiterado).
-      - Encaminha: "Cópia das peças <MANUTAP> e <ÚLTIMA> dos autos." — números
-        de display (não index_ato) da última peça MANUTAP-OF e da última peça
-        anexada ao processo.
+      - Encaminha: "Cópia das peças <MANUTAP> e <DES> dos autos." — números de
+        display (não index_ato) da última peça MANUTAP-OF e da última peça
+        DESPACHO (DES) do conselheiro.
       - Corpo do ofício (SSG): mesmo nº/ano da Referência.
 
     Cada título de peça segue o padrão:
         "<seq>. <TIPO> - <num/ano> - <DD/MM/AAAA> - <UNIDADE>"
     Ex.: "14. MANUTAP-OF - 3957/2025 - 05/11/2025 - UNIDADE TÉCNICA..."
 
-    Retorna dict com ssg_ref, ssg_date, manutap_seq, last_seq, des_seq, ssg_seq.
-    des_seq é mantido como alias legado de last_seq para o restante do pipeline.
-    Strings vazias quando não conseguir extrair; não dispara exceção.
+    Retorna dict com ssg_ref, ssg_date, manutap_seq, des_seq, ssg_seq. Strings
+    vazias quando não conseguir extrair; não dispara exceção.
     """
-    out = {"ssg_ref": "", "ssg_date": "", "manutap_seq": "", "last_seq": "", "des_seq": "", "ssg_seq": ""}
+    out = {"ssg_ref": "", "ssg_date": "", "manutap_seq": "", "des_seq": "", "ssg_seq": ""}
     if not pieces:
         return out
 
-    seq_re = re.compile(r"^\s*(\d+)\.\s*")
+    # IMPORTANTE: o "numero da peça" usado no Encaminha ("Copia das pecas X
+    # e Y dos autos.") corresponde a POSIÇÃO da peça na árvore visível do
+    # processo (display), NAO ao atributo HTML index_ato.
+    #
+    # Em processos onde atos antigos foram excluídos (cleanup destrutivo ou
+    # cancelamento de Oficio SSG em rascunho), index_ato fica esparso — ex.:
+    # arvore mostra 0..14 mas a peça 14 internamente tem index_ato=16. O
+    # operador vê "14. ENC ..." e essa é a referência correta no oficio.
+    #
+    # Bug observado em 29/05/2026 com TC/016628/2024: extraido des_seq=16
+    # gerou "Copia das pecas 03 e 16 dos autos." quando o correto era "03
+    # e 14". O fix passa a usar a posicao em pieces[] (que ja vem ordenada
+    # por iv em _enumerate_piece_names), garantindo que seja o número de
+    # display da arvore.
+    n = len(pieces)
 
-    # 1) Última peça MANUTAP-OF (a de maior idx_ato).
-    manutap_idx = None
-    manutap_name = ""
-    for iv, name in pieces:
+    # 1) Última peça MANUTAP-OF.
+    manutap_pos = None
+    for pos, (iv, name) in enumerate(pieces):
         if "manutap-of" in normalize(name).lower():
-            manutap_idx = iv
-            manutap_name = name
-    if manutap_idx is None:
+            manutap_pos = pos
+    if manutap_pos is None:
         return out
-    m_seq = seq_re.search(manutap_name)
-    if m_seq:
-        out["manutap_seq"] = m_seq.group(1)
+    out["manutap_seq"] = str(manutap_pos)
 
     # 2) Peça SSG logo após o MANUTAP-OF: é a que está sendo reiterada.
-    ssg_name = next((name for iv, name in pieces if iv == manutap_idx + 1), "")
-    if ssg_name:
+    if manutap_pos + 1 < n:
+        ssg_name = pieces[manutap_pos + 1][1]
         m_ssg = re.search(r"SSG\s*[-–:]?\s*(\d{2,6}\s*/\s*\d{4})", ssg_name, re.I)
         if m_ssg:
             out["ssg_ref"] = re.sub(r"\s+", "", m_ssg.group(1))
         m_date = re.search(r"(\d{2}/\d{2}/\d{4})", ssg_name)
         if m_date:
             out["ssg_date"] = m_date.group(1)
-        m_ssg_seq = seq_re.search(ssg_name)
-        if m_ssg_seq:
-            out["ssg_seq"] = m_ssg_seq.group(1)
+        out["ssg_seq"] = str(manutap_pos + 1)
 
-    # 3) Última peça anexada ao processo, independentemente do tipo/unidade.
-    # Brief operacional 2026-05-29: no Encaminha da reiteração, a segunda peça
-    # citada é sempre a última peça visual da lista, não necessariamente DES/ENC
-    # do gabinete. Não use pieces[-1]: a ordenação por index_ato do e-TCM nem
-    # sempre coincide com o número exibido da peça.
-    last_seq_num = 0
-    for _iv, name in pieces:
-        m_last_seq = seq_re.search(name)
-        if not m_last_seq:
-            continue
-        try:
-            seq_num = int(m_last_seq.group(1))
-        except Exception:
-            continue
-        if seq_num > last_seq_num:
-            last_seq_num = seq_num
-    if last_seq_num > 0:
-        out["last_seq"] = str(last_seq_num)
-        out["des_seq"] = out["last_seq"]
+    # 3) Última peça anexada ao processo (qualquer tipo).
+    # Briefing Raphael 29/05: sempre a última peça da árvore, sem inspeção
+    # de tipo. Cobre DES, ENC do Gabinete, ou qualquer peça que o relator
+    # tenha anexado por ultimo.
+    out["des_seq"] = str(n - 1)
 
     return out
 
@@ -6753,7 +6752,7 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
         # Pega tudo do NOME das peças (não baixa PDFs extras):
         #   - Referência:  Ofício SSG <num/ano>, encaminhado eletronicamente em <data>.
         #     (a peça SSG logo APÓS o último MANUTAP-OF)
-        #   - Encaminha:   peças MANUTAP-OF (ultima) + última peça anexada, via env var
+        #   - Encaminha:   peças MANUTAP-OF (ultima) + DES (ultima), via env var
         #     OFICIO_ENCAMINHA_PIECE_NUMBERS consumida pelo bloco de Encaminha
         #     mais abaixo.
         #   - Corpo SSG:   mesmo nº/ano da Referência.
@@ -6783,17 +6782,16 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
                     f"Processo {processo_num}: [reiteração] AVISO — não auto-extraí a Referência; "
                     f"mantendo OFICIO_REFERENCIA_TEXT='{os.getenv('OFICIO_REFERENCIA_TEXT','')}'."
                 )
-            _last_seq = _r.get("last_seq") or _r.get("des_seq")
-            if _r.get("manutap_seq") and _last_seq:
-                os.environ["OFICIO_ENCAMINHA_PIECE_NUMBERS"] = f"{_r['manutap_seq']},{_last_seq}"
+            if _r.get("manutap_seq") and _r.get("des_seq"):
+                os.environ["OFICIO_ENCAMINHA_PIECE_NUMBERS"] = f"{_r['manutap_seq']},{_r['des_seq']}"
                 print(
                     f"Processo {processo_num}: [reiteração] Encaminha vai usar peças "
-                    f"{_r['manutap_seq']} (MANUTAP) e {_last_seq} (última peça)."
+                    f"{_r['manutap_seq']} (MANUTAP) e {_r['des_seq']} (DES)."
                 )
             else:
                 print(
                     f"Processo {processo_num}: [reiteração] AVISO — não auto-extraí as peças do Encaminha "
-                    f"(MANUTAP/última peça); fallback será a peça preferida."
+                    f"(MANUTAP/DES); fallback será a peça preferida."
                 )
             if env_bool("REITERACAO_REQUIRE_AUTO_EXTRACT", False):
                 missing = []
@@ -6802,7 +6800,7 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
                 if not (os.getenv("OFICIO_REFERENCIA_TEXT") or "").strip():
                     missing.append("Referência")
                 if not (os.getenv("OFICIO_ENCAMINHA_PIECE_NUMBERS") or "").strip():
-                    missing.append("peças Encaminha (MANUTAP+última peça)")
+                    missing.append("peças Encaminha (MANUTAP+DES)")
                 if missing:
                     print(
                         f"ERRO bloqueante: reiteração de {processo_num} sem autoextração de "
@@ -6853,7 +6851,7 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
         encaminha_override = (os.getenv("OFICIO_ENCAMINHA_TEXT") or "").strip()
         encaminha_text = ""
         # Lista explicita de peças para o Encaminha (ex.: REITERACAO usa
-        # [MANUTAP, última peça], setado pela auto-extração mais acima). Tem
+        # [MANUTAP, DESPACHO], setado pela auto-extração mais acima). Tem
         # prioridade SOBRE piece_number (single), mas perde para
         # OFICIO_ENCAMINHA_TEXT (override total).
         encaminha_piece_nums_env = (os.getenv("OFICIO_ENCAMINHA_PIECE_NUMBERS") or "").strip()
