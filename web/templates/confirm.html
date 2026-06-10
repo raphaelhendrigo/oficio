@@ -1,0 +1,109 @@
+{% extends "_base.html" %}
+{% block title %}Projeto Euclides — confirmar tipos{% endblock %}
+{% block content %}
+<section class="page-head">
+    <span class="eyebrow">Projeto Euclides · etapa 2</span>
+    <h1>Confirme o tipo de cada processo</h1>
+    <p class="lead">
+        Detectamos <strong>{{ processos|length }}</strong> processo(s) na planilha
+        <code>{{ filename }}</code>. Marque o tipo de cada um. Os marcados como
+        <em>pular</em> não serão enviados para o robô.
+    </p>
+</section>
+
+<form method="post" action="/confirm/{{ upload_id }}" id="confirmForm" class="card">
+    <div class="counters">
+        <div class="counter" data-tipo="REITERACAO"><span class="num" id="cnt-REITERACAO">0</span><span class="lbl">Reiteração</span></div>
+        <div class="counter" data-tipo="DILACAO"><span class="num" id="cnt-DILACAO">0</span><span class="lbl">Dilação</span></div>
+        <div class="counter" data-tipo="UTAP"><span class="num" id="cnt-UTAP">0</span><span class="lbl">Manutap (UTAP)</span></div>
+        <div class="counter ghost" data-tipo="PULAR"><span class="num" id="cnt-PULAR">{{ processos|length }}</span><span class="lbl">A definir / pular</span></div>
+    </div>
+
+    <div class="bulk-row">
+        <span class="muted">Aplicar a todos:</span>
+        <button type="button" class="chip" data-bulk="REITERACAO">Reiteração</button>
+        <button type="button" class="chip" data-bulk="DILACAO">Dilação</button>
+        <button type="button" class="chip" data-bulk="UTAP">Manutap</button>
+        <button type="button" class="chip ghost" data-bulk="PULAR">Limpar</button>
+    </div>
+
+    <table class="grid select-grid">
+        <thead>
+            <tr>
+                <th style="width:48px">#</th>
+                <th>Processo</th>
+                <th style="width:220px">Tipo</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for p in processos %}
+            <tr>
+                <td class="muted">{{ loop.index }}</td>
+                <td><code class="proc">{{ p }}</code></td>
+                <td>
+                    <select name="tipo__{{ p }}" class="tipo-select" data-proc="{{ p }}">
+                        <option value="PULAR" selected>— pular —</option>
+                        <option value="REITERACAO">Reiteração</option>
+                        <option value="DILACAO">Dilação</option>
+                        <option value="UTAP">Manutap (UTAP)</option>
+                    </select>
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+    <section class="schedule-block">
+        <h3>Quando o Euclides deve disparar o fluxo?</h3>
+        <p class="muted">Pré-preenchido com <strong>00:10 do próximo dia útil</strong> ({{ default_scheduled_label }}). Ajuste se quiser outro horário.</p>
+        <div class="schedule-options">
+            <label class="radio-card">
+                <input type="radio" name="when_mode" value="scheduled" checked>
+                <div>
+                    <span class="radio-title">Agendar para:</span>
+                    <input type="datetime-local" name="scheduled_at" value="{{ default_scheduled_at }}" class="datetime-input">
+                </div>
+            </label>
+            <label class="radio-card">
+                <input type="radio" name="when_mode" value="now">
+                <div>
+                    <span class="radio-title">Disparar agora</span>
+                    <span class="radio-sub">útil para testes ou execução manual imediata</span>
+                </div>
+            </label>
+        </div>
+    </section>
+
+    <div class="actions-row">
+        <a href="/" class="ghost-btn">← voltar</a>
+        <button type="submit" class="primary" id="submitBtn">
+            Confirmar e agendar
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        </button>
+    </div>
+    {% if is_busy %}
+    <p class="alert warn">Já existe um job em execução. Você ainda pode agendar este — ele entra na fila.</p>
+    {% endif %}
+</form>
+
+<script>
+    const selects = document.querySelectorAll('.tipo-select');
+    function recount() {
+        const counts = { REITERACAO:0, DILACAO:0, UTAP:0, PULAR:0 };
+        selects.forEach(s => { counts[s.value] = (counts[s.value]||0)+1; });
+        for (const k of Object.keys(counts)) {
+            const el = document.getElementById('cnt-'+k);
+            if (el) el.textContent = counts[k];
+        }
+    }
+    selects.forEach(s => s.addEventListener('change', recount));
+    document.querySelectorAll('[data-bulk]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const v = btn.getAttribute('data-bulk');
+            selects.forEach(s => s.value = v);
+            recount();
+        });
+    });
+    recount();
+</script>
+{% endblock %}

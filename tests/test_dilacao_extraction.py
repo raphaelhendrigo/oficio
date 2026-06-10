@@ -42,8 +42,8 @@ def test_referencia_regex_picks_header_oficio_not_body():
     assert re.sub(r"\s+", " ", m.group(0)).strip() == "Ofício nº 818/2026 - SME / COGEP / DITEM"
 
 
-def test_reiteracao_uses_des_when_present():
-    """Quando há DES, deve usar DES (comportamento anterior intacto)."""
+def test_reiteracao_uses_last_piece_when_des_present():
+    """O Encaminha usa a ultima MANUTAP e a ultima peca anexada."""
     pieces = [
         (4, "4. MANUTAP-OF - 886/2026 - 05/03/2026 - UNIDADE TÉCNICA DE APOSENTADORIA E PENSÕES"),
         (5, "5. OF SSG - 14354/2026 - 17/03/2026 - UNIDADE TÉCNICA DE OFÍCIOS"),
@@ -52,13 +52,13 @@ def test_reiteracao_uses_des_when_present():
     ]
     r = main._extract_reiteracao_data_from_pieces(pieces)
     assert r["manutap_seq"] == "4"
-    assert r["des_seq"] == "8", "DES deve ter prioridade sobre ENC do gabinete"
+    assert r["last_seq"] == "9"
+    assert r["des_seq"] == "9", "des_seq e alias legado da ultima peca"
     assert r["ssg_ref"] == "14354/2026"
 
 
-def test_reiteracao_fallback_enc_gabinete_when_no_des():
-    """Quando não há DES mas há ENC do GABINETE DO CONSELHEIRO, usa o ENC.
-    Caso observado em 2026-05-28: TC/004770/2023 e TC/004038/2024."""
+def test_reiteracao_uses_last_piece_without_des():
+    """Sem DES, a regra continua sendo a ultima peca anexada."""
     pieces = [
         (4, "4. MANUTAP-OF - 886/2026 - 05/03/2026 - UNIDADE TÉCNICA DE APOSENTADORIA E PENSÕES"),
         (5, "5. OF SSG - 14354/2026 - 17/03/2026 - UNIDADE TÉCNICA DE OFÍCIOS"),
@@ -67,13 +67,13 @@ def test_reiteracao_fallback_enc_gabinete_when_no_des():
     ]
     r = main._extract_reiteracao_data_from_pieces(pieces)
     assert r["manutap_seq"] == "4"
-    assert r["des_seq"] == "9", "ENC do GABINETE DO CONSELHEIRO deve servir de fallback do DES"
+    assert r["last_seq"] == "9"
+    assert r["des_seq"] == "9"
     assert r["ssg_ref"] == "14354/2026"
 
 
-def test_reiteracao_fallback_ignora_enc_de_outras_unidades():
-    """ENC que não venha do gabinete do conselheiro NÃO deve servir de fallback
-    (ex.: ENC da UTOF/UTAP é trâmite interno, não manifestação do relator)."""
+def test_reiteracao_uses_last_piece_even_from_other_units():
+    """A ultima peca pode ser de qualquer tipo/unidade."""
     pieces = [
         (4, "4. MANUTAP-OF - 886/2026 - 05/03/2026 - UNIDADE TÉCNICA DE APOSENTADORIA E PENSÕES"),
         (5, "5. OF SSG - 14354/2026 - 17/03/2026 - UNIDADE TÉCNICA DE OFÍCIOS"),
@@ -81,7 +81,22 @@ def test_reiteracao_fallback_ignora_enc_de_outras_unidades():
     ]
     r = main._extract_reiteracao_data_from_pieces(pieces)
     assert r["manutap_seq"] == "4"
-    assert r["des_seq"] == "", "sem DES nem ENC do gabinete -> des_seq vazio (forca erro bloqueante)"
+    assert r["last_seq"] == "7"
+    assert r["des_seq"] == "7"
+
+
+def test_reiteracao_last_piece_uses_display_number_not_index_order():
+    """O e-TCM pode devolver index_ato fora da ordem visual da arvore."""
+    pieces = [
+        (20, "7. ENC - 2200/2026 - 23/03/2026 - UNIDADE TÉCNICA DE OFÍCIOS"),
+        (4, "4. MANUTAP-OF - 886/2026 - 05/03/2026 - UNIDADE TÉCNICA DE APOSENTADORIA E PENSÕES"),
+        (5, "5. OF SSG - 14354/2026 - 17/03/2026 - UNIDADE TÉCNICA DE OFÍCIOS"),
+        (3, "9. DES - 764/2026 - 26/05/2026 - GABINETE CONSELHEIRO JOAO ANTONIO"),
+    ]
+    r = main._extract_reiteracao_data_from_pieces(pieces)
+    assert r["manutap_seq"] == "4"
+    assert r["last_seq"] == "9"
+    assert r["des_seq"] == "9"
 
 
 @pytest.mark.skipif(not TEMPLATE.exists(), reason="modelo de dilação ausente")

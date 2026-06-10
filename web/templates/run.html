@@ -1,0 +1,304 @@
+{% extends "_base.html" %}
+{% block title %}Projeto Euclides — execução {{ job.id }}{% endblock %}
+{% block content %}
+<section class="page-head run-head">
+    <div>
+        <span class="eyebrow">Projeto Euclides · execução</span>
+        <h1>Job <code>{{ job.id }}</code></h1>
+        <p class="muted">
+            planilha <strong>{{ job.excel_filename }}</strong> ·
+            {{ job.processos|length }} processo(s)
+        </p>
+    </div>
+    <div class="status-block">
+        <span class="pill st-{{ job.status }}" id="jobStatusBadge">{{ job.status }}</span>
+        <span class="muted" id="currentTipoLabel">
+            {% if job.current_tipo %}batch atual: {{ job.current_tipo }}{% endif %}
+        </span>
+    </div>
+</section>
+
+{% if job.scheduled_at %}
+<section class="card schedule-card" id="scheduleCard">
+    <div class="card-header">
+        <h2>Agendamento</h2>
+        <span class="muted" id="scheduledLabel"></span>
+    </div>
+    <div class="schedule-row">
+        <div class="countdown" id="countdown">—</div>
+        <form method="post" action="/run/{{ job.id }}/cancel" id="cancelForm" onsubmit="return confirm('Cancelar este job agendado?');">
+            <button type="submit" class="ghost-btn" id="cancelBtn">Cancelar agendamento</button>
+        </form>
+    </div>
+</section>
+{% endif %}
+
+<section class="card progress-card">
+    <div class="card-header">
+        <h2>Andamento</h2>
+        <span class="muted" id="progressLabel">aguardando inicio</span>
+    </div>
+    <div class="progress-line">
+        <div class="progress-track" aria-label="Progresso do job">
+            <div class="progress-fill" id="progressFill" style="width:0%"></div>
+        </div>
+        <span class="progress-percent" id="progressPercent">0%</span>
+    </div>
+    <div class="state-counters">
+        <div class="state-counter"><span id="countPending">0</span><small>Pendentes</small></div>
+        <div class="state-counter running"><span id="countRunning">0</span><small>Em execucao</small></div>
+        <div class="state-counter ok"><span id="countOk">0</span><small>Completos</small></div>
+        <div class="state-counter failed"><span id="countFailed">0</span><small>Falhas</small></div>
+    </div>
+</section>
+
+<div class="run-grid">
+    <section class="card status-card">
+        <div class="card-header">
+            <h2>Processos</h2>
+            <span class="muted" id="okCount">0 / {{ job.processos|length }}</span>
+        </div>
+        <table class="grid status-grid">
+            <thead>
+                <tr>
+                    <th>Processo</th>
+                    <th>Tipo</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody id="statusTable">
+            {% for p in job.processos %}
+                <tr data-proc="{{ p.processo }}">
+                    <td><code>{{ p.processo }}</code></td>
+                    <td><span class="tag tag-{{ p.tipo }}">{{ p.tipo }}</span></td>
+                    <td><span class="pill st-{{ p.status }}">{{ p.status }}</span>{% if p.error %} <span class="muted err">{{ p.error }}</span>{% endif %}</td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </section>
+
+    <section class="card log-card">
+        <div class="card-header">
+            <h2>Log ao vivo</h2>
+            <div class="log-controls">
+                <label class="muted"><input type="checkbox" id="autoscroll" checked> autoscroll</label>
+                <button type="button" class="ghost-btn small" id="clearVisual">limpar tela</button>
+            </div>
+        </div>
+        <pre id="logBox" class="log">{{ job.log_lines|join('\n') }}</pre>
+    </section>
+</div>
+
+<section class="card report-card" id="reportCard" style="display:none">
+    <div class="card-header">
+        <h2>Relatório final</h2>
+        <div class="report-actions">
+            <a href="/run/{{ job.id }}/report.docx" class="ghost-btn small" download>↓ Word (.docx)</a>
+            <a href="/run/{{ job.id }}/report.pdf" class="ghost-btn small" download>↓ PDF</a>
+            <a href="/run/{{ job.id }}/report" class="ghost-btn small" target="_blank">abrir HTML</a>
+        </div>
+    </div>
+    <div id="reportSummary"></div>
+</section>
+
+<div class="actions-row">
+    <a href="/" class="ghost-btn">← voltar para início</a>
+</div>
+
+<script>
+    const jobId = {{ job.id|tojson }};
+    const initialJob = {{ job_dict|tojson }};
+    const scheduledAt = {{ (job.scheduled_at * 1000)|int if job.scheduled_at else 'null' }};
+    const logBox = document.getElementById('logBox');
+    const statusBadge = document.getElementById('jobStatusBadge');
+    const currentTipoLabel = document.getElementById('currentTipoLabel');
+    const okCount = document.getElementById('okCount');
+    const total = {{ job.processos|length }};
+    const progressLabel = document.getElementById('progressLabel');
+    const progressFill = document.getElementById('progressFill');
+    const progressPercent = document.getElementById('progressPercent');
+    const countPending = document.getElementById('countPending');
+    const countRunning = document.getElementById('countRunning');
+    const countOk = document.getElementById('countOk');
+    const countFailed = document.getElementById('countFailed');
+    const autoscroll = document.getElementById('autoscroll');
+    const reportCard = document.getElementById('reportCard');
+    const reportSummary = document.getElementById('reportSummary');
+    document.getElementById('clearVisual').addEventListener('click', () => { logBox.textContent = ''; });
+    if (autoscroll.checked) logBox.scrollTop = logBox.scrollHeight;
+
+    const procLabel = {
+        pending: 'pendente',
+        running: 'em execucao',
+        ok: 'completo',
+        failed: 'falha',
+        skipped: 'pulado'
+    };
+    const jobLabel = {
+        pending: 'pendente',
+        scheduled: 'agendado',
+        running: 'em execucao',
+        done: 'concluido',
+        failed: 'falhou',
+        cancelled: 'cancelado'
+    };
+
+    function setRow(proc, status, error) {
+        const tr = document.querySelector(`[data-proc="${proc}"]`);
+        if (!tr) return;
+        const cell = tr.querySelector('td:last-child');
+        cell.innerHTML = `<span class="pill st-${status}">${procLabel[status] || status}</span>` + (error ? ` <span class="muted err">${escapeHtml(error)}</span>` : '');
+    }
+    function escapeHtml(s){return (s||'').replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));}
+
+    function setBadge(status) {
+        statusBadge.textContent = jobLabel[status] || status;
+        statusBadge.className = 'pill st-' + status;
+    }
+
+    function refreshStatus(snap) {
+        if (!snap) return;
+        setBadge(snap.status);
+        currentTipoLabel.textContent = snap.current_tipo ? ('batch atual: ' + snap.current_tipo) : '';
+        let pending = 0, running = 0, ok = 0, failed = 0, skipped = 0;
+        snap.processos.forEach(p => {
+            setRow(p.processo, p.status, p.error);
+            if (p.status === 'pending') pending++;
+            else if (p.status === 'running') running++;
+            else if (p.status === 'ok') ok++;
+            else if (p.status === 'failed') failed++;
+            else if (p.status === 'skipped') skipped++;
+        });
+        const finished = ok + failed + skipped;
+        const pctRaw = total ? Math.round((finished / total) * 100) : 100;
+        const pct = snap.status === 'running' && pctRaw === 0 ? 8 : pctRaw;
+        progressFill.style.width = `${pct}%`;
+        progressFill.classList.toggle('active', snap.status === 'running');
+        progressPercent.textContent = `${pctRaw}%`;
+        countPending.textContent = pending;
+        countRunning.textContent = running;
+        countOk.textContent = ok;
+        countFailed.textContent = failed;
+        okCount.textContent = `${ok} / ${total}`;
+        if (snap.status === 'running') {
+            progressLabel.textContent = running > 0 ? `em execucao: ${running} processo(s)` : 'preparando execucao';
+        } else {
+            progressLabel.textContent = jobLabel[snap.status] || snap.status;
+        }
+        lastSnapshot = snap;
+        if (snap.status === 'done' || snap.status === 'failed' || snap.status === 'cancelled') {
+            maybeShowReport(snap, snap.status);
+        }
+    }
+
+    // Countdown do agendamento.
+    const countdownEl = document.getElementById('countdown');
+    const scheduledLabel = document.getElementById('scheduledLabel');
+    function formatTs(ts) {
+        const d = new Date(ts);
+        return d.toLocaleDateString('pt-BR') + ' às ' + d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+    }
+    if (scheduledAt && scheduledLabel) {
+        scheduledLabel.textContent = formatTs(scheduledAt);
+    }
+    function updateCountdown() {
+        if (!scheduledAt || !countdownEl) return;
+        const ms = scheduledAt - Date.now();
+        if (ms <= 0) {
+            countdownEl.textContent = 'horário atingido — iniciando...';
+            return;
+        }
+        const sec = Math.floor(ms/1000);
+        const h = Math.floor(sec/3600).toString().padStart(2,'0');
+        const m = Math.floor((sec%3600)/60).toString().padStart(2,'0');
+        const s = (sec%60).toString().padStart(2,'0');
+        countdownEl.textContent = `inicia em ${h}:${m}:${s}`;
+    }
+    if (scheduledAt) { updateCountdown(); setInterval(updateCountdown, 1000); }
+
+    let lastSnapshot = null;
+    function maybeShowReport(snap, finalStatus) {
+        if (!finalStatus) return;
+        const ok = snap.processos.filter(p => p.status === 'ok').length;
+        const fail = snap.processos.filter(p => p.status === 'failed').length;
+        const skip = snap.processos.filter(p => p.status === 'skipped').length;
+        const rows = snap.processos.map(p => `
+            <tr>
+                <td><code>${p.processo}</code></td>
+                <td><span class="tag tag-${p.tipo}">${p.tipo}</span></td>
+                <td><span class="pill st-${p.status}">${p.status}</span></td>
+                <td class="muted">${escapeHtml(p.error||'')}</td>
+            </tr>`).join('');
+        reportSummary.innerHTML = `
+            <div class="report-counters">
+                <div class="counter"><span class="num">${ok}</span><span class="lbl">Sucesso</span></div>
+                <div class="counter"><span class="num">${fail}</span><span class="lbl">Falha</span></div>
+                <div class="counter"><span class="num">${skip}</span><span class="lbl">Pulado</span></div>
+                <div class="counter"><span class="num">${snap.processos.length}</span><span class="lbl">Total</span></div>
+            </div>
+            <table class="grid"><thead><tr><th>Processo</th><th>Tipo</th><th>Status</th><th>Detalhe</th></tr></thead><tbody>${rows}</tbody></table>`;
+        reportCard.style.display = '';
+    }
+
+    refreshStatus({
+        status: initialJob.status,
+        current_tipo: initialJob.current_tipo,
+        processos: initialJob.processos.map(p => ({processo:p.processo,tipo:p.tipo,status:p.status,error:p.error}))
+    });
+
+    async function pollSnapshot() {
+        try {
+            const j = await fetch(`/api/job/${jobId}`, { cache: 'no-store' }).then(r => r.json());
+            const snap = {
+                status: j.status,
+                current_tipo: j.current_tipo,
+                processos: j.processos.map(p => ({processo:p.processo,tipo:p.tipo,status:p.status,error:p.error}))
+            };
+            refreshStatus(snap);
+            if (Array.isArray(j.log_lines)) {
+                const text = j.log_lines.join('\n');
+                if (text && text !== logBox.textContent.trimEnd()) {
+                    logBox.textContent = text + '\n';
+                    if (autoscroll.checked) logBox.scrollTop = logBox.scrollHeight;
+                }
+            }
+        } catch (e) {
+            /* WebSocket continua sendo o caminho principal. */
+        }
+    }
+
+    const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${location.host}/run/${jobId}/ws`);
+    ws.onmessage = (ev) => {
+        let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+        if (msg.type === 'log') {
+            logBox.textContent += msg.line + "\n";
+            if (autoscroll.checked) logBox.scrollTop = logBox.scrollHeight;
+        } else if (msg.type === 'status') {
+            refreshStatus(msg);
+        } else if (msg.type === 'finished') {
+            setBadge(msg.status);
+            if (lastSnapshot) maybeShowReport(lastSnapshot, msg.status);
+            if (msg.error) logBox.textContent += `\n[fim] ${msg.error}\n`;
+        } else if (msg.type === 'error') {
+            logBox.textContent += `\n[ws error] ${msg.message}\n`;
+        }
+    };
+    ws.onclose = () => { pollSnapshot(); };
+    setInterval(pollSnapshot, 2000);
+
+    // Se a página foi aberta com job já finalizado, busca snapshot inicial pra mostrar relatório.
+    {% if job.status in ('done','failed','cancelled') %}
+    fetch(`/api/job/${jobId}`).then(r=>r.json()).then(j => {
+        const snap = {
+            status: j.status, current_tipo: j.current_tipo,
+            processos: j.processos.map(p=>({processo:p.processo,tipo:p.tipo,status:p.status,error:p.error}))
+        };
+        lastSnapshot = snap;
+        maybeShowReport(snap, j.status);
+        if (j.log_lines) logBox.textContent = j.log_lines.join('\n');
+    });
+    {% endif %}
+</script>
+{% endblock %}

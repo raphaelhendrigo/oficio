@@ -1,0 +1,69 @@
+{% extends "_base.html" %}
+{% block title %}Relatório · Job {{ job.id }} — Projeto Euclides{% endblock %}
+{% block content %}
+<section class="page-head">
+    <span class="eyebrow">Projeto Euclides · relatório</span>
+    <h1>Job <code>{{ job.id }}</code></h1>
+    <p class="muted">{{ job.excel_filename }} · {{ job.processos|length }} processo(s)</p>
+</section>
+
+<div class="report-actions" style="margin-bottom:14px">
+    <a href="/run/{{ job.id }}/report.docx" class="primary" download>↓ Baixar Word (.docx)</a>
+    <a href="/run/{{ job.id }}/report.pdf" class="primary" download>↓ Baixar PDF</a>
+    <a href="/run/{{ job.id }}" class="ghost-btn">← voltar para execução</a>
+    <button type="button" onclick="window.print()" class="ghost-btn">🖨 Imprimir</button>
+</div>
+
+<section class="card">
+    <div class="card-header"><h2>Metadados</h2></div>
+    <table class="grid">
+        <tbody>
+            <tr><th>Status final</th><td>{{ summary.job_status_label }}</td></tr>
+            <tr><th>Agendado para</th><td>{{ summary.scheduled or "—" }}</td></tr>
+            <tr><th>Início</th><td>{{ summary.started }}</td></tr>
+            <tr><th>Fim</th><td>{{ summary.finished }}</td></tr>
+            <tr><th>Duração</th><td>{{ summary.duration }}</td></tr>
+            <tr><th>Erro geral</th><td>{{ job.error or "—" }}</td></tr>
+        </tbody>
+    </table>
+</section>
+
+<section class="card">
+    <div class="card-header"><h2>Resumo</h2></div>
+    <div class="report-counters">
+        <div class="counter"><span class="num">{{ summary.total }}</span><span class="lbl">Total</span></div>
+        <div class="counter"><span class="num">{{ summary.ok }}</span><span class="lbl">Sucesso</span></div>
+        <div class="counter"><span class="num">{{ summary.fail }}</span><span class="lbl">Falha</span></div>
+        <div class="counter"><span class="num">{{ summary.skip }}</span><span class="lbl">Pulado</span></div>
+    </div>
+</section>
+
+<section class="card">
+    <div class="card-header"><h2>Por tipo</h2></div>
+    <table class="grid">
+        <thead><tr><th>Tipo</th><th>Total</th><th>Sucesso</th><th>Falha</th></tr></thead>
+        <tbody>
+            {% for tipo, vals in summary.by_tipo.items() %}
+            <tr><td><span class="tag tag-{{ tipo }}">{{ tipo }}</span></td><td>{{ vals.total }}</td><td>{{ vals.ok }}</td><td>{{ vals.fail }}</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="card">
+    <div class="card-header"><h2>Detalhe por processo</h2></div>
+    <table class="grid">
+        <thead><tr><th>Processo</th><th>Tipo</th><th>Status</th><th>Detalhe</th></tr></thead>
+        <tbody>
+        {% for p in job.processos %}
+            <tr>
+                <td><code>{{ p.processo }}</code></td>
+                <td><span class="tag tag-{{ p.tipo }}">{{ p.tipo }}</span></td>
+                <td><span class="pill st-{{ p.status }}">{{ status_label.get(p.status, p.status) }}</span></td>
+                <td class="muted">{{ p.error or "" }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

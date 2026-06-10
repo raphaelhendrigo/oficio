@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Projeto Euclides — APO-PEN{% endblock %}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <div class="logo" aria-hidden="true">
+                <span>Π</span>
+            </div>
+            <div class="brand-text">
+                <span class="brand-title">Projeto Euclides</span>
+                <span class="brand-sub">disparador de Ofícios SSG · APO-PEN</span>
+            </div>
+        </div>
+        <nav class="right">
+            <a href="/" class="nav-link">Início</a>
+            <a href="/labels" class="nav-link">Aprendizado</a>
+            {% if is_busy %}
+                <span class="pill pill-live">● job em execução</span>
+            {% else %}
+                <span class="pill pill-idle">● ocioso</span>
+            {% endif %}
+        </nav>
+    </header>
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+    <footer class="footer">
+        <span>Projeto Euclides · TCM-SP · Robô Ofícios SSG</span>
+    </footer>
+</body>
+</html>

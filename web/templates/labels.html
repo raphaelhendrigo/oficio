@@ -1,0 +1,117 @@
+{% extends "_base.html" %}
+{% block title %}Projeto Euclides — aprendizado{% endblock %}
+{% block content %}
+<section class="page-head">
+    <span class="eyebrow">Projeto Euclides · aprendizado</span>
+    <h1>Captura supervisionada das classificações do Gilson</h1>
+    <p class="lead">
+        Cada decisão de tipo (Reiteração / Dilação / Manutap) feita na tela
+        de confirmação vira uma linha em <code>web/labels/labels.jsonl</code>.
+        Este painel mostra quanto dado já temos e quanto falta para cada
+        marco do classificador automático.
+    </p>
+</section>
+
+<section class="card">
+    <div class="card-header">
+        <h2>Volume acumulado</h2>
+        <span class="muted">{{ stats.days_active }} dia(s) ativos · média {{ stats.avg_per_day }} labels/dia</span>
+    </div>
+    <div class="report-counters">
+        <div class="counter"><span class="num">{{ stats.total }}</span><span class="lbl">Total de labels</span></div>
+        <div class="counter"><span class="num">{{ stats.unique_processos }}</span><span class="lbl">Processos únicos</span></div>
+        <div class="counter" data-tipo="REITERACAO"><span class="num">{{ stats.by_tipo.REITERACAO }}</span><span class="lbl">Reiteração</span></div>
+        <div class="counter" data-tipo="DILACAO"><span class="num">{{ stats.by_tipo.DILACAO }}</span><span class="lbl">Dilação</span></div>
+        <div class="counter" data-tipo="UTAP"><span class="num">{{ stats.by_tipo.UTAP }}</span><span class="lbl">Manutap (UTAP)</span></div>
+    </div>
+</section>
+
+<section class="card">
+    <div class="card-header">
+        <h2>Features capturadas pelo robô</h2>
+        <span class="muted">{{ joined_count }} processo(s) com label + features prontas para treino</span>
+    </div>
+    <div class="report-counters">
+        <div class="counter"><span class="num">{{ features_stats.total }}</span><span class="lbl">Registros de features</span></div>
+        <div class="counter"><span class="num">{{ features_stats.with_pieces }}</span><span class="lbl">Com lista de peças</span></div>
+        <div class="counter"><span class="num">{{ features_stats.avg_pieces }}</span><span class="lbl">Média de peças/processo</span></div>
+        <div class="counter"><span class="num">{{ joined_count }}</span><span class="lbl">Linhas treináveis (label + features)</span></div>
+    </div>
+    <p class="muted">
+        A cada disparo, o robô grava em <code>web/labels/features.jsonl</code>
+        os nomes de todas as peças do processo + flags de palavras-chave
+        (MANUTAP, SSG, dilação, reiteração etc.). Essas são as features que
+        alimentam o classificador.
+    </p>
+</section>
+
+<section class="card">
+    <div class="card-header"><h2>Progresso até cada marco</h2></div>
+    <table class="grid">
+        <thead>
+            <tr>
+                <th>Marco</th>
+                <th>Labels necessários</th>
+                <th>Tempo estimado (no ritmo atual)</th>
+                <th>O que muda</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Sinal mínimo</strong></td>
+                <td>{{ stats.milestones.sinal_minimo }}</td>
+                <td>{{ eta.sinal_minimo }}</td>
+                <td class="muted">Validamos se as features escolhidas separam as 3 classes. Treina o primeiro baseline.</td>
+            </tr>
+            <tr>
+                <td><strong>Baseline assistido</strong></td>
+                <td>{{ stats.milestones.baseline_assistido }}</td>
+                <td>{{ eta.baseline_assistido }}</td>
+                <td class="muted">A interface começa a pré-marcar o tipo sugerido. Gilson só confirma ou corrige.</td>
+            </tr>
+            <tr>
+                <td><strong>Auto-classificação confiável</strong></td>
+                <td>{{ stats.milestones.auto_confiavel }}</td>
+                <td>{{ eta.auto_confiavel }}</td>
+                <td class="muted">Casos de alta confiança (~&gt;90%) entram automáticos. Gilson só revisa os incertos.</td>
+            </tr>
+            <tr>
+                <td><strong>Substituição quase completa</strong></td>
+                <td>{{ stats.milestones.substituicao_completa }}</td>
+                <td>{{ eta.substituicao_completa }}</td>
+                <td class="muted">Robô classifica sozinho. Gilson age só como auditor.</td>
+            </tr>
+        </tbody>
+    </table>
+</section>
+
+{% if stats.by_day %}
+<section class="card">
+    <div class="card-header"><h2>Histórico diário</h2></div>
+    <table class="grid">
+        <thead><tr><th>Dia</th><th>Labels capturados</th></tr></thead>
+        <tbody>
+        {% for day, n in stats.by_day.items() %}
+            <tr><td>{{ day }}</td><td>{{ n }}</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+
+<section class="card">
+    <div class="card-header"><h2>Próximo passo: capturar as features</h2></div>
+    <p class="muted">
+        O label sozinho não treina o classificador. Falta capturar, no momento que
+        o robô abre cada processo no e-TCM, as <strong>features</strong> que
+        explicam por que ele é UTAP, DILACAO ou REITERACAO: último ato,
+        secretaria, número de ofícios anteriores, datas, conselheiro relator,
+        decisão atual etc. Esse passo entra no <code>src/main.py</code> e está
+        documentado em <a href="/static/LEARNING_PIPELINE.md">LEARNING_PIPELINE.md</a>.
+    </p>
+</section>
+
+<div class="actions-row">
+    <a href="/" class="ghost-btn">← voltar para início</a>
+</div>
+{% endblock %}

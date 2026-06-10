@@ -7,3 +7,8 @@ pypdf==5.1.0
 pywin32==311
 pandas==2.2.3
 pyyaml==6.0.2
+fastapi==0.115.6
+uvicorn==0.32.1
+python-multipart==0.0.20
+jinja2==3.1.5
+reportlab==4.2.5

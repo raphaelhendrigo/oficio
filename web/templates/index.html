@@ -1,0 +1,100 @@
+{% extends "_base.html" %}
+{% block title %}Projeto Euclides — enviar planilha{% endblock %}
+{% block content %}
+<section class="hero">
+    <div class="hero-text">
+        <span class="eyebrow">Projeto Euclides</span>
+        <h1>Dispare os Ofícios SSG a partir de uma planilha.</h1>
+        <p class="lead">
+            Envie o Excel com a lista de processos. Na próxima tela você marca o tipo
+            de cada um — <strong>Reiteração</strong>, <strong>Dilação</strong> ou
+            <strong>Manutap / UTAP</strong> — e o robô executa o fluxo PROD completo:
+            limpeza, geração do Ofício SSG, comunicação processual e pedido de
+            assinatura para a <strong>Roseli Chaves</strong>.
+        </p>
+    </div>
+    <div class="hero-art" aria-hidden="true">
+        <div class="orbit">
+            <span class="dot dot-1"></span>
+            <span class="dot dot-2"></span>
+            <span class="dot dot-3"></span>
+            <span class="core">Π</span>
+        </div>
+    </div>
+</section>
+
+{% if is_busy %}
+<div class="alert warn">
+    Já existe um job em execução. Espere ele terminar antes de disparar outro.
+</div>
+{% endif %}
+
+<section class="card upload-card">
+    <div class="card-header">
+        <h2>1. Enviar planilha</h2>
+        <span class="muted">.xlsx ou .xls</span>
+    </div>
+    <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form" id="uploadForm">
+        <label class="file-drop" id="fileDrop">
+            <input type="file" name="file" id="fileInput" accept=".xlsx,.xls" required>
+            <div class="file-drop-inner">
+                <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                <span class="file-drop-title">Clique para selecionar o Excel</span>
+                <span class="file-drop-hint">ou arraste o arquivo aqui</span>
+                <span class="file-drop-name" id="fileName"></span>
+            </div>
+        </label>
+        <button type="submit" class="primary">
+            Continuar
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+        </button>
+    </form>
+</section>
+
+{% if recent %}
+<section class="card">
+    <div class="card-header">
+        <h2>Últimas execuções</h2>
+    </div>
+    <table class="grid">
+        <thead>
+            <tr>
+                <th>Job</th>
+                <th>Planilha</th>
+                <th>Processos</th>
+                <th>Status</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for j in recent %}
+            <tr>
+                <td><code>{{ j.id }}</code></td>
+                <td>{{ j.excel_filename }}</td>
+                <td>{{ j.processos|length }}</td>
+                <td><span class="pill st-{{ j.status }}">{{ j.status }}</span></td>
+                <td><a class="link" href="/run/{{ j.id }}">abrir →</a></td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+
+<script>
+    const input = document.getElementById('fileInput');
+    const fileName = document.getElementById('fileName');
+    const drop = document.getElementById('fileDrop');
+    input.addEventListener('change', () => {
+        fileName.textContent = input.files[0] ? input.files[0].name : '';
+    });
+    ;['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('drag'); }));
+    ;['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('drag'); }));
+    drop.addEventListener('drop', e => {
+        if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+            input.files = e.dataTransfer.files;
+            fileName.textContent = input.files[0].name;
+        }
+    });
+</script>
+{% endblock %}

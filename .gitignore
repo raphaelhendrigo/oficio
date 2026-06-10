@@ -39,3 +39,11 @@ backup_pre_filter_repo/
 docs/video_frames/
 video_silvana.mp4
 .claude/
+
+# Interface web - dados operacionais (ficam apenas na VM, nao versionar):
+# - uploads/  planilhas reais enviadas pelo Gilson
+# - jobs/     estado persistido de cada execucao
+# - labels/   dataset supervisionado (labels.jsonl + features.jsonl)
+web/uploads/
+web/jobs/
+web/labels/
