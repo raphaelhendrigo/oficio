@@ -166,3 +166,65 @@ def test_find_signer_in_list_returns_first_match() -> None:
 def test_find_signer_in_list_returns_none_when_no_match() -> None:
     names = ["Jose Silva", "Maria Souza"]
     assert find_signer_in_list(names) is None
+
+
+# ---------------- SIGNER_MATCH_TOKENS / current_signer_tokens ---------------
+# Caso real: Roseli Chaves entrou de ferias em 24/06/2026 e foi substituida
+# pela Daniela Shimizu (Subsecretaria-Geral Substituta). O matcher precisa
+# trocar de assinante so com env var, sem mexer em codigo.
+
+from oficio_normalize import (  # type: ignore  # noqa: E402
+    current_signer_tokens,
+    signer_name_matches,
+)
+
+
+def test_current_signer_tokens_default_eh_roseli_chaves(monkeypatch) -> None:
+    monkeypatch.delenv("SIGNER_MATCH_TOKENS", raising=False)
+    assert current_signer_tokens() == ("roseli", "chaves")
+
+
+def test_current_signer_tokens_le_env_var_daniela(monkeypatch) -> None:
+    monkeypatch.setenv("SIGNER_MATCH_TOKENS", "daniela,shimizu")
+    assert current_signer_tokens() == ("daniela", "shimizu")
+
+
+def test_current_signer_tokens_normaliza_espacos_e_acentos(monkeypatch) -> None:
+    monkeypatch.setenv("SIGNER_MATCH_TOKENS", "  DANIELA ; Shimizú  ")
+    assert current_signer_tokens() == ("daniela", "shimizu")
+
+
+def test_current_signer_tokens_envar_vazia_volta_para_default(monkeypatch) -> None:
+    monkeypatch.setenv("SIGNER_MATCH_TOKENS", "")
+    assert current_signer_tokens() == ("roseli", "chaves")
+
+
+def test_signer_name_matches_default_continua_aceitando_roseli(monkeypatch) -> None:
+    monkeypatch.delenv("SIGNER_MATCH_TOKENS", raising=False)
+    assert signer_name_matches("Roseli de Morais Chaves")
+    assert signer_name_matches("ROSELI MORAES CHAVES")
+    assert not signer_name_matches("Daniela Shimizu")
+
+
+def test_signer_name_matches_com_env_daniela_aceita_daniela(monkeypatch) -> None:
+    monkeypatch.setenv("SIGNER_MATCH_TOKENS", "daniela,shimizu")
+    assert signer_name_matches("Daniela Shimizu")
+    assert signer_name_matches("DANIELA K. SHIMIZU")
+    assert signer_name_matches("Sra. Daniela Shimizu - Subsecretaria-Geral Substituta")
+    # nao confunde com Roseli
+    assert not signer_name_matches("Roseli de Morais Chaves")
+    # exige AMBOS tokens — so o primeiro nome nao basta
+    assert not signer_name_matches("Daniela Souza")
+
+
+def test_signer_name_matches_legado_intacto() -> None:
+    """A funcao legada signer_name_matches_roseli_chaves NAO le env var
+    e continua presa a Roseli/Chaves (50+ testes existentes garantem
+    estabilidade)."""
+    import os
+    os.environ["SIGNER_MATCH_TOKENS"] = "daniela,shimizu"
+    try:
+        assert signer_name_matches_roseli_chaves("Roseli Chaves")
+        assert not signer_name_matches_roseli_chaves("Daniela Shimizu")
+    finally:
+        os.environ.pop("SIGNER_MATCH_TOKENS", None)

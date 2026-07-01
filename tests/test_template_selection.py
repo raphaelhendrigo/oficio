@@ -94,3 +94,55 @@ def test_select_reiteracao_template_routes_to_modelos_reiteracao(project_root: P
     path = _select(txt, last_piece=None)
     assert path is not None
     assert "modelos_reiteracao" in str(path), f"Esperava modelos_reiteracao, veio: {path}"
+
+
+
+# --------------------------- Overrides via env vars ----------------------------
+# Caso real: ferias da Roseli Chaves (24/06/2026) - as pastas de modelos
+# 'modelos daniela/{manutap,dilação,reiteração}' substituem as historicas
+# via env vars OFICIO_TEMPLATES_DIR_<TIPO>. Pasta da Daniela so tem Educacao
+# e Saude, entao OFICIO_SECRETARIA_FALLBACK=educacao cobre o caso 'Geral'.
+
+def test_select_template_usa_override_de_env_var_para_utap(project_root: Path, monkeypatch, tmp_path) -> None:
+    # Cria uma pasta temporaria com modelos da Daniela
+    d = tmp_path / "daniela_manutap"
+    d.mkdir()
+    (d / "SSG - Aposentadoria MANUTAP - Educacao - Daniela.docx").write_bytes(b"fake")
+    (d / "SSG - Aposentadoria MANUTAP - Saude - Daniela.docx").write_bytes(b"fake")
+    monkeypatch.setenv("OFICIO_TEMPLATES_DIR_UTAP", str(d))
+    txt = "Secretaria Municipal de Educacao"
+    path = _select(txt, last_piece="MANUTAP-OF 123/2026")
+    assert path is not None
+    assert "daniela_manutap" in str(path).replace("\\", "/")
+    assert "Educa" in path.name
+
+
+def test_select_template_fallback_educacao_quando_pasta_so_tem_educacao_saude(
+    project_root: Path, monkeypatch, tmp_path
+) -> None:
+    """Pasta da Daniela so tem Educacao e Saude. Veio um processo Geral.
+    Sem fallback, antes caia em qualquer arquivo. Com OFICIO_SECRETARIA_FALLBACK=educacao,
+    cai explicitamente em Educacao."""
+    d = tmp_path / "daniela_dilacao"
+    d.mkdir()
+    (d / "SSG - Aposentadoria Dilacao - Educacao - Daniela.dotx").write_bytes(b"fake")
+    (d / "SSG - Aposentadoria Dilacao - Saude - Daniela.dotx").write_bytes(b"fake")
+    monkeypatch.setenv("OFICIO_TEMPLATES_DIR_DILACAO", str(d))
+    monkeypatch.setenv("OFICIO_SECRETARIA_FALLBACK", "educacao")
+    txt = "Conselheiro autorizo a dilacao de prazo do processo (orgao generico)"
+    path = _select(txt, last_piece=None)
+    assert path is not None
+    assert "Educa" in path.name, f"Fallback deveria ser Educacao, veio {path.name}"
+
+
+def test_select_template_override_para_reiteracao(
+    project_root: Path, monkeypatch, tmp_path
+) -> None:
+    d = tmp_path / "daniela_reit"
+    d.mkdir()
+    (d / "SSG - Aposentadoria Reiteracao - Saude - Daniela.dotx").write_bytes(b"fake")
+    monkeypatch.setenv("OFICIO_TEMPLATES_DIR_REITERACAO", str(d))
+    txt = "reitere-se o oficio - secretaria municipal da saude"
+    path = _select(txt, last_piece=None)
+    assert path is not None
+    assert "daniela_reit" in str(path).replace("\\", "/")

@@ -163,8 +163,11 @@ def normalize_secretaria_label(text: str) -> str:
 
 # ----------------------------- Assinante ------------------------------------
 
-# Token raiz que identifica o assinante alvo, independente de "DE MORAIS",
-# "MORAIS", "MORAES" ou de o nome estar abreviado.
+# Tokens raiz "padrao histórico": Roseli Chaves. Usado como default tanto pela
+# funcao legada `signer_name_matches_roseli_chaves` (mantida intacta para os
+# 50+ testes existentes) quanto pelos helpers que consultam o env var
+# SIGNER_MATCH_TOKENS para substituicoes temporarias (ex.: ferias da Roseli,
+# Daniela Shimizu cobrindo).
 SIGNER_REQUIRED_TOKENS: tuple[str, ...] = ("roseli", "chaves")
 
 
@@ -177,7 +180,8 @@ def signer_name_matches_roseli_chaves(candidate: str,
     "Roseli" nem apenas "Chaves" — exige a combinacao.
 
     O parametro `required` permite reaproveitar a funcao para outros
-    assinantes (ex.: tokens 'fulano','tal').
+    assinantes (ex.: tokens 'fulano','tal'). Vide `signer_name_matches` e
+    `current_signer_tokens` para o caminho configuravel por env.
     """
     if not candidate:
         return False
@@ -189,14 +193,57 @@ def signer_name_matches_roseli_chaves(candidate: str,
     return required_tokens.issubset(candidate_tokens)
 
 
+def current_signer_tokens(default: Iterable[str] = SIGNER_REQUIRED_TOKENS) -> tuple[str, ...]:
+    """Tokens raiz do assinante atual.
+
+    Le da env var SIGNER_MATCH_TOKENS (separada por virgula ou ponto-e-virgula);
+    se ausente ou vazia, devolve `default` (Roseli Chaves).
+
+    Tolerante a espacos, vazios e acentos — os tokens sempre voltam normalizados
+    (sem acento, lowercase, sem pontuacao). Util para chamar os matchers sem
+    precisar parsear em cada lugar.
+
+        # ferias da Roseli, Daniela assumindo:
+        os.environ['SIGNER_MATCH_TOKENS'] = 'daniela,shimizu'
+        current_signer_tokens() -> ('daniela', 'shimizu')
+    """
+    import os as _os
+    raw = (_os.getenv("SIGNER_MATCH_TOKENS") or "").strip()
+    if not raw:
+        return tuple(default)
+    parts: list[str] = []
+    for chunk in re.split(r"[,;\s]+", raw):
+        norm = _norm_compare(chunk)
+        if norm:
+            parts.append(norm)
+    return tuple(parts) if parts else tuple(default)
+
+
+def signer_name_matches(candidate: str, required: Iterable[str] | None = None) -> bool:
+    """Versão configurável de `signer_name_matches_roseli_chaves`.
+
+    Se `required` não for passada, usa `current_signer_tokens()` — que respeita
+    a env var SIGNER_MATCH_TOKENS. Permite trocar o assinante alvo sem mexer no
+    código que chama o matcher.
+    """
+    if required is None:
+        required = current_signer_tokens()
+    return signer_name_matches_roseli_chaves(candidate, required=required)
+
+
 def find_signer_in_list(names: Iterable[str],
-                        required: Iterable[str] = SIGNER_REQUIRED_TOKENS) -> str | None:
+                        required: Iterable[str] | None = None) -> str | None:
     """Retorna o PRIMEIRO nome em `names` que combine com `required`.
+
+    Se `required` for None, usa os tokens configurados pela env var
+    SIGNER_MATCH_TOKENS (default = Roseli Chaves).
 
     Quando varios candidatos combinam, e retornado o primeiro encontrado.
     Util para iteracoes sobre listas exibidas em telas (autocomplete,
     grids de selecao de assinante).
     """
+    if required is None:
+        required = current_signer_tokens()
     for n in names:
         if signer_name_matches_roseli_chaves(n, required=required):
             return n

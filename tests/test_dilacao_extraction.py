@@ -28,6 +28,30 @@ def test_ssg_ref_empty_without_manutap():
     assert main._extract_ssg_ref_after_manutap([(1, "1. TÍTULO")]) == ""
 
 
+def test_extract_ssg_ref_from_ato_text_ignores_tc_process_number():
+    text = "TC/008940/2023\tOficio SSG\t15777/2026\tConcluido"
+    assert main._extract_ssg_ref_from_ato_text(text) == "15777/2026"
+
+
+def test_extract_ssg_ref_from_ato_text_returns_empty_without_ssg_number():
+    text = "TC/008940/2023\tOficio SSG\tConcluido"
+    assert main._extract_ssg_ref_from_ato_text(text) == ""
+
+
+def test_extract_ssg_ref_from_ato_text_accepts_number_before_label():
+    text = "15777/2026\tOficio SSG\tConcluido\tTC/008940/2023"
+    assert main._extract_ssg_ref_from_ato_text(text) == "15777/2026"
+
+
+def test_upload_ato_tipo_inferido_por_nome_do_docx():
+    assert main._infer_upload_ato_tipo_label(Path("encaminhamento_TC_008940_2023.docx")) == "Encaminhamento"
+    assert main._infer_upload_ato_tipo_label(Path("oficio_TC_008940_2023.docx")) == "Ofício SSG"
+
+
+def test_upload_ato_tipo_override_explicito():
+    assert main._infer_upload_ato_tipo_label(Path("qualquer.docx"), ato_tipo="Encaminhamento") == "Encaminhamento"
+
+
 def test_referencia_regex_picks_header_oficio_not_body():
     import re
 
@@ -141,6 +165,96 @@ def test_reiteracao_simula_arvore_com_iv_esparso_de_tc_016628_2024():
     assert r["des_seq"] == "14", (
         "ultima peça da arvore esta na posicao 14, mesmo que seu iv seja 16"
     )
+
+
+def test_reiteracao_usa_display_do_NOME_quando_enumeracao_perde_uma_peca():
+    """Caso real TC/005666/2022 (22/06/2026): a árvore exibe 38 peças
+    (0..37), mas _enumerate_piece_names devolve só 37 — algum item (ex.:
+    "1. TITULO DE APOSENTADORIA") não tem link clicável e é filtrado. Com
+    isso, todas as posições de array depois do item perdido ficam -1 em
+    relação ao número exibido na árvore.
+
+    Robô gerou "Cópia das peças 21 e 36 dos autos" quando o correto era
+    "22 e 37". O fix passa a parsear o número de display direto do NOME
+    da peça (sempre presente em "<num>. <TIPO> - ..."), eliminando a
+    dependência de posição do array.
+    """
+    # Simula 37 peças capturadas (uma a menos que as 38 da árvore):
+    # display=1 (TÍTULO) foi filtrado mas o resto mantém o prefixo
+    # numérico correto.
+    pieces = [
+        (0, "0. CAPA"),
+        # (1, "1. TITULO ...") ausente: nao foi capturado
+        (2, "2. CERTIDÃO"),
+        (3, "3. PREXDIG - 5254/2023"),
+        (4, "4. TERDIG - 5105/2023"),
+        (5, "5. ATRIB - 141/2025"),
+        (6, "6. DEMREMUN - 158/2025"),
+        (7, "7. HOLE - 270/2025"),
+        (8, "8. HOLE - 268/2025"),
+        (9, "9. HOLE - 269/2025"),
+        (10, "10. PLAAN - 1504/2025"),
+        (11, "11. MANUTAP-OF - 214/2025 - 17/02/2025"),
+        (12, "12. OF SSG - 12843/2025"),
+        (13, "13. E-MAIL - 189/2025"),
+        (14, "14. ENC - 805/2025"),
+        (15, "15. PTC - 171/2025"),
+        (16, "16. INF - 1443/2025"),
+        (17, "17. ENC - 6319/2025"),
+        (18, "18. OF SSG - 14629/2025"),
+        (19, "19. PTC - 3079/2025"),
+        (20, "20. RESPOSTA DE COMUNICAÇÃO PROCESSUAL"),
+        (21, "21. ENC - 2442/2025"),
+        (22, "22. MANUTAP-OF - 1907/2025 - 24/09/2025"),  # LAST MANUTAP — display=22
+        (23, "23. OF SSG - 18775/2025 - 03/10/2025"),     # SSG after manutap — display=23
+        (24, "24. PTC - 8137/2025"),
+        (25, "25. ENC - 6319/2025"),
+        (26, "26. INF - 6168/2025"),
+        (27, "27. ENC - 548/2025"),
+        (28, "28. OF SSG - 21343/2025"),
+        (29, "29. PTC - 10963/2025"),
+        (30, "30. ENC - 8803/2025"),
+        (31, "31. INF - 2050/2026"),
+        (32, "32. DES - 536/2026"),
+        (33, "33. OF SSG - 14922/2026"),
+        (34, "34. PTC - 3397/2026"),
+        (35, "35. ENC - 2749/2026"),
+        (36, "36. INF - 4432/2026"),
+        (37, "37. ENC - 495/2026 - 18/06/2026"),  # LAST piece — display=37
+    ]
+    assert len(pieces) == 37  # 1 piece short of the displayed 38
+    r = main._extract_reiteracao_data_from_pieces(pieces)
+    assert r["manutap_seq"] == "22", "MANUTAP-OF tem display=22 no nome"
+    assert r["des_seq"] == "37", "Ultima peca tem display=37 no nome"
+    assert r["ssg_seq"] == "23"
+    assert r["ssg_ref"] == "18775/2025"
+
+
+def test_reiteracao_usa_display_do_NOME_quando_so_a_ultima_pula_um_numero():
+    """Caso TC/011446/2022 (22/06/2026): tree mostra "28." como ultima,
+    mas a enumeracao retorna 28 itens (0..27). Antes do fix:
+        manutap_seq=17 (correto, parse da posicao 17 do array)
+        des_seq=27 (errado, n-1=27, deveria ser 28)
+    O fix usa o display number do nome ('28. ...') -> 28.
+    """
+    pieces = []
+    for i in range(18):  # 0..17
+        if i == 17:
+            pieces.append((i, "17. MANUTAP-OF - 999/2025"))
+        else:
+            pieces.append((i, f"{i}. PEÇA - {i}/2025"))
+    # Depois da MANUTAP-OF, a árvore mostra mais 11 peças numeradas 18..28,
+    # mas a enumeracao só captura 10 delas (pulou uma). A última piece
+    # capturada tem display=28 mas array_pos=27.
+    iv = 100
+    captured_displays = [18, 19, 20, 21, 22, 23, 24, 25, 26, 28]  # display 27 perdido
+    for d in captured_displays:
+        pieces.append((iv, f"{d}. PEÇA - {d}/2026"))
+        iv += 1
+    assert len(pieces) == 28  # uma a menos que as 29 da arvore
+    r = main._extract_reiteracao_data_from_pieces(pieces)
+    assert r["manutap_seq"] == "17"
+    assert r["des_seq"] == "28", "ultima peça tem display=28 no nome (array_pos=27)"
 
 
 @pytest.mark.skipif(not TEMPLATE.exists(), reason="modelo de dilação ausente")
