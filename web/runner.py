@@ -18,6 +18,7 @@ from datetime import date
 from pathlib import Path
 from typing import Iterable
 
+from . import signers as _signers
 from . import store
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,8 +34,12 @@ RE_FALHA = re.compile(r"(?:ERRO|FAIL|Falha|fora de ONLY_PROCESSOS).*?(TC/\d+/\d+
 def _default_env_for_tipo(tipo: str) -> dict[str, str]:
     """Env vars base copiadas dos runners PowerShell do projeto.
 
-    Mantém o comportamento PROD/destrutivo já usado pelo Gilson, com assinatura
-    da Roseli Chaves e sem tramitar (apenas pede assinatura).
+    Comportamento PROD/destrutivo + assinatura sem tramitar.
+
+    Os campos de assinante (`ASSINANTE_NOME`, `SIGNER_MATCH_TOKENS`,
+    pastas `OFICIO_TEMPLATES_DIR_<TIPO>`, fallback de secretaria) vem do
+    assinante ATIVO em `web/signers.py:active()`. O usuário escolhe na
+    home — default = Daniela Shimizu (durante as ferias da Roseli).
     """
     tipo = tipo.strip().upper()
     data_oficio = date.today().strftime("%d/%m/%Y")
@@ -59,6 +64,9 @@ def _default_env_for_tipo(tipo: str) -> dict[str, str]:
         "RUN_PROD_DESTRUCTIVE_CLEANUP": "true",
         "FORCE_DELETE_OLD_OFICIO_SSG": "true",
         "FORCE_RECREATE_COMUNICACAO": "true",
+        # Env var generica que controla estorno de assinatura pendente do
+        # assinante configurado em SIGNER_MATCH_TOKENS (Roseli, Daniela ou
+        # custom). Mantemos o nome historico p/ nao quebrar runners antigos.
         "FORCE_REVOKE_PENDING_ROSELI_SIGNATURE": "true",
         "FORCE_DELETE_ALL_COMUNICACOES_AUTHORIZED": "false",
         "SKIP_COMUNICACAO_CLEANUP": "false",
@@ -66,8 +74,6 @@ def _default_env_for_tipo(tipo: str) -> dict[str, str]:
         "STOP_AFTER_OFICIO_CONCLUIDO": "false",
         "SKIP_SIGNATURE": "false",
         "REQUEST_SIGNATURE": "true",
-        "ASSINANTE_NOME": "Roseli Chaves",
-        "SIGNER_NAME": "Roseli Chaves",
         "SKIP_TRAMITACAO": "true",
         "TRAMITAR_DESTINO": "",
         "DISTRIBUIR_PARA": "",
@@ -87,6 +93,10 @@ def _default_env_for_tipo(tipo: str) -> dict[str, str]:
     }
     if tipo == "REITERACAO":
         env["REITERACAO_REQUIRE_AUTO_EXTRACT"] = "true"
+    # Injeta os campos do assinante ATIVO (escolhido pelo Gilson na home).
+    # Sobrescreve qualquer default — se vier vazio o matcher cai no fallback
+    # default de oficio_normalize (Roseli/Chaves) sem quebrar.
+    env.update(_signers.active().to_env())
     return env
 
 

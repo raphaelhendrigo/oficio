@@ -10,7 +10,7 @@
             de cada um — <strong>Reiteração</strong>, <strong>Dilação</strong> ou
             <strong>Manutap / UTAP</strong> — e o robô executa o fluxo PROD completo:
             limpeza, geração do Ofício SSG, comunicação processual e pedido de
-            assinatura para a <strong>Roseli Chaves</strong>.
+            assinatura para o assinante selecionado abaixo.
         </p>
     </div>
     <div class="hero-art" aria-hidden="true">
@@ -29,9 +29,69 @@
 </div>
 {% endif %}
 
+<section class="card signer-card" id="signerCard">
+    <div class="card-header">
+        <h2>1. Quem vai assinar?</h2>
+        <span class="muted">o robô vai pedir assinatura para esta pessoa em todos os processos do lote</span>
+    </div>
+    <ul class="signer-list" id="signerList">
+        {% for s in signers %}
+        <li class="signer-item {% if s.id == active_signer.id %}is-active{% endif %} {% if s.is_preset %}is-preset{% else %}is-custom{% endif %}" data-id="{{ s.id }}" data-preset="{{ 1 if s.is_preset else 0 }}">
+            <label class="signer-row">
+                <input type="radio" name="signer" value="{{ s.id }}" {% if s.id == active_signer.id %}checked{% endif %}>
+                <div class="signer-info">
+                    <span class="signer-name">{{ s.name }}</span>
+                    <span class="signer-desc">{{ s.description }}</span>
+                    <span class="signer-tokens">tokens: {{ s.tokens|join(', ') }}</span>
+                </div>
+            </label>
+            {% if not s.is_preset %}
+            <button type="button" class="ghost-btn small signer-del" data-id="{{ s.id }}" title="Remover este assinante">×</button>
+            {% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+    <div class="signer-add" id="signerAddBox">
+        <button type="button" class="ghost-btn" id="signerAddToggle">+ Adicionar outro assinante</button>
+        <form id="signerAddForm" class="signer-add-form hidden" autocomplete="off">
+            <input type="text" id="signerAddName" placeholder="Nome completo (ex.: Marcia Silva Souza)" required>
+            <input type="text" id="signerAddTokens" placeholder="tokens (opcional, ex.: marcia, souza)">
+            <button type="submit" class="primary small">Salvar</button>
+            <button type="button" class="ghost-btn small" id="signerAddCancel">Cancelar</button>
+        </form>
+        <div class="signer-feedback muted small" id="signerFeedback"></div>
+    </div>
+</section>
+
+<section class="card directors-card" id="directorsCard">
+    <div class="card-header">
+        <h2>2. Diretores (encaminhamento)</h2>
+        <span class="muted">nome e cargo que vão na tabela do documento de encaminhamento</span>
+    </div>
+    <div class="director-list">
+        {% for d in directors %}
+        <div class="director-item" data-key="{{ d.key }}">
+            <div class="director-secretaria">{{ d.secretaria_label }}</div>
+            <div class="director-fields">
+                <label>
+                    <span class="lbl-mini">Nome</span>
+                    <input type="text" class="dir-name" data-key="{{ d.key }}" value="{{ d.name }}" placeholder="ex.: Vandréia Cristian de Oliveira">
+                </label>
+                <label>
+                    <span class="lbl-mini">Cargo</span>
+                    <input type="text" class="dir-cargo" data-key="{{ d.key }}" value="{{ d.cargo }}" placeholder="ex.: Diretora/SME">
+                </label>
+                <button type="button" class="ghost-btn small dir-save" data-key="{{ d.key }}">Salvar</button>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    <div class="director-feedback muted small" id="directorFeedback"></div>
+</section>
+
 <section class="card upload-card">
     <div class="card-header">
-        <h2>1. Enviar planilha</h2>
+        <h2>3. Enviar planilha</h2>
         <span class="muted">.xlsx ou .xls</span>
     </div>
     <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form" id="uploadForm">
@@ -95,6 +155,101 @@
             input.files = e.dataTransfer.files;
             fileName.textContent = input.files[0].name;
         }
+    });
+
+    // -------- Assinantes ---------------------------------------------------
+    const fb = document.getElementById('signerFeedback');
+    function showFeedback(msg, isError=false) {
+        fb.textContent = msg;
+        fb.style.color = isError ? '#fca5a5' : '';
+        if (msg) setTimeout(() => { if (fb.textContent === msg) fb.textContent = ''; }, 3500);
+    }
+    // Selecionar
+    document.querySelectorAll('input[name="signer"]').forEach(rb => {
+        rb.addEventListener('change', async () => {
+            const id = rb.value;
+            try {
+                const r = await fetch('/api/signers/select', {
+                    method: 'POST', headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({id})
+                });
+                if (!r.ok) { showFeedback('Falha ao trocar assinante: '+r.status, true); return; }
+                // Reflete visualmente sem reload
+                document.querySelectorAll('.signer-item').forEach(li => li.classList.toggle('is-active', li.dataset.id === id));
+                showFeedback('Assinante ativo atualizado.');
+            } catch (e) { showFeedback('Erro: '+e.message, true); }
+        });
+    });
+    // Remover custom
+    document.querySelectorAll('.signer-del').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.dataset.id;
+            if (!confirm('Remover este assinante personalizado?')) return;
+            try {
+                const r = await fetch('/api/signers/'+encodeURIComponent(id), {method: 'DELETE'});
+                if (!r.ok) { showFeedback('Falha ao remover: '+r.status, true); return; }
+                location.reload();
+            } catch (e) { showFeedback('Erro: '+e.message, true); }
+        });
+    });
+    // Adicionar
+    const addToggle = document.getElementById('signerAddToggle');
+    const addForm = document.getElementById('signerAddForm');
+    const addCancel = document.getElementById('signerAddCancel');
+    const addName = document.getElementById('signerAddName');
+    const addTokens = document.getElementById('signerAddTokens');
+    addToggle.addEventListener('click', () => {
+        addForm.classList.remove('hidden');
+        addToggle.classList.add('hidden');
+        addName.focus();
+    });
+    addCancel.addEventListener('click', () => {
+        addForm.classList.add('hidden');
+        addToggle.classList.remove('hidden');
+        addName.value = ''; addTokens.value = '';
+    });
+    // -------- Diretores --------------------------------------------------
+    const dfb = document.getElementById('directorFeedback');
+    function showDirFeedback(msg, isError=false) {
+        if (!dfb) return;
+        dfb.textContent = msg;
+        dfb.style.color = isError ? '#fca5a5' : '';
+        if (msg) setTimeout(() => { if (dfb.textContent === msg) dfb.textContent = ''; }, 3500);
+    }
+    document.querySelectorAll('.dir-save').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const key = btn.dataset.key;
+            const name = document.querySelector(`.dir-name[data-key="${key}"]`).value.trim();
+            const cargo = document.querySelector(`.dir-cargo[data-key="${key}"]`).value.trim();
+            btn.disabled = true;
+            try {
+                const r = await fetch('/api/directors/'+encodeURIComponent(key), {
+                    method: 'POST', headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({name, cargo}),
+                });
+                const data = await r.json();
+                if (!r.ok) { showDirFeedback(data.detail || 'Falha ao salvar '+key, true); return; }
+                showDirFeedback('Diretor(a) de '+key+' salvo(a).');
+            } catch (e) { showDirFeedback('Erro: '+e.message, true); }
+            finally { btn.disabled = false; }
+        });
+    });
+
+    addForm.addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        const name = addName.value.trim();
+        const tokens = addTokens.value.trim();
+        if (!name) { showFeedback('Informe o nome.', true); return; }
+        try {
+            const r = await fetch('/api/signers', {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({name, tokens: tokens || null})
+            });
+            const data = await r.json();
+            if (!r.ok) { showFeedback(data.detail || 'Falha ao adicionar', true); return; }
+            showFeedback('Assinante adicionado.');
+            location.reload();
+        } catch (e) { showFeedback('Erro: '+e.message, true); }
     });
 </script>
 {% endblock %}

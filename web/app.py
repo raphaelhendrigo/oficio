@@ -23,7 +23,9 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import excel_parser, features as features_mod, labels, report, runner, store
+from . import classifier as clf_mod
+from . import directors as directors_mod
+from . import excel_parser, features as features_mod, labels, report, runner, signers as signers_mod, store
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB_DIR = ROOT / "web"
@@ -71,8 +73,81 @@ async def index(request: Request):
     recent = store.list_recent(10)
     return templates.TemplateResponse(
         "index.html",
-        {"request": request, "recent": recent, "is_busy": store.is_busy()},
+        {
+            "request": request,
+            "recent": recent,
+            "is_busy": store.is_busy(),
+            "signers": signers_mod.list_signers(),
+            "active_signer": signers_mod.active(),
+            "directors": directors_mod.list_directors(),
+        },
     )
+
+
+# ---------- Diretores (encaminhamento) --------------------------------------
+
+@app.get("/api/directors")
+async def api_list_directors():
+    return JSONResponse({
+        "directors": [directors_mod.to_dict(d) for d in directors_mod.list_directors()]
+    })
+
+
+@app.post("/api/directors/{key}")
+async def api_update_director(key: str, request: Request):
+    body = await request.json() or {}
+    name = body.get("name")
+    cargo = body.get("cargo")
+    try:
+        d = directors_mod.update(key, name=name, cargo=cargo)
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
+    return JSONResponse({"ok": True, "director": directors_mod.to_dict(d)})
+
+
+# ---------- Assinantes (presets + customs) ----------------------------------
+
+@app.get("/api/signers")
+async def api_list_signers():
+    sigs = signers_mod.list_signers()
+    a = signers_mod.active()
+    return JSONResponse({
+        "active_id": a.id,
+        "signers": [signers_mod.to_dict(s) for s in sigs],
+    })
+
+
+@app.post("/api/signers/select")
+async def api_select_signer(request: Request):
+    body = await request.json()
+    sid = (body or {}).get("id") or ""
+    if not signers_mod.set_active(sid):
+        raise HTTPException(404, "assinante não encontrado")
+    return JSONResponse({"ok": True, "active_id": sid})
+
+
+@app.post("/api/signers")
+async def api_add_signer(request: Request):
+    body = await request.json() or {}
+    name = (body.get("name") or "").strip()
+    tokens = body.get("tokens") or None
+    if not name:
+        raise HTTPException(400, "informe o nome do assinante")
+    if isinstance(tokens, str):
+        tokens = [t.strip() for t in tokens.split(",") if t.strip()]
+    try:
+        s = signers_mod.add_custom(name, tokens=tokens)
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
+    return JSONResponse({"ok": True, "signer": signers_mod.to_dict(s)})
+
+
+@app.delete("/api/signers/{signer_id}")
+async def api_delete_signer(signer_id: str):
+    ok = signers_mod.delete_custom(signer_id)
+    if not ok:
+        raise HTTPException(400, "não foi possível remover (preset, em uso ou inexistente)")
+    return JSONResponse({"ok": True})
 
 
 @app.post("/upload")
@@ -104,12 +179,52 @@ async def upload(file: Annotated[UploadFile, File()]):
     return RedirectResponse(url=f"/confirm/{upload_id}", status_code=303)
 
 
+CONF_HIGH = 0.85   # cinto-suspensorio: pré-marca quando confiança >= 85%
+CONF_MED = 0.60    # pré-marca como sugestão "média" entre 60-85%
+
+
+def _classify_for_confirm(processos: list[str]) -> dict[str, dict]:
+    """Para cada processo do Excel, devolve sugestao do classificador.
+
+    Estrategia:
+      - Se ha features cacheadas para o processo (ja foi rodado antes),
+        usa elas direto.
+      - Caso contrario, marca como "sem cache" — o front-end mostra um
+        botao "Pre-classificar" que dispara o peek Playwright (mais lento)
+        sob demanda do Gilson.
+
+    Retorna dict {processo: {tipo, confidence, probs, source, label_class}}
+    onde label_class e 'high' / 'med' / 'low' / 'none' (usado pelo CSS).
+    """
+    out: dict[str, dict] = {}
+    if not clf_mod.is_trained():
+        for p in processos:
+            out[p] = {"tipo": None, "confidence": 0.0, "source": "no_model"}
+        return out
+    for p in processos:
+        pred = clf_mod.predict_by_processo(p)
+        conf = pred.get("confidence", 0.0)
+        if pred.get("tipo") is None:
+            label_class = "none"
+        elif conf >= CONF_HIGH:
+            label_class = "high"
+        elif conf >= CONF_MED:
+            label_class = "med"
+        else:
+            label_class = "low"
+        pred["label_class"] = label_class
+        out[p] = pred
+    return out
+
+
 @app.get("/confirm/{upload_id}", response_class=HTMLResponse)
 async def confirm_get(upload_id: str, request: Request):
     info = _pending_uploads.get(upload_id)
     if not info:
         raise HTTPException(404, "Upload expirou — envie a planilha de novo.")
     default_dt = _next_business_day_0010()
+    suggestions = _classify_for_confirm(info["processos"])
+    meta = clf_mod.load_meta() or {}
     return templates.TemplateResponse(
         "confirm.html",
         {
@@ -117,6 +232,8 @@ async def confirm_get(upload_id: str, request: Request):
             "upload_id": upload_id,
             "filename": info["filename"],
             "processos": info["processos"],
+            "suggestions": suggestions,
+            "model_meta": meta,
             "is_busy": store.is_busy(),
             "default_scheduled_at": default_dt.strftime("%Y-%m-%dT%H:%M"),
             "default_scheduled_label": default_dt.strftime("%d/%m/%Y às %H:%M"),
@@ -211,6 +328,7 @@ async def labels_page(request: Request):
     s = labels.stats()
     fs = features_mod.stats()
     joined = features_mod.join_with_labels()
+    model_meta = clf_mod.load_meta()
     # Estimativa de quantos dias úteis faltam para cada marco com base no
     # ritmo histórico (avg_per_day). Se ainda não há histórico, mostra "—".
     rate = s["avg_per_day"] or 0
@@ -232,6 +350,7 @@ async def labels_page(request: Request):
             "eta": eta,
             "features_stats": fs,
             "joined_count": len(joined),
+            "model_meta": model_meta,
             "is_busy": store.is_busy(),
         },
     )
@@ -243,7 +362,127 @@ async def api_labels_stats():
         "labels": labels.stats(),
         "features": features_mod.stats(),
         "joined": len(features_mod.join_with_labels()),
+        "model": clf_mod.load_meta(),
     })
+
+
+@app.post("/api/prefetch_classify")
+async def api_prefetch_classify(request: Request):
+    """Inicia um peek em background e devolve peek_id imediatamente.
+
+    Cliente acompanha progresso por `GET /api/peek/{peek_id}` ou pelo
+    WebSocket `/ws/peek/{peek_id}`.
+    """
+    body = await request.json()
+    processos = body.get("processos") or []
+    if not isinstance(processos, list) or not processos:
+        raise HTTPException(400, "Esperado JSON com lista de processos")
+    if len(processos) > 60:
+        raise HTTPException(400, "Maximo 60 processos por peek")
+    if store.is_busy():
+        raise HTTPException(409, "Nao posso fazer peek com job rodando — aguarde.")
+
+    from . import peek as _peek
+    from . import peek_store as _ps
+    pj = _ps.new_peek(processos)
+
+    def _run():
+        _ps.prune_old()
+        try:
+            _peek.peek_and_persist_features(
+                processos,
+                log_fn=lambda line: _ps.append_log(pj.id, line),
+                peek_id=pj.id,
+            )
+            _ps.mark_finished(pj.id, ok=True)
+        except Exception as ex:
+            _ps.mark_finished(pj.id, ok=False, error=str(ex)[:300])
+
+    import asyncio
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, _run)
+    return JSONResponse({"peek_id": pj.id, "total": pj.total})
+
+
+@app.get("/api/peek/{peek_id}")
+async def api_peek_status(peek_id: str):
+    from . import peek_store as _ps
+    pj = _ps.get(peek_id)
+    if not pj:
+        raise HTTPException(404, "peek expirado ou inexistente")
+    return JSONResponse(pj.to_dict())
+
+
+@app.websocket("/ws/peek/{peek_id}")
+async def ws_peek(websocket: WebSocket, peek_id: str):
+    from . import peek_store as _ps
+    await websocket.accept()
+    pj = _ps.get(peek_id)
+    if not pj:
+        await websocket.send_text(json.dumps({"type": "error", "message": "peek nao encontrado"}))
+        await websocket.close()
+        return
+
+    sent_lines = 0
+    last_done = -1
+    try:
+        # Snapshot inicial.
+        await websocket.send_text(json.dumps({
+            "type": "start",
+            "peek_id": peek_id,
+            "total": pj.total,
+            "processos": pj.processos,
+        }))
+        while True:
+            pj = _ps.get(peek_id)
+            if not pj:
+                break
+            # Log novo.
+            new = pj.log_lines[sent_lines:]
+            if new:
+                for ln in new:
+                    await websocket.send_text(json.dumps({"type": "log", "line": ln}))
+                sent_lines = len(pj.log_lines)
+            # Progresso.
+            if pj.done != last_done:
+                await websocket.send_text(json.dumps({
+                    "type": "progress",
+                    "done": pj.done,
+                    "total": pj.total,
+                    "results": pj.results,
+                }))
+                last_done = pj.done
+            if pj.status in ("done", "failed"):
+                await websocket.send_text(json.dumps({
+                    "type": "finished",
+                    "status": pj.status,
+                    "error": pj.error,
+                    "results": pj.results,
+                }))
+                break
+            await asyncio.sleep(0.4)
+    except WebSocketDisconnect:
+        return
+    except Exception as ex:
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": str(ex)}))
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/train_classifier")
+async def api_train_classifier():
+    """Retreina o classificador on-demand. Costuma rodar em < 5 segundos."""
+    try:
+        meta = clf_mod.train_and_save(verbose=False)
+        return JSONResponse({"ok": True, "meta": meta})
+    except Exception as ex:
+        return JSONResponse({"ok": False, "error": str(ex)}, status_code=500)
 
 
 @app.get("/run/{job_id}/report", response_class=HTMLResponse)

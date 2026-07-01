@@ -6,9 +6,20 @@
     <h1>Confirme o tipo de cada processo</h1>
     <p class="lead">
         Detectamos <strong>{{ processos|length }}</strong> processo(s) na planilha
-        <code>{{ filename }}</code>. Marque o tipo de cada um. Os marcados como
-        <em>pular</em> não serão enviados para o robô.
+        <code>{{ filename }}</code>.
+        {% if model_meta and model_meta.f1_macro_cv %}
+        O classificador automático sugere o tipo de cada um — confiança alta vem
+        pré-marcada (badge verde). Confira e ajuste antes de disparar.
+        {% else %}
+        Marque o tipo de cada um. Os marcados como <em>pular</em> não serão enviados.
+        {% endif %}
     </p>
+    {% if model_meta and model_meta.f1_macro_cv %}
+    <div class="model-info">
+        <span class="pill st-ok">modelo ativo · F1 = {{ '%.3f' % model_meta.f1_macro_cv }}</span>
+        <span class="muted">treinado em {{ model_meta.trained_at }} com {{ model_meta.n_samples }} processos rotulados</span>
+    </div>
+    {% endif %}
 </section>
 
 <form method="post" action="/confirm/{{ upload_id }}" id="confirmForm" class="card">
@@ -25,6 +36,10 @@
         <button type="button" class="chip" data-bulk="DILACAO">Dilação</button>
         <button type="button" class="chip" data-bulk="UTAP">Manutap</button>
         <button type="button" class="chip ghost" data-bulk="PULAR">Limpar</button>
+        <span class="muted">·</span>
+        <button type="button" class="chip" id="acceptAllHigh" title="Aceita só as sugestões com confiança alta">Aceitar sugestões fortes</button>
+        <button type="button" class="chip" id="acceptAllSuggested" title="Aceita TODAS as sugestões cacheadas">Aceitar todas</button>
+        <button type="button" class="chip ghost" id="prefetchUncached" title="Abre os processos sem cache no e-TCM em headless para extrair features e classificar">Pré-classificar sem-cache</button>
     </div>
 
     <table class="grid select-grid">
@@ -32,20 +47,50 @@
             <tr>
                 <th style="width:48px">#</th>
                 <th>Processo</th>
-                <th style="width:220px">Tipo</th>
+                <th style="width:260px">Sugestão do modelo</th>
+                <th style="width:220px">Tipo escolhido</th>
             </tr>
         </thead>
         <tbody>
         {% for p in processos %}
-            <tr>
+            {% set s = suggestions.get(p, {}) %}
+            {% set lc = s.get('label_class') or 'none' %}
+            {% set tipo_sug = s.get('tipo') %}
+            {% set conf = s.get('confidence') or 0 %}
+            <tr data-proc="{{ p }}" data-label-class="{{ lc }}">
                 <td class="muted">{{ loop.index }}</td>
                 <td><code class="proc">{{ p }}</code></td>
                 <td>
-                    <select name="tipo__{{ p }}" class="tipo-select" data-proc="{{ p }}">
-                        <option value="PULAR" selected>— pular —</option>
-                        <option value="REITERACAO">Reiteração</option>
-                        <option value="DILACAO">Dilação</option>
-                        <option value="UTAP">Manutap (UTAP)</option>
+                    {% if tipo_sug %}
+                        <span class="sugg sugg-{{ lc }} sugg-tipo-{{ tipo_sug }}">
+                            <span class="sugg-tipo">{{ tipo_sug }}</span>
+                            <span class="sugg-conf">{{ '%.0f%%' % (conf * 100) }}</span>
+                        </span>
+                        {% if s.get('source') == 'cache' %}
+                            <span class="muted small">via cache</span>
+                        {% endif %}
+                    {% elif s.get('source') == 'no_cache' %}
+                        <span class="muted small">sem cache · use "Pré-classificar sem-cache"</span>
+                    {% elif s.get('source') == 'no_model' %}
+                        <span class="muted small">modelo ainda não treinado</span>
+                    {% else %}
+                        <span class="muted small">—</span>
+                    {% endif %}
+                </td>
+                <td>
+                    <select name="tipo__{{ p }}" class="tipo-select" data-proc="{{ p }}" data-suggested="{{ tipo_sug or '' }}" data-conf="{{ conf }}">
+                        {# Pré-marcação só quando confiança é ALTA (>=85%). #}
+                        {% if tipo_sug and lc == 'high' %}
+                            <option value="PULAR">— pular —</option>
+                            <option value="REITERACAO" {% if tipo_sug=='REITERACAO' %}selected{% endif %}>Reiteração</option>
+                            <option value="DILACAO" {% if tipo_sug=='DILACAO' %}selected{% endif %}>Dilação</option>
+                            <option value="UTAP" {% if tipo_sug=='UTAP' %}selected{% endif %}>Manutap (UTAP)</option>
+                        {% else %}
+                            <option value="PULAR" selected>— pular —</option>
+                            <option value="REITERACAO">Reiteração</option>
+                            <option value="DILACAO">Dilação</option>
+                            <option value="UTAP">Manutap (UTAP)</option>
+                        {% endif %}
                     </select>
                 </td>
             </tr>
@@ -103,6 +148,118 @@
             selects.forEach(s => s.value = v);
             recount();
         });
+    });
+    document.getElementById('acceptAllHigh').addEventListener('click', () => {
+        document.querySelectorAll('tr[data-label-class="high"] .tipo-select').forEach(s => {
+            const sug = s.getAttribute('data-suggested');
+            if (sug) s.value = sug;
+        });
+        recount();
+    });
+    document.getElementById('acceptAllSuggested').addEventListener('click', () => {
+        document.querySelectorAll('.tipo-select').forEach(s => {
+            const sug = s.getAttribute('data-suggested');
+            if (sug) s.value = sug;
+        });
+        recount();
+    });
+    function renderSuggestion(tr, sug, source_label) {
+        if (!tr || !sug || !sug.tipo) return;
+        tr.setAttribute('data-label-class', sug.label_class);
+        const cellSug = tr.children[2];
+        const conf = Math.round((sug.confidence||0)*100);
+        cellSug.innerHTML = `<span class="sugg sugg-${sug.label_class} sugg-tipo-${sug.tipo}"><span class="sugg-tipo">${sug.tipo}</span><span class="sugg-conf">${conf}%</span></span> <span class="muted small">${source_label||'peek'}</span>`;
+        const sel = tr.querySelector('.tipo-select');
+        sel.setAttribute('data-suggested', sug.tipo);
+        sel.setAttribute('data-conf', sug.confidence);
+        if (sug.label_class === 'high') sel.value = sug.tipo;
+    }
+    function renderError(tr, err) {
+        if (!tr) return;
+        const cellSug = tr.children[2];
+        cellSug.innerHTML = `<span class="muted small" style="color:#fca5a5">falhou: ${err||'erro'}</span>`;
+    }
+    function renderRunning(tr) {
+        if (!tr) return;
+        const cellSug = tr.children[2];
+        cellSug.innerHTML = `<span class="sugg sugg-none"><span class="sugg-tipo">…lendo</span></span>`;
+    }
+
+    document.getElementById('prefetchUncached').addEventListener('click', async (ev) => {
+        const btn = ev.currentTarget;
+        const original = btn.textContent;
+        btn.disabled = true;
+        const uncached = Array.from(document.querySelectorAll('tr[data-label-class="none"]')).map(tr => tr.getAttribute('data-proc'));
+        if (uncached.length === 0) { alert('Todos os processos já têm sugestão.'); btn.disabled=false; return; }
+
+        // Cria/exibe a barra de progresso.
+        let progressBox = document.getElementById('peekProgress');
+        if (!progressBox) {
+            progressBox = document.createElement('div');
+            progressBox.id = 'peekProgress';
+            progressBox.className = 'peek-progress';
+            progressBox.innerHTML = `
+                <div class="peek-progress-head">
+                    <span class="peek-progress-title">Pré-classificando processos sem cache…</span>
+                    <span class="peek-progress-count" id="peekProgressCount">0 / ${uncached.length}</span>
+                </div>
+                <div class="peek-progress-track"><div class="peek-progress-fill" id="peekProgressFill" style="width:0%"></div></div>
+                <div class="peek-progress-log" id="peekProgressLog"></div>`;
+            btn.closest('.bulk-row').after(progressBox);
+        }
+        const fill = document.getElementById('peekProgressFill');
+        const cnt = document.getElementById('peekProgressCount');
+        const logEl = document.getElementById('peekProgressLog');
+        btn.textContent = 'pré-classificando…';
+
+        try {
+            const res = await fetch('/api/prefetch_classify', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({processos: uncached}),
+            });
+            if (!res.ok) { alert('Falha ao iniciar peek: '+res.status); return; }
+            const { peek_id, total } = await res.json();
+            const seen = new Set();
+
+            await new Promise((resolve) => {
+                const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
+                const ws = new WebSocket(`${proto}://${location.host}/ws/peek/${peek_id}`);
+                ws.onmessage = (ev) => {
+                    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+                    if (msg.type === 'log') {
+                        const line = msg.line || '';
+                        const m = line.match(/\[peek\]\s+(TC\/\S+)\s+running/);
+                        if (m) renderRunning(document.querySelector(`tr[data-proc="${m[1]}"]`));
+                        logEl.textContent = line;
+                    } else if (msg.type === 'progress') {
+                        const done = msg.done || 0;
+                        cnt.textContent = `${done} / ${msg.total}`;
+                        fill.style.width = (100 * done / msg.total) + '%';
+                        // Aplica resultados novos.
+                        for (const [proc, sug] of Object.entries(msg.results || {})) {
+                            if (seen.has(proc)) continue;
+                            seen.add(proc);
+                            const tr = document.querySelector(`tr[data-proc="${proc}"]`);
+                            if (sug && sug.tipo) renderSuggestion(tr, sug, 'novo peek');
+                            else renderError(tr, sug && sug.error || 'sem peças');
+                        }
+                        recount();
+                    } else if (msg.type === 'finished') {
+                        cnt.textContent = `${msg.results ? Object.keys(msg.results).length : 0} / ${total} · concluído`;
+                        fill.style.width = '100%';
+                        resolve();
+                    } else if (msg.type === 'error') {
+                        logEl.textContent = '[ws error] ' + msg.message;
+                    }
+                };
+                ws.onclose = () => resolve();
+            });
+        } catch (e) {
+            alert('Erro: ' + e.message);
+        } finally {
+            btn.textContent = original;
+            btn.disabled = false;
+        }
     });
     recount();
 </script>

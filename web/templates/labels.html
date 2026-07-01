@@ -99,17 +99,85 @@
 </section>
 {% endif %}
 
+{% if model_meta %}
 <section class="card">
-    <div class="card-header"><h2>Próximo passo: capturar as features</h2></div>
-    <p class="muted">
-        O label sozinho não treina o classificador. Falta capturar, no momento que
-        o robô abre cada processo no e-TCM, as <strong>features</strong> que
-        explicam por que ele é UTAP, DILACAO ou REITERACAO: último ato,
-        secretaria, número de ofícios anteriores, datas, conselheiro relator,
-        decisão atual etc. Esse passo entra no <code>src/main.py</code> e está
-        documentado em <a href="/static/LEARNING_PIPELINE.md">LEARNING_PIPELINE.md</a>.
-    </p>
+    <div class="card-header">
+        <h2>Classificador automático ativo</h2>
+        <span class="muted">treinado em {{ model_meta.trained_at }} · sklearn {{ model_meta.sklearn_version }}</span>
+    </div>
+    <div class="report-counters">
+        <div class="counter"><span class="num">{{ model_meta.n_samples }}</span><span class="lbl">Amostras no treino</span></div>
+        <div class="counter"><span class="num">{{ '%.3f' % model_meta.f1_macro_cv }}</span><span class="lbl">F1 macro (CV {{ model_meta.cv_folds }}-fold)</span></div>
+        <div class="counter"><span class="num">{{ model_meta.class_counts.UTAP }}</span><span class="lbl">UTAP no treino</span></div>
+        <div class="counter"><span class="num">{{ model_meta.class_counts.DILACAO }}</span><span class="lbl">DILACAO no treino</span></div>
+    </div>
+    <h3 style="margin-top:18px;">Performance por classe (validação cruzada)</h3>
+    <table class="grid">
+        <thead><tr><th>Classe</th><th>Precisão</th><th>Recall</th><th>F1</th><th>Suporte</th></tr></thead>
+        <tbody>
+        {% for cls in ['UTAP','DILACAO','REITERACAO'] %}
+            {% set r = model_meta.report_cv.get(cls, {}) %}
+            <tr>
+                <td><span class="tag tag-{{ cls }}">{{ cls }}</span></td>
+                <td>{{ '%.2f' % (r.precision or 0) }}</td>
+                <td>{{ '%.2f' % (r.recall or 0) }}</td>
+                <td>{{ '%.2f' % (r['f1-score'] or 0) }}</td>
+                <td>{{ r.support or 0 }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    <h3 style="margin-top:18px;">Matriz de confusão (CV)</h3>
+    <table class="grid">
+        <thead><tr><th></th>{% for c in model_meta.confusion_matrix_cv.labels %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+        <tbody>
+        {% for i in range(model_meta.confusion_matrix_cv.labels|length) %}
+            <tr>
+                <td><strong>{{ model_meta.confusion_matrix_cv.labels[i] }}</strong></td>
+                {% for v in model_meta.confusion_matrix_cv.matrix[i] %}<td>{{ v }}</td>{% endfor %}
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    <div class="actions-row" style="margin-top:14px;">
+        <button type="button" class="ghost-btn" id="retrainBtn">Retreinar agora</button>
+        <span class="muted" id="retrainResult"></span>
+    </div>
 </section>
+{% else %}
+<section class="card">
+    <div class="card-header"><h2>Classificador ainda não treinado</h2></div>
+    <p class="muted">
+        Rode <code>.venv\Scripts\python.exe scripts\train_classifier.py</code>
+        ou clique no botão abaixo para treinar com o dataset atual ({{ joined_count }} linhas).
+    </p>
+    <div class="actions-row">
+        <button type="button" class="ghost-btn" id="retrainBtn">Treinar agora</button>
+        <span class="muted" id="retrainResult"></span>
+    </div>
+</section>
+{% endif %}
+
+<script>
+    const btn = document.getElementById('retrainBtn');
+    const out = document.getElementById('retrainResult');
+    if (btn) {
+        btn.addEventListener('click', async () => {
+            btn.disabled = true; const orig = btn.textContent; btn.textContent = 'treinando...';
+            try {
+                const res = await fetch('/api/train_classifier', {method:'POST'});
+                const data = await res.json();
+                if (data.ok) {
+                    out.textContent = `F1 macro = ${data.meta.f1_macro_cv.toFixed(3)} (n=${data.meta.n_samples}). Recarregando...`;
+                    setTimeout(() => location.reload(), 1500);
+                } else {
+                    out.textContent = 'Falha: ' + (data.error || 'desconhecido');
+                }
+            } catch (e) { out.textContent = 'Erro: ' + e.message; }
+            finally { btn.disabled = false; btn.textContent = orig; }
+        });
+    }
+</script>
 
 <div class="actions-row">
     <a href="/" class="ghost-btn">← voltar para início</a>
