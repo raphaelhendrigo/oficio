@@ -34,8 +34,10 @@ from oficio_normalize import (
     DESCRICAO_DILACAO,
     DESCRICAO_JUIZO_SINGULAR,
     DESCRICAO_REITERACAO,
+    current_signer_tokens,
     decode_zip_unicode_escape_name,
     normalize_descricao_comunicacao,
+    signer_name_matches,
     signer_name_matches_roseli_chaves,
 )
 
@@ -2322,7 +2324,54 @@ def _get_robot_comm_ntf_key(context, page, processo: str) -> Optional[Tuple[str,
             pass
 
 
-def attach_docx_inside_comunicacao(context, page, processo: str, docx_path: Path) -> bool:
+def _open_robot_comm_gerenciador_atos(context, page, processo: str):
+    info = _get_robot_comm_ntf_key(context, page, processo)
+    if not info:
+        return None
+
+    ntf, pt, ar = info
+    base_root = page.url.split("/paginas/")[0] if "/paginas/" in (page.url or "") else "https://etcm.tcm.sp.gov.br"
+    gerencia_url = f"{base_root}/paginas/ato/GerenciaAto.aspx?ntf={ntf}&pt={pt}&ar={ar}&pc="
+    pop = None
+    try:
+        pop = context.new_page()
+        pop.goto(gerencia_url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            pop.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        return pop
+    except Exception as e:
+        print(f"Aviso: {processo}: nao consegui abrir Gerenciador vinculado para ler SSG atual: {e}")
+        try:
+            if pop is not None and not pop.is_closed():
+                pop.close()
+        except Exception:
+            pass
+        return None
+
+
+def _infer_upload_ato_tipo_label(docx_path: Path | None, ato_tipo: str | None = None) -> str:
+    raw = ato_tipo or (docx_path.name if docx_path else "")
+    norm = normalize(raw).lower()
+    if "encaminhamento" in norm:
+        return "Encaminhamento"
+    return "Ofício SSG"
+
+
+def _upload_ato_tipo_regex(label: str):
+    if "encaminhamento" in normalize(label).lower():
+        return re.compile(r"encaminhamento", re.I)
+    return re.compile(r"of[ií]cio\s*ssg", re.I)
+
+
+def attach_docx_inside_comunicacao(
+    context,
+    page,
+    processo: str,
+    docx_path: Path,
+    ato_tipo: str | None = None,
+) -> bool:
     """Anexa o DOCX como Of'icio SSG VINCULADO a comunicacao processual.
 
     Difere de `attach_docx_via_gerenciador_atos` porque abre o Gerenciador
@@ -2338,7 +2387,7 @@ def attach_docx_inside_comunicacao(context, page, processo: str, docx_path: Path
     info = _get_robot_comm_ntf_key(context, page, processo)
     if not info:
         print(f"Aviso: {processo}: sem cod_notificacao identificavel; fallback para anexo standalone.")
-        return attach_docx_via_gerenciador_atos(context, page, processo, docx_path)
+        return attach_docx_via_gerenciador_atos(context, page, processo, docx_path, ato_tipo=ato_tipo)
 
     ntf, pt, ar = info
     base_root = page.url.split("/paginas/")[0] if "/paginas/" in (page.url or "") else "https://etcm.tcm.sp.gov.br"
@@ -2356,20 +2405,26 @@ def attach_docx_inside_comunicacao(context, page, processo: str, docx_path: Path
                     new_page.close()
             except Exception:
                 pass
-            return attach_docx_via_gerenciador_atos(context, page, processo, docx_path)
+            return attach_docx_via_gerenciador_atos(context, page, processo, docx_path, ato_tipo=ato_tipo)
         try:
             new_page.wait_for_load_state("domcontentloaded", timeout=10000)
         except Exception:
             pass
-        attached = attach_docx_via_gerenciador_atos(context, new_page, processo, docx_path)
+        attached = attach_docx_via_gerenciador_atos(context, new_page, processo, docx_path, ato_tipo=ato_tipo)
         print(f"  [anexo-comm] resultado anexo vinculado: {'OK' if attached else 'falhou'}")
         return attached
     except Exception as e:
         print(f"Aviso: falha no anexo vinculado em {processo}: {e}; fallback standalone.")
-        return attach_docx_via_gerenciador_atos(context, page, processo, docx_path)
+        return attach_docx_via_gerenciador_atos(context, page, processo, docx_path, ato_tipo=ato_tipo)
 
 
-def attach_docx_via_gerenciador_atos(context, page, processo: str, docx_path: Path) -> bool:
+def attach_docx_via_gerenciador_atos(
+    context,
+    page,
+    processo: str,
+    docx_path: Path,
+    ato_tipo: str | None = None,
+) -> bool:
     """Try to attach the DOCX via the Gerenciador de Atos popup.
 
     Steps:
@@ -2403,6 +2458,21 @@ def attach_docx_via_gerenciador_atos(context, page, processo: str, docx_path: Pa
     if not pop:
         return False
 
+    try:
+        pop.wait_for_load_state("networkidle", timeout=8000)
+    except Exception:
+        pass
+    try:
+        pop.wait_for_selector(
+            "#btnAnexaAto_CD, #btnAnexaAto, #btnAnexaAto_I, "
+            "#btnAnexaAtos, #btnAnexaAtos_I, "
+            "input[type='submit'][value*='Anexar Ato' i], "
+            "input[type='submit'][value*='Anexar Atos' i]",
+            timeout=15000,
+        )
+    except Exception:
+        pass
+
     # 1) Clicar preferencialmente em 'Anexar Ato' (novo fluxo); se nao existir, tenta 'Anexar Atos'
     clicked = False
     for sel in [
@@ -2417,12 +2487,21 @@ def attach_docx_via_gerenciador_atos(context, page, processo: str, docx_path: Pa
         try:
             loc = pop.locator(sel).first
             if loc.count() > 0:
-                with pop.expect_navigation(url=re.compile(r"uploadato|uploadAtos", re.I), timeout=15000):
-                    loc.click()
+                try:
+                    with pop.expect_navigation(url=re.compile(r"uploadato|uploadAtos", re.I), timeout=15000):
+                        loc.click()
+                except Exception:
+                    loc.click(force=True, timeout=5000)
+                    try:
+                        pop.wait_for_url(re.compile(r"uploadato|uploadAtos", re.I), timeout=10000)
+                    except Exception:
+                        pass
                 clicked = True
                 break
         except Exception:
             continue
+    if not clicked:
+        print("[uploadato] botao Anexar Ato/Atos nao localizado no Gerenciador.")
 
     # If no navigation happened, try to proceed anyway on same popup
     target = pop
@@ -2535,23 +2614,68 @@ def attach_docx_via_gerenciador_atos(context, page, processo: str, docx_path: Pa
     except Exception:
         pass
 
-    # 2.1) Classificar como Ofício SSG (novo fluxo); manter fallbacks antigos
+    ato_tipo_label = _infer_upload_ato_tipo_label(docx_path, ato_tipo=ato_tipo)
+    ato_tipo_re = _upload_ato_tipo_regex(ato_tipo_label)
+    ato_tipo_fill = "Encaminhamento" if "encaminhamento" in normalize(ato_tipo_label).lower() else "Oficio SSG"
+    ato_tipo_is_oficio = ato_tipo_label == "Ofício SSG"
+    print(f"[uploadato] classificando ato como: {ato_tipo_label}")
+
+    # 2.1) Classificar o ato (Ofício SSG ou Encaminhamento); manter fallbacks antigos
     try:
-        # Tentativa direta via DevExpress: definir valor 79 ('Ofício SSG')
+        # Tentativa direta via DevExpress. O valor fixo 79 só vale para
+        # Ofício SSG; para Encaminhamento buscamos pelo texto da opção.
         try:
-            target.evaluate(
-                "(function(){\n"
-                "  try {\n"
-                "    var cb = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection().GetByName('cbbTiposAtos') : (window.cbbTiposAtos || null);\n"
-                "    if (cb && cb.SetValue) { cb.SetValue('79'); cb.SetText('Ofício SSG'); return true; }\n"
-                "  } catch(e) {}\n"
-                "  try {\n"
-                "    var vi=document.getElementById('cbbTiposAtos_VI'); var ti=document.getElementById('cbbTiposAtos_I');\n"
-                "    if (vi) vi.value='79'; if (ti) ti.value='Ofício SSG'; return !!(vi||ti);\n"
-                "  } catch(e) {}\n"
-                "  return false;\n"
-                "})()"
+            selected_info = target.evaluate(
+                """(args) => {
+                  const label = args.label || '';
+                  const needle = (args.needle || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').toLowerCase();
+                  const isOficio = !!args.isOficio;
+                  try {
+                    const coll = (window.ASPx && ASPx.GetControlCollection) ? ASPx.GetControlCollection() : null;
+                    const cb = (coll && coll.GetByName) ? coll.GetByName('cbbTiposAtos') : (window.cbbTiposAtos || null);
+                    if (cb) {
+                      try {
+                        const count = cb.GetItemCount ? cb.GetItemCount() : 0;
+                        for (let i = 0; i < count; i++) {
+                          const item = cb.GetItem(i);
+                          const text = String((item && (item.text || item.GetText && item.GetText())) || '');
+                          const norm = text.normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').toLowerCase();
+                          if (norm.indexOf(needle) >= 0) {
+                            if (cb.SetSelectedIndex) cb.SetSelectedIndex(i);
+                            if (cb.SetValue && item && item.value != null) cb.SetValue(item.value);
+                            if (cb.SetText) cb.SetText(text);
+                            return {ok:true, text:text, value:String(item && item.value != null ? item.value : '')};
+                          }
+                        }
+                      } catch(e) {}
+                      if (isOficio && cb.SetValue) {
+                        cb.SetValue('79');
+                        if (cb.SetText) cb.SetText('Ofício SSG');
+                        return {ok:true, text:'Ofício SSG', value:'79'};
+                      }
+                      if (cb.SetText) {
+                        cb.SetText(label);
+                        return {ok:false, text:label, value:''};
+                      }
+                    }
+                  } catch(e) {}
+                  try {
+                    const vi=document.getElementById('cbbTiposAtos_VI');
+                    const ti=document.getElementById('cbbTiposAtos_I');
+                    if (isOficio && vi) vi.value='79';
+                    if (ti) ti.value=label;
+                    return {ok:!!(vi||ti), text:label, value:isOficio ? '79' : ''};
+                  } catch(e) {}
+                  return {ok:false, text:'', value:''};
+                }""",
+                {
+                    "label": ato_tipo_label,
+                    "needle": "encaminhamento" if not ato_tipo_is_oficio else "oficio ssg",
+                    "isOficio": ato_tipo_is_oficio,
+                },
             )
+            if selected_info and selected_info.get("ok"):
+                print(f"[uploadato] tipo por DevExpress: {selected_info}")
         except Exception:
             pass        # Combo global da página nova (uploadato.aspx)
         try:
@@ -2562,7 +2686,7 @@ def attach_docx_via_gerenciador_atos(context, page, processo: str, docx_path: Pa
                 except Exception:
                     pass
                 try:
-                    cg.fill("Oficio SSG")
+                    cg.fill(ato_tipo_fill)
                 except Exception:
                     pass
                 # tenta abrir dropdown e escolher explicitamente
@@ -2571,7 +2695,7 @@ def attach_docx_via_gerenciador_atos(context, page, processo: str, docx_path: Pa
                     if ddbtn.count() > 0:
                         ddbtn.click()
                         try:
-                            target.get_by_text(re.compile(r"of[ií]cio\s*ssg", re.I)).first.click()
+                            target.get_by_text(ato_tipo_re).first.click()
                         except Exception:
                             pass
                 except Exception:
@@ -2588,12 +2712,12 @@ def attach_docx_via_gerenciador_atos(context, page, processo: str, docx_path: Pa
                 except Exception:
                     pass
                 try:
-                    tipo_inp.fill("Ofício SSG")
+                    tipo_inp.fill(ato_tipo_label)
                 except Exception:
                     pass
                 # Tenta selecionar a opção na lista suspensa, se aparecer
                 try:
-                    opt = target.get_by_text(re.compile(r"of[ií]cio\\s*ssg", re.I)).first
+                    opt = target.get_by_text(ato_tipo_re).first
                     if opt.count() > 0:
                         opt.click()
                 except Exception:
@@ -2619,21 +2743,29 @@ def attach_docx_via_gerenciador_atos(context, page, processo: str, docx_path: Pa
                 if sel.count() > 0:
                     try:
                         # tentativa direta por label
-                        sel.select_option(label=re.compile(r"of[ií]cio\s*ssg", re.I))
+                        sel.select_option(label=ato_tipo_re)
                     except Exception:
-                        # busca o value cujo texto contenha 'encaminhamento'
+                        # busca o value cujo texto contenha o tipo desejado
                         try:
-                            value = sel.evaluate("el => { const opt = Array.from(el.options).find(o => /of[ií]cio\\s*ssg/i.test(o.textContent)); return opt ? opt.value : null; }")
+                            value = sel.evaluate(
+                                """(el, needle) => {
+                                    const norm = (s) => String(s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').toLowerCase();
+                                    const opt = Array.from(el.options).find(o => norm(o.textContent).indexOf(needle) >= 0);
+                                    return opt ? opt.value : null;
+                                }""",
+                                "encaminhamento" if not ato_tipo_is_oficio else "oficio ssg",
+                            )
                             if value:
                                 sel.select_option(value=value)
                             else:
                                 # fallbacks
                                 try:
-                                    sel.select_option(label=re.compile(r"encaminhamento", re.I))
+                                    sel.select_option(label=re.compile(r"encaminhamento", re.I) if not ato_tipo_is_oficio else "ANEXO")
                                 except Exception:
                                     sel.select_option(label="ANEXO")
                         except Exception:
-                            for lab in (re.compile(r"encaminhamento", re.I), "ANEXO"):
+                            fallback_labels = (re.compile(r"encaminhamento", re.I), "ANEXO") if not ato_tipo_is_oficio else ("ANEXO",)
+                            for lab in fallback_labels:
                                 try:
                                     sel.select_option(label=lab)
                                     break
@@ -2649,21 +2781,23 @@ def attach_docx_via_gerenciador_atos(context, page, processo: str, docx_path: Pa
                         # Abra as opções e clique na opção com o texto
                         cb.click()
                         try:
-                            target.get_by_role("option", name=re.compile(r"of[ií]cio\s*ssg", re.I)).first.click()
+                            target.get_by_role("option", name=ato_tipo_re).first.click()
                         except Exception:
-                            target.get_by_text(re.compile(r"of[ií]cio\\s*ssg", re.I)).first.click()
+                            target.get_by_text(ato_tipo_re).first.click()
                     except Exception:
                         try:
-                            target.get_by_text(re.compile(r"encaminhamento|^\\s*anexo\\s*$", re.I)).first.click()
+                            fallback_re = re.compile(r"encaminhamento|^\\s*anexo\\s*$", re.I) if not ato_tipo_is_oficio else re.compile(r"^\\s*anexo\\s*$", re.I)
+                            target.get_by_text(fallback_re).first.click()
                         except Exception:
                             pass
             except Exception:
                 pass
             # Fallback: clicar no texto ANEXO
             try:
-                opt = target.get_by_text(re.compile(r"of[ií]cio\\s*ssg", re.I)).first
+                opt = target.get_by_text(ato_tipo_re).first
                 if opt.count() == 0:
-                    opt = target.get_by_text(re.compile(r"encaminhamento|^\\s*anexo\\s*$", re.I)).first
+                    fallback_re = re.compile(r"encaminhamento|^\\s*anexo\\s*$", re.I) if not ato_tipo_is_oficio else re.compile(r"^\\s*anexo\\s*$", re.I)
+                    opt = target.get_by_text(fallback_re).first
                 if opt.count() > 0:
                     opt.click()
             except Exception:
@@ -4307,14 +4441,29 @@ def _select_template_for(tipo: str, secretaria: str) -> Optional[Path]:
 
     Procura dentro das pastas locais mapeadas e retorna o Path do arquivo
     preferindo .docx; se não houver, retorna .dotx.
+
+    Permite override por env var quando precisamos trocar de pasta sem
+    mexer no código (ex.: ferias da Roseli — pastas em `modelos daniela/`):
+
+        OFICIO_TEMPLATES_DIR_UTAP=modelos daniela/manutap
+        OFICIO_TEMPLATES_DIR_DILACAO=modelos daniela/dilação
+        OFICIO_TEMPLATES_DIR_REITERACAO=modelos daniela/reiteração
+
+    Fallback de secretaria: quando não há modelo com a secretaria pedida
+    nem um modelo "Geral", a env var OFICIO_SECRETARIA_FALLBACK indica
+    qual usar como substituto (ex.: "educacao" — útil quando a pasta da
+    Daniela só tem Educação e Saúde).
     """
+    tipo_up = tipo.upper()
+    # Override por env var por tipo. Se nao setado, cai no default historico.
+    override_env = os.getenv(f"OFICIO_TEMPLATES_DIR_{tipo_up}")
     base_map = {
         "UTAP": "modelos_utap",
         "REITERACAO": "modelos_reiteracao",
         "DILACAO": "modelos_dilacao",
         "JUIZO": "modelos_juizo",
     }
-    folder = base_map.get(tipo.upper())
+    folder = (override_env or base_map.get(tipo_up) or "").strip()
     if not folder:
         return None
     d = Path(folder)
@@ -4341,6 +4490,20 @@ def _select_template_for(tipo: str, secretaria: str) -> Optional[Path]:
             if "geral" in normalize(decoded_name).lower():
                 geral.append(p)
         candidates = geral
+    if not candidates:
+        # Fallback configuravel por env (ex.: "educacao") — útil quando a
+        # pasta do assinante substituto so tem Educacao e Saude e veio um
+        # processo Geral. Procura por secretaria do fallback antes de aceitar
+        # qualquer arquivo aleatorio da pasta.
+        fb = (os.getenv("OFICIO_SECRETARIA_FALLBACK") or "").strip()
+        if fb:
+            fb_norm = normalize(decode_zip_unicode_escape_name(fb)).lower()
+            for p in d.glob("*"):
+                if not p.is_file():
+                    continue
+                decoded_name = decode_zip_unicode_escape_name(p.name)
+                if fb_norm in normalize(decoded_name).lower():
+                    candidates.append(p)
     if not candidates:
         # Último fallback: qualquer arquivo da pasta.
         candidates = [p for p in d.glob("*") if p.is_file()]
@@ -4855,12 +5018,15 @@ def _set_devexpress_combo_item(page_like, control_name: str, desired_text: str) 
 
 
 def _signer_filter_query(name: str) -> str:
+    # Token raiz configurado para o assinante atual (env SIGNER_MATCH_TOKENS).
+    # Default Roseli — fallback quando o caller nao passa nome ou nao bate.
+    primary_token = (current_signer_tokens() or ("roseli",))[0].upper()
     norm = normalize(name or "").strip()
     if not norm:
-        return "ROSELI"
+        return primary_token
     parts = [p for p in re.split(r"\s+", norm) if len(p) > 2 and p.lower() not in {"de", "da", "do", "das", "dos"}]
-    if any(p.lower() == "roseli" for p in parts):
-        return "ROSELI"
+    if any(p.lower() == primary_token.lower() for p in parts):
+        return primary_token
     return parts[0] if parts else norm
 
 
@@ -4868,8 +5034,12 @@ def _row_text_matches_person(row_text: str, desired_name: str) -> bool:
     text = normalize(row_text or "").lower()
     desired = normalize(desired_name or "").lower()
     tokens = [p for p in re.split(r"\s+", desired) if len(p) > 2 and p not in {"de", "da", "do", "das", "dos"}]
-    if "roseli" in tokens:
-        return "roseli" in text and "chaves" in text
+    # Atalho para o assinante configurado (ex.: "Roseli Chaves" -> exige ambos
+    # tokens no texto da linha; "Daniela Shimizu" -> idem). Mantem fallback
+    # generico para nomes arbitrarios.
+    signer_tokens = current_signer_tokens()
+    if signer_tokens and all(t in tokens for t in signer_tokens):
+        return all(t in text for t in signer_tokens)
     if not tokens:
         return bool(text.strip())
     required = tokens[:1]
@@ -5064,6 +5234,169 @@ def _find_oficio_ssg_row(pop, preferred_statuses: list[str] | None = None):
     if matches:
         return matches[0]
     return None, ""
+
+
+def _extract_ssg_ref_from_ato_text(text: str) -> str:
+    hay = re.sub(r"\s+", " ", normalize(text or "")).strip()
+    if not hay:
+        return ""
+    labels = list(re.finditer(r"\b(?:oficio\s+ssg|of\s+ssg|ssg)\b", hay, re.I))
+    if not labels:
+        return ""
+
+    def _is_tc_process_number(start: int) -> bool:
+        prefix = re.sub(r"\s+", "", hay[max(0, start - 10):start].lower())
+        return prefix.endswith("tc/") or prefix.endswith("tc")
+
+    candidates = []
+    patterns = [
+        r"\b(\d{1,7})\s*/\s*(20\d{2})\b",
+        r"\b(\d{1,7})\s+(20\d{2})\b",
+    ]
+    label_centers = [m.start() + ((m.end() - m.start()) // 2) for m in labels]
+    first_label_start = labels[0].start()
+    for pattern in patterns:
+        for m in re.finditer(pattern, hay, re.I):
+            if _is_tc_process_number(m.start()):
+                continue
+            distance = min(abs(m.start() - center) for center in label_centers)
+            after_label_rank = 0 if m.start() >= first_label_start else 1
+            candidates.append((after_label_rank, distance, m.start(), f"{m.group(1)}/{m.group(2)}"))
+        if candidates:
+            break
+
+    if not candidates:
+        return ""
+    candidates.sort()
+    return candidates[0][3]
+
+
+def _extract_oficio_ssg_ref_from_gerenciador_page(pop) -> str:
+    rows = pop.locator("#gvAtosArea_DXMainTable tr[id*='DXDataRow'], tr[id*='gvAtosArea_DXDataRow']")
+    try:
+        count = rows.count()
+    except Exception:
+        count = 0
+
+    candidates = []
+    for i in range(count):
+        row = rows.nth(i)
+        try:
+            row_text = row.inner_text(timeout=1500)
+        except Exception:
+            row_text = ""
+        norm_text = normalize(row_text).lower()
+        if not ("oficio ssg" in norm_text or "of ssg" in norm_text or "ssg" in norm_text):
+            continue
+        if "excluir" in norm_text:
+            continue
+        ref = _extract_ssg_ref_from_ato_text(row_text)
+        if not ref:
+            try:
+                ref = _extract_ssg_ref_from_ato_text(row.inner_html(timeout=1000))
+            except Exception:
+                ref = ""
+        if not ref:
+            continue
+        if "concluido" in norm_text or "concluído" in norm_text:
+            status_rank = 0
+        elif "em assinatura" in norm_text:
+            status_rank = 1
+        elif "assinado" in norm_text:
+            status_rank = 2
+        elif "rascunho" in norm_text:
+            status_rank = 3
+        else:
+            status_rank = 4
+        candidates.append((status_rank, i, ref))
+
+    if not candidates:
+        return ""
+    candidates.sort()
+    return candidates[0][2]
+
+
+def _extract_current_oficio_ssg_ref(
+    context,
+    page,
+    processo: str,
+    use_caixa_correio: bool,
+    expected_piece_display: int | None = None,
+) -> str:
+    pop = None
+    try:
+        if use_caixa_correio:
+            pop = _open_robot_comm_gerenciador_atos(context, page, processo)
+        if pop is not None:
+            try:
+                pop.wait_for_selector(
+                    "#gvAtosArea_DXMainTable tr[id*='DXDataRow'], tr[id*='gvAtosArea_DXDataRow']",
+                    timeout=15000,
+                )
+            except Exception:
+                pass
+            ref = _extract_oficio_ssg_ref_from_gerenciador_page(pop)
+            if ref:
+                return ref
+    finally:
+        try:
+            if pop is not None and not pop.is_closed():
+                pop.close()
+        except Exception:
+            pass
+
+    if expected_piece_display is not None:
+        fresh_page = None
+        viewer_page = None
+        try:
+            fresh_page = _open_fresh_apo_pen_page(context) or page
+            viewer_page = filter_and_open_processo(context, fresh_page, processo) or fresh_page
+            pieces = _enumerate_piece_names(viewer_page)
+            for _iv, name in pieces:
+                m_display = re.match(r"\s*(\d+)\s*\.", name or "")
+                if not m_display or int(m_display.group(1)) != expected_piece_display:
+                    continue
+                ref = _extract_ssg_ref_from_ato_text(name)
+                if ref:
+                    return ref
+        except Exception as e:
+            print(f"Aviso: {processo}: falha ao reabrir arvore para ler SSG atual: {e}")
+        finally:
+            seen = set()
+            for p in (viewer_page, fresh_page):
+                try:
+                    if p is None or p == page:
+                        continue
+                    ident = id(p)
+                    if ident in seen:
+                        continue
+                    seen.add(ident)
+                    if hasattr(p, "is_closed") and not p.is_closed():
+                        p.close()
+                except Exception:
+                    pass
+
+    try:
+        pop = open_gerenciador_atos_from_grid(context, page, processo)
+    except Exception:
+        pop = None
+    if not pop:
+        return ""
+    try:
+        try:
+            pop.wait_for_selector(
+                "#gvAtosArea_DXMainTable tr[id*='DXDataRow'], tr[id*='gvAtosArea_DXDataRow']",
+                timeout=15000,
+            )
+        except Exception:
+            pass
+        return _extract_oficio_ssg_ref_from_gerenciador_page(pop)
+    finally:
+        try:
+            if not pop.is_closed():
+                pop.close()
+        except Exception:
+            pass
 
 
 def _save_evidence_text(prefix: str, processo: str, content: str, suffix: str = ".html") -> Path | None:
@@ -5661,7 +5994,10 @@ def revoke_pending_roseli_signature_for_oficio_ssg(context, page, processo: str)
         if not is_pending_signature_status(row_text):
             return True, [f"sem assinatura pendente no Ofício SSG atual: {row_text[:100]}"]
 
-        signer_visible = signer_name_matches_roseli_chaves(row_text)
+        # Usa os tokens do assinante atual (env SIGNER_MATCH_TOKENS) — quando
+        # nao definido, cai no default Roseli/Chaves. Permite estornar
+        # assinaturas pendentes da Daniela ou da Roseli sem reescrever.
+        signer_visible = signer_name_matches(row_text)
         if not signer_visible:
             acoes.append("assinante não visível/confirmável na linha; prosseguindo por autorização explícita do processo")
 
@@ -6104,21 +6440,25 @@ def request_signature_for_docx(context, page, processo: str, docx_path: Path, si
         return False
 
     # Tokens-raiz para matching: derivados do nome solicitado e tolerantes a
-    # variacoes ("de", "da", "moraes", "morais", abreviacoes). Para o caso
-    # padrao "Roseli (de Morais|Moraes) Chaves", usamos a funcao utilitaria
-    # signer_name_matches_roseli_chaves do oficio_normalize (testada).
+    # variacoes ("de", "da", "moraes", "morais", abreviacoes). Quando o nome
+    # solicitado coincide com o assinante configurado (env SIGNER_MATCH_TOKENS,
+    # default Roseli/Chaves), usamos a funcao utilitaria signer_name_matches
+    # do oficio_normalize (testada com 50+ casos).
     signer_norm = normalize(signer_name).lower()
     stop_words = {"de", "da", "do", "das", "dos", "moraes", "morais"}
     must_tokens = [t for t in re.split(r"\s+", signer_norm) if t and t not in stop_words]
-    use_roseli_helper = "roseli" in signer_norm and "chaves" in signer_norm
-    if use_roseli_helper:
-        must_tokens = ["roseli", "chaves"]
+    cfg_tokens = current_signer_tokens()
+    use_helper = bool(cfg_tokens) and all(t in signer_norm for t in cfg_tokens)
+    if use_helper:
+        must_tokens = list(cfg_tokens)
 
     queries = []
     if signer_name.strip():
         queries.append(signer_name.strip())
-    if "roseli" in signer_norm:
-        queries.append("ROSELI")
+    # Adiciona o primeiro token do assinante configurado como busca alternativa
+    # (ex.: 'ROSELI' para Roseli Chaves, 'DANIELA' para Daniela Shimizu).
+    if cfg_tokens and cfg_tokens[0] in signer_norm:
+        queries.append(cfg_tokens[0].upper())
     if signer_name.strip().split():
         queries.append(signer_name.strip().split()[0])
     queries = [q for i, q in enumerate(queries) if q and q not in queries[:i]]
@@ -6139,11 +6479,12 @@ def request_signature_for_docx(context, page, processo: str, docx_path: Path, si
                 if row.count() > 0:
                     row_text_raw = row.inner_text(timeout=1000)
                     row_text = normalize(row_text_raw).lower()
-                    # Para Roseli Chaves, usa o helper testado (50 testes em
-                    # tests/test_oficio_normalize.py) que aceita variacoes
-                    # de "DE MORAIS" / "MORAES" / sem nome do meio.
-                    if use_roseli_helper:
-                        matched = signer_name_matches_roseli_chaves(row_text_raw)
+                    # Quando o assinante configurado (env SIGNER_MATCH_TOKENS)
+                    # bate com o que foi pedido, usa o helper testado (50+
+                    # casos em tests/test_oficio_normalize.py) que aceita
+                    # variacoes de "DE MORAIS" / "MORAES" / abreviacoes.
+                    if use_helper:
+                        matched = signer_name_matches(row_text_raw)
                     else:
                         matched = all(tok in row_text for tok in must_tokens)
                     if matched:
@@ -6240,12 +6581,16 @@ def tramitar_processo_para_destino(context, page, processo: str, destino: str) -
         if not pop:
             return False
         try:
+            # Fallback: 1) env var, 2) assinante configurado (SIGNER_MATCH_TOKENS)
+            # convertido para nome legivel, 3) "Roseli Moraes Chaves" historico.
+            _cfg = current_signer_tokens()
+            _default_signer = " ".join(t.capitalize() for t in _cfg) if _cfg else "Roseli Moraes Chaves"
             signer_name = (
                 os.getenv("DISTRIBUIR_PARA")
                 or os.getenv("ASSINANTE_NOME")
                 or os.getenv("SIGNER_NAME")
                 or os.getenv("ASSINANTE")
-                or "Roseli Moraes Chaves"
+                or _default_signer
             ).strip()
             if not _select_distribuicao_usuario(pop, signer_name):
                 print(f"Aviso: distribuicao de {processo} nao confirmada porque o usuario nao foi selecionado.")
@@ -6480,43 +6825,65 @@ def _extract_reiteracao_data_from_pieces(pieces: list[tuple[int, str]]) -> dict:
     # e Y dos autos.") corresponde a POSIÇÃO da peça na árvore visível do
     # processo (display), NAO ao atributo HTML index_ato.
     #
-    # Em processos onde atos antigos foram excluídos (cleanup destrutivo ou
-    # cancelamento de Oficio SSG em rascunho), index_ato fica esparso — ex.:
-    # arvore mostra 0..14 mas a peça 14 internamente tem index_ato=16. O
-    # operador vê "14. ENC ..." e essa é a referência correta no oficio.
+    # Bug observado em 22/06/2026 com TC/005666/2022, TC/009327/2022 e
+    # TC/011446/2022: o robô gerou "Cópia das peças 21 e 36 dos autos."
+    # quando o correto era "22 e 37". Causa: _enumerate_piece_names usa
+    # um seletor CSS que casa com links clicáveis da árvore (a[index_ato],
+    # a[onclick*='LerPDF'], ...). Itens que aparecem na árvore mas não
+    # são links clicáveis (ex.: "1. TÍTULO DE APOSENTADORIA", que em
+    # alguns processos é só texto, sem PDF anexo) ficam de fora. Resultado:
+    # pieces[] tem N-1 itens enquanto a árvore mostra N — todo display
+    # posterior ao item faltante fica defasado em -1.
     #
-    # Bug observado em 29/05/2026 com TC/016628/2024: extraido des_seq=16
-    # gerou "Copia das pecas 03 e 16 dos autos." quando o correto era "03
-    # e 14". O fix passa a usar a posicao em pieces[] (que ja vem ordenada
-    # por iv em _enumerate_piece_names), garantindo que seja o número de
-    # display da arvore.
+    # Fix: ler o número de display DIRETO DO NOME da peça (prefixo
+    # "<num>. <TIPO>"), em vez de derivar da posição em pieces[]. O nome
+    # vem do innerText do link na própria árvore — é exatamente o que o
+    # operador vê e digita no Encaminha.
     n = len(pieces)
 
-    # 1) Última peça MANUTAP-OF.
-    manutap_pos = None
+    def _display_seq_from_name(name: str) -> int | None:
+        """Parseia '<N>. <TIPO>' no início do nome. None se não casar."""
+        m = re.match(r"\s*(\d+)\s*\.", name or "")
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+
+    # 1) Última peça MANUTAP-OF: usa o número exibido no nome.
+    manutap_arr_pos = None       # posição no array (pra achar a SSG seguinte)
+    manutap_display = None       # número exibido na árvore (vai no Encaminha)
     for pos, (iv, name) in enumerate(pieces):
         if "manutap-of" in normalize(name).lower():
-            manutap_pos = pos
-    if manutap_pos is None:
+            d = _display_seq_from_name(name)
+            manutap_arr_pos = pos
+            manutap_display = d if d is not None else pos  # fallback defensivo
+    if manutap_arr_pos is None:
         return out
-    out["manutap_seq"] = str(manutap_pos)
+    out["manutap_seq"] = str(manutap_display)
 
     # 2) Peça SSG logo após o MANUTAP-OF: é a que está sendo reiterada.
-    if manutap_pos + 1 < n:
-        ssg_name = pieces[manutap_pos + 1][1]
+    if manutap_arr_pos + 1 < n:
+        ssg_name = pieces[manutap_arr_pos + 1][1]
         m_ssg = re.search(r"SSG\s*[-–:]?\s*(\d{2,6}\s*/\s*\d{4})", ssg_name, re.I)
         if m_ssg:
             out["ssg_ref"] = re.sub(r"\s+", "", m_ssg.group(1))
         m_date = re.search(r"(\d{2}/\d{2}/\d{4})", ssg_name)
         if m_date:
             out["ssg_date"] = m_date.group(1)
-        out["ssg_seq"] = str(manutap_pos + 1)
+        d_ssg = _display_seq_from_name(ssg_name)
+        out["ssg_seq"] = str(d_ssg if d_ssg is not None else manutap_arr_pos + 1)
 
-    # 3) Última peça anexada ao processo (qualquer tipo).
-    # Briefing Raphael 29/05: sempre a última peça da árvore, sem inspeção
-    # de tipo. Cobre DES, ENC do Gabinete, ou qualquer peça que o relator
-    # tenha anexado por ultimo.
-    out["des_seq"] = str(n - 1)
+    # 3) Última peça anexada ao processo: maior número exibido em qualquer nome.
+    # Robusto a buracos de enumeração: se a árvore mostra "37. ENC" mas
+    # pieces[] tem só 37 itens, o nome "37." está lá e isso vira des_seq.
+    max_display = -1
+    for iv, name in pieces:
+        d = _display_seq_from_name(name)
+        if d is not None and d > max_display:
+            max_display = d
+    out["des_seq"] = str(max_display if max_display >= 0 else n - 1)
 
     return out
 
@@ -6544,6 +6911,165 @@ def _extract_referencia_from_requerimento(context, page, output_dir: Path, proce
     if not m:
         return ""
     return re.sub(r"\s+", " ", m.group(0)).strip()
+
+
+def _generate_and_attach_encaminhamento(
+    context,
+    action_page,
+    processo_num: str,
+    secretaria: str,
+    output_dir: Path,
+    use_caixa_correio: bool,
+    relator: str | None = None,
+    descricao: str | None = None,
+    pre_anex_max_display: int | None = None,
+    oficio_ssg_ref: str | None = None,
+) -> None:
+    """Gera + anexa o DOCX de ENCAMINHAMENTO na MESMA comunicação processual.
+
+    Chamado após concluir o ato do Ofício SSG. Passos:
+      1. Re-enumera a árvore atualizada — última peça = ofício SSG concluído.
+      2. Extrai o número do ofício SSG do nome da peça ("OF SSG 12345/2026").
+      3. Descobre número de display da última peça (=peça do ofício).
+      4. Escolhe diretor(a) via web/directors com base na secretaria.
+      5. Gera o DOCX via src/encaminhamento.py.
+      6. Anexa via attach_docx_inside_comunicacao (mesma ntf).
+
+    Não conclui o ato do encaminhamento (para evitar bater com o helper de
+    conclusão do ofício SSG). O ato do encaminhamento fica em Rascunho e
+    o operador conclui manual, se desejar.
+    """
+    # Import tardio para não pesar o load do main.py em runs que não usam.
+    import sys as _sys
+    _here = Path(__file__).resolve().parent
+    if str(_here) not in _sys.path:
+        _sys.path.insert(0, str(_here))
+    from encaminhamento import generate_encaminhamento_docx  # type: ignore
+
+    # Diretor(a) da secretaria destino — busca com fallback para "geral".
+    director_name, director_cargo = "", ""
+    try:
+        _root = Path(__file__).resolve().parents[1]
+        if str(_root) not in _sys.path:
+            _sys.path.insert(0, str(_root))
+        from web import directors as _dirs  # type: ignore
+        d = _dirs.get(secretaria) or _dirs.get("geral")
+        if d:
+            director_name = d.name
+            director_cargo = d.cargo
+    except Exception as _ex:
+        print(f"  [encaminhamento] aviso: nao carreguei web/directors ({_ex}); campos ficam em branco.")
+
+    # Numeracao das pecas do Encaminhamento:
+    #   - encaminhamento = ULTIMA peca da arvore (max_display + 1 apos o
+    #     anexo do oficio SSG e do proprio encaminhamento)
+    #   - oficio SSG = PENULTIMA peca (max_display + 1 apos anexo do oficio)
+    #
+    # Estrategia robusta: usar `pre_anex_max_display` — o maior display
+    # observado na arvore ANTES do anexo do oficio. A partir dele:
+    #   - oficio SSG display = pre_anex_max_display + 1
+    #   - encaminhamento display = pre_anex_max_display + 2
+    #
+    # Isso evita o problema de re-enumerar depois da conclusao do ato
+    # (popup do Gerenciador fecha, action_page volta pra grid, o frame do
+    # visualizador some — observado em 01/07/2026 no TC/008940/2023).
+    ssg_ref = (oficio_ssg_ref or "").strip()
+    if pre_anex_max_display is not None and pre_anex_max_display >= 0:
+        piece_num_oficio = pre_anex_max_display + 1
+        piece_num_encaminhamento = pre_anex_max_display + 2
+    else:
+        # Fallback: se pre_anex_max_display nao foi calculado, tenta
+        # re-enumerar em uma aba fresca. Menos robusto — costuma falhar em
+        # producao.
+        pieces = []
+        viewer_page = None
+        try:
+            try:
+                grid_page = _open_fresh_apo_pen_page(context) or action_page
+                viewer_page = filter_and_open_processo(context, grid_page, processo_num) or grid_page
+            except Exception as _ex:
+                viewer_page = None
+                print(f"  [encaminhamento] falha ao reabrir visualizador: {_ex}")
+            for _try, page_try in enumerate([viewer_page, action_page], start=1):
+                if page_try is None:
+                    continue
+                try:
+                    pieces = _enumerate_piece_names(page_try)
+                except Exception:
+                    pieces = []
+                if pieces:
+                    break
+        finally:
+            try:
+                if viewer_page is not None and viewer_page is not action_page and hasattr(viewer_page, "is_closed") and not viewer_page.is_closed():
+                    viewer_page.close()
+            except Exception:
+                pass
+        if not pieces:
+            raise RuntimeError("nao consegui determinar numeracao (nem pre-anex nem re-enum)")
+        max_display = -1
+        for _iv, name in pieces:
+            m = re.match(r"\s*(\d+)\s*\.", name or "")
+            if not m:
+                continue
+            n = int(m.group(1))
+            if n > max_display:
+                max_display = n
+                m_ssg = re.search(r"SSG\s*[-–:]?\s*(\d{1,7})\s*/\s*(\d{4})", name, re.I)
+                if m_ssg and not ssg_ref:
+                    ssg_ref = f"{m_ssg.group(1)}/{m_ssg.group(2)}"
+        if max_display < 0:
+            raise RuntimeError("nao encontrei display num na arvore")
+        # No fallback, `max_display` ja considera o oficio anexado como ultima
+        # peca — entao a peca do proprio oficio = max_display, do encaminhamento
+        # = max_display + 1.
+        piece_num_oficio = max_display
+        piece_num_encaminhamento = max_display + 1
+
+    if not ssg_ref:
+        raise RuntimeError("nao consegui determinar numero do Oficio SSG recem-gerado para o encaminhamento")
+
+    safe_proc = processo_num.replace("/", "_")
+    out = output_dir / f"encaminhamento_{safe_proc}.docx"
+    generate_encaminhamento_docx(
+        output_path=out,
+        process_num=processo_num,
+        oficio_ssg_num=ssg_ref,
+        piece_num_oficio=piece_num_oficio,
+        piece_num_encaminhamento=piece_num_encaminhamento,
+        director_name=director_name,
+        director_cargo=director_cargo,
+        process_meta={
+            "PROCESSO": processo_num,
+            "nome_relator": (relator or "").strip(),
+            "TIPO_ASSUNTO": (descricao or "").strip(),
+        },
+    )
+    print(
+        f"Processo {processo_num}: encaminhamento gerado ({out.name}) — "
+        f"of.SSG={ssg_ref or '?'}, pecas {piece_num_oficio} e {piece_num_encaminhamento}, "
+        f"diretor='{director_name or '(nao cadastrado)'}'."
+    )
+
+    if use_caixa_correio:
+        ok = attach_docx_inside_comunicacao(
+            context,
+            action_page,
+            processo_num,
+            out,
+            ato_tipo="Encaminhamento",
+        )
+    else:
+        ok = attach_docx_via_gerenciador_atos(
+            context,
+            action_page,
+            processo_num,
+            out,
+            ato_tipo="Encaminhamento",
+        )
+    if not ok:
+        raise RuntimeError("anexo do encaminhamento falhou")
+    print(f"Processo {processo_num}: encaminhamento anexado na mesma comunicacao.")
 
 
 def process_processo_pipeline(context, main_page, output_dir: Path, processo_num: str, use_caixa_correio: bool):
@@ -7059,6 +7585,28 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
                     cleanup_reason = _safe_reason
                     print(f"Processo {processo_num}: limpeza de rascunhos pulada — {cleanup_reason}.")
 
+                # NOVO 2026-07-01: enumerar peças ANTES do anexo do ofício
+                # para saber o maior display atual. Usado no encaminhamento:
+                # ofício = max_display+1, encaminhamento = max_display+2.
+                # Mais robusto do que re-enumerar depois (visualizador pode
+                # ter fechado).
+                pre_anex_max_display: int | None = None
+                if not env_bool("SKIP_ENCAMINHAMENTO", False):
+                    try:
+                        pre_pieces = _enumerate_piece_names(active_page)
+                        _max = -1
+                        for _iv, _name in (pre_pieces or []):
+                            m = re.match(r"\s*(\d+)\s*\.", _name or "")
+                            if m:
+                                n = int(m.group(1))
+                                if n > _max:
+                                    _max = n
+                        if _max >= 0:
+                            pre_anex_max_display = _max
+                            print(f"Processo {processo_num}: pré-anexo — árvore tem max_display={_max} (ofício vai virar peça {_max+1}, encaminhamento peça {_max+2}).")
+                    except Exception as _ex:
+                        print(f"Aviso: pré-enumeração falhou em {processo_num}: {_ex}")
+
                 if reuse_existing_oficio and oficio_ssg_ato_existe(context, action_page, processo_num):
                     attached = True
                     print(f"Processo {processo_num}: Ofício SSG existente localizado; anexo novo ignorado por REUSE_EXISTING_OFICIO.")
@@ -7093,6 +7641,43 @@ def process_processo_pipeline(context, main_page, output_dir: Path, processo_num
                     if not concluded:
                         print(f"ERRO bloqueante: Ofício SSG não foi concluído em {processo_num}.")
                         return
+                    # --- NOVO 2026-07-01: gera + anexa ENCAMINHAMENTO ---
+                    # Após concluir o ato do Ofício SSG, ele vira a última peça
+                    # da árvore. Geramos o encaminhamento referenciando a peça
+                    # do ofício (penúltima após anexo do encaminhamento) e a
+                    # peça do próprio encaminhamento (última). Falha silenciosa
+                    # para não bloquear o fluxo de assinatura.
+                    if not env_bool("SKIP_ENCAMINHAMENTO", False):
+                        try:
+                            expected_oficio_piece = None
+                            if pre_anex_max_display is not None:
+                                expected_oficio_piece = pre_anex_max_display + 1
+                            encaminhamento_ssg_ref = _extract_current_oficio_ssg_ref(
+                                context,
+                                action_page,
+                                processo_num,
+                                use_caixa_correio,
+                                expected_piece_display=expected_oficio_piece,
+                            )
+                            if encaminhamento_ssg_ref:
+                                print(
+                                    f"Processo {processo_num}: nº do Ofício SSG recém-gerado = "
+                                    f"{encaminhamento_ssg_ref}."
+                                )
+                            else:
+                                print(
+                                    f"Aviso: {processo_num}: nao consegui ler o nº do Ofício SSG "
+                                    "recém-gerado; encaminhamento nao sera anexado com numero antigo."
+                                )
+                            _generate_and_attach_encaminhamento(
+                                context, action_page, processo_num,
+                                secretaria, output_dir, use_caixa_correio,
+                                relator=relator, descricao=descricao,
+                                pre_anex_max_display=pre_anex_max_display,
+                                oficio_ssg_ref=encaminhamento_ssg_ref,
+                            )
+                        except Exception as _enc_err:
+                            print(f"Aviso: falha ao gerar/anexar encaminhamento em {processo_num}: {_enc_err}")
                     if policy["stop_after_oficio_concluido"]:
                         print(f"Processo {processo_num}: STOP_AFTER_OFICIO_CONCLUIDO=true; parando após Ofício SSG concluído.")
                         return
