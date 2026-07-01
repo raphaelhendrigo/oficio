@@ -129,33 +129,18 @@ Get-ScheduledTask -TaskName ProjetoEuclidesWeb | Format-List State, LastRunTime,
   do `web/` (commitar quando o item 1 estiver resolvido).
 - Tag pertinente: `checkpoint-2026-05-15-assinatura-solicitada` no `origin`.
 
-## Prompt sugerido para iniciar a sessão Codex
+## Atualizações recentes (2026-07-01)
 
-```
-Estou retomando o Projeto Euclides (TCM-SP, robô APO-PEN) no Codex. O Claude
-me deixou um documento de handoff em `docs/CODEX_HANDOFF.md` — leia ele
-primeiro, depois `web/README.md`, `web/runner.py` e `src/main.py`.
+### 1. Feature de Encaminhamento
+- **Template:** `modelos_encaminhamento/encaminhamento.docx`
+- **Lógica:** Implementada em `src/encaminhamento.py` e integrada ao pipeline principal (`_generate_and_attach_encaminhamento`).
+- **Resiliência:** A numeração das peças calcula `max_display` ANTES do anexo do Ofício (`pre_anex_max_display`), garantindo que o Ofício seja `max_display + 1` e o Encaminhamento seja `max_display + 2`.
+- **Ato no e-TCM:** Concluído como "Encaminhamento" (value=189).
 
-Objetivo desta sessão: **fazer o robô disparado pela interface web em
-http://10.20.1.214:8080 chegar até o pedido de assinatura para a Roseli
-Chaves**, exatamente como os runners PowerShell PROD já fazem (ver
-`run_4_DILACAO_GILSON_2026_05_25.ps1`).
+### 2. Interface de Configuração Administrativa
+- **Assinantes:** Gerenciamento de presets (Roseli/Daniela) e assinantes customizados persistidos no arquivo `web/labels/signers.json` (usando tokens gerados automaticamente do nome do assinante).
+- **Diretores:** Mapeamento de diretores por secretaria destino (Educação -> Vandréia, Saúde -> Cassio, Geral -> fallback configurável), persistidos em `web/labels/directors.json` para preenchimento dinâmico do encaminhamento.
 
-Sintoma reportado pelo usuário: ao disparar pela web (processo
-TC/016628/2024, REITERACAO), o robô criou a Comunicação Processual mas
-*não* enviou o ofício para assinatura. As env vars enviadas pelo
-`web/runner.py:_default_env_for_tipo` incluem `REQUEST_SIGNATURE=true`,
-`ASSINANTE_NOME=Roseli Chaves`, `SKIP_SIGNATURE=false`,
-`SKIP_TRAMITACAO=true`. Comparar com o que os runners .ps1 enviam e
-identificar a diferença.
+### 3. Pipeline de Aprendizado de Máquina (ML)
+- **Features e Labels:** Gravação de metadados das peças em `web/labels/features.jsonl` de forma paralela e não-bloqueante no pipeline. Script de treinamento implementado em `scripts/train_classifier.py` gerando o modelo `web/labels/model.joblib`.
 
-Antes de fazer mudanças invasivas, rode o robô com `HEADLESS=false`
-(botão "Disparar agora" na interface) e observe onde o fluxo encerra.
-Consulte `web/jobs/<job_id>.json` para ver o log persistido do último
-disparo. Não toque na infraestrutura do Task Scheduler nem nos
-scripts em `scripts/start_web_hidden.ps1` — eles estão estáveis.
-
-Critério de pronto: um disparo pela interface web de um processo
-REITERACAO termina com o evento "Assinatura solicitada para Roseli Chaves"
-no log, igual ao que os runners .ps1 produzem.
-```
